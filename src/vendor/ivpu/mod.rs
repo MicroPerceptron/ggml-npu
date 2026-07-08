@@ -8,6 +8,7 @@
 //! `ze_graph_ext.h` bindings, then `load`/`submit` over the graph extension and wiring the
 //! first `MUL_MAT` into `graph_compute`. The other verbs are `unimplemented!()` until then.
 
+mod compile;
 mod graph;
 mod ze;
 
@@ -17,23 +18,27 @@ use crate::hal::{BufFlags, NpuHal};
 
 pub use ze::Device as IvpuDevice;
 
-/// Precompiled shape-generic MatMul blob for `[M=1, K=64, N=64]` (weights are a graph
-/// input, so one blob serves any weights of this shape). Graph input args are ordered
-/// `[activation, weight]`; see `ov_matmul_ggml.cpp`.
-static MATMUL_1X64X64: &[u8] = include_bytes!("artifacts/matmul_1x64x64.blob");
+/// Can we run a ggml `MUL_MAT` of shape `(M, K, N)` on the NPU? True iff a blob for it is
+/// available (compiled on first sight, then cached). Called from `supports_op`.
+pub fn can_matmul(m: i64, k: i64, n: i64) -> bool {
+    compile::get_or_compile_matmul(m, k, n).is_some()
+}
 
-/// Run a ggml `MUL_MAT` of the supported fixed shape on the NPU: `weight` is src0
-/// (`[N,K]=[64,64]`), `activation` is src1 (`[K,M]=[64,1]`), result into `out`
-/// (`[N,M]=[64,1]`). Returns true on success. Feeds `[activation, weight]` in arg order.
+/// Run a ggml `MUL_MAT` of shape `(M, K, N)` on the NPU: `weight` is src0 (`[K,N]`),
+/// `activation` is src1 (`[K,M]`), result into `out` (`[N,M]`). Fetches the shape's blob from
+/// the JIT cache and feeds `[activation, weight]` in graph-arg order. Returns true on success.
 ///
-/// TODO: this re-probes and re-creates the graph every call; cache the device + graph
-/// handle, and route weights through a persistent buffer once the JIT cache lands.
-pub fn run_mul_mat(weight: &[f32], activation: &[f32], out: &mut [f32]) -> bool {
+/// TODO: re-probes the device and re-creates the graph every call; cache the device + a graph
+/// handle per shape, and route weights through a persistent device buffer.
+pub fn run_matmul(m: i64, k: i64, n: i64, weight: &[f32], activation: &[f32], out: &mut [f32]) -> bool {
+    let Some(blob) = compile::get_or_compile_matmul(m, k, n) else {
+        return false;
+    };
     let devices = <IvpuHal as NpuHal>::probe();
     let Some(dev) = devices.first() else {
         return false;
     };
-    graph::run_native_blob(dev, MATMUL_1X64X64, &[activation, weight], out).is_ok()
+    graph::run_native_blob(dev, blob, &[activation, weight], out).is_ok()
 }
 
 /// Bring-up self-test: run a native (OpenVINO-compiled) blob on the first discovered NPU,

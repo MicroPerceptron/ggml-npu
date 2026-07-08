@@ -104,8 +104,8 @@ unsafe extern "C" fn dev_get_buffer_type(_dev: ggml_backend_dev_t) -> ggml_backe
 }
 
 unsafe extern "C" fn dev_supports_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
-    // First real claim: a single fixed-shape f32 MUL_MAT we have a precompiled blob for —
-    // src0 (weight) [K=64, N=64], src1 (activation) [K=64, M=1]. Everything else -> CPU.
+    // Claim any 2D f32 MUL_MAT we can compile a blob for (compile-on-miss, cached in
+    // vendor::ivpu). src0 (weight) [K,N], src1 (activation) [K,M]. Everything else -> CPU.
     if op.is_null() {
         return false;
     }
@@ -118,12 +118,23 @@ unsafe extern "C" fn dev_supports_op(_dev: ggml_backend_dev_t, op: *const ggml_t
         return false;
     }
     let (s0, s1) = (&*src0, &*src1);
-    s0.type_ == GGML_TYPE_F32
-        && s1.type_ == GGML_TYPE_F32
-        && s0.ne == [64i64, 64, 1, 1]
-        && s1.ne == [64i64, 1, 1, 1]
-        && ggml_is_contiguous(src0 as *const ggml_tensor)
-        && ggml_is_contiguous(src1 as *const ggml_tensor)
+    if s0.type_ != GGML_TYPE_F32 || s1.type_ != GGML_TYPE_F32 {
+        return false;
+    }
+    // 2D only (no batch dims), contraction dim K must match, both contiguous.
+    if s0.ne[2] != 1 || s0.ne[3] != 1 || s1.ne[2] != 1 || s1.ne[3] != 1 || s0.ne[0] != s1.ne[0] {
+        return false;
+    }
+    if !ggml_is_contiguous(src0 as *const ggml_tensor)
+        || !ggml_is_contiguous(src1 as *const ggml_tensor)
+    {
+        return false;
+    }
+    let (k, n, m) = (s0.ne[0], s0.ne[1], s1.ne[1]);
+    if !(1..=65536).contains(&k) || !(1..=65536).contains(&n) || !(1..=65536).contains(&m) {
+        return false;
+    }
+    crate::vendor::ivpu::can_matmul(m, k, n)
 }
 
 unsafe extern "C" fn dev_supports_buft(
@@ -204,8 +215,9 @@ unsafe fn dispatch_mul_mat(dst: &ggml_tensor) -> bool {
     if s0.data.is_null() || s1.data.is_null() {
         return false;
     }
+    let (k, n, m) = (s0.ne[0], s0.ne[1], s1.ne[1]);
     let w = core::slice::from_raw_parts(s0.data as *const f32, nelements(s0));
     let x = core::slice::from_raw_parts(s1.data as *const f32, nelements(s1));
     let out = core::slice::from_raw_parts_mut(dst.data as *mut f32, nelements(dst));
-    crate::vendor::ivpu::run_mul_mat(w, x, out)
+    crate::vendor::ivpu::run_matmul(m, k, n, w, x, out)
 }

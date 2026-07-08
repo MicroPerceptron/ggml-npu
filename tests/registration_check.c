@@ -19,8 +19,9 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
-/* The only ggml symbol our cdylib references. Real hosts provide it from libggml;
- * here a stub is enough (never called: supports_op==false => no allocation). */
+/* ggml symbols our cdylib references. Real hosts provide these from libggml; here stubs
+ * are enough to satisfy RTLD_NOW — none are called during this registration check (we only
+ * probe with a null op, which supports_op rejects before touching them). */
 ggml_backend_buffer_t ggml_backend_buffer_init(
         ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i iface,
@@ -29,6 +30,10 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
     (void) buft; (void) iface; (void) context; (void) size;
     return NULL;
 }
+int ggml_graph_n_nodes(struct ggml_cgraph * g) { (void) g; return 0; }
+struct ggml_tensor * ggml_graph_node(struct ggml_cgraph * g, int i) { (void) g; (void) i; return NULL; }
+bool ggml_is_contiguous(const struct ggml_tensor * t) { (void) t; return true; }
+bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t b) { (void) b; return false; }
 
 typedef ggml_backend_reg_t (*init_fn)(void);
 typedef int (*score_fn)(void);
@@ -91,7 +96,7 @@ int main(int argc, char ** argv) {
     CHECK(reg->api_version == GGML_BACKEND_API_VERSION, "api_version == GGML_BACKEND_API_VERSION (2)");
     CHECK(ndev == 1, "exactly one device");
     CHECK(dtype == GGML_BACKEND_DEVICE_TYPE_ACCEL, "device type is ACCEL");
-    CHECK(sop == 0, "supports_op returns false (pure CPU fallback)");
+    CHECK(sop == 0, "supports_op(NULL) safely returns false");
     CHECK(buft != NULL, "get_buffer_type is non-null");
     if (buft) {
         CHECK(buft->iface.get_alignment(buft) >= 1, "buffer type reports sane alignment");
