@@ -1,0 +1,104 @@
+//! ggml backend shell: the four C vtables and the singleton they stand on.
+//!
+//! `reg -> device -> buffer_type`, plus one backend (stream) instance, all held in a
+//! single heap allocation with self-referential interior pointers. Immutable after init
+//! and never moved or freed, so the pointers we hand ggml stay valid for the process
+//! lifetime. Init is a lock-free CAS (no global lock); the loader calls
+//! `ggml_backend_init` once, so the race is a formality we nonetheless handle correctly.
+
+mod buffer;
+mod shell;
+
+use core::ffi::c_int;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use alloc::boxed::Box;
+
+use crate::ffi::*;
+
+const _: () = assert!(GGML_BACKEND_API_VERSION == 2);
+
+/// One allocation holding the whole self-referential vtable graph.
+struct Handles {
+    reg: ggml_backend_reg,
+    device: ggml_backend_device,
+    buft: ggml_backend_buffer_type,
+    backend: ggml_backend,
+    guid: ggml_guid,
+}
+
+// SAFETY: written once during init, only read afterwards, never moved.
+unsafe impl Sync for Handles {}
+unsafe impl Send for Handles {}
+
+static HANDLES: AtomicPtr<Handles> = AtomicPtr::new(ptr::null_mut());
+
+const NPU_GUID_BYTES: [u8; 16] = *b"ggml-npu-phase0\0";
+
+fn get_or_init() -> *mut Handles {
+    let existing = HANDLES.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    let built = build();
+    match HANDLES.compare_exchange(ptr::null_mut(), built, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => built,
+        Err(winner) => {
+            // Lost the (practically impossible) race: reclaim ours, use the winner's.
+            drop(unsafe { Box::from_raw(built) });
+            winner
+        }
+    }
+}
+
+fn build() -> *mut Handles {
+    // Allocate first for a stable address, then wire the self-referential pointers.
+    let hp = Box::into_raw(Box::new(Handles {
+        reg: ggml_backend_reg {
+            api_version: GGML_BACKEND_API_VERSION as c_int,
+            iface: shell::REG_IFACE,
+            context: ptr::null_mut(),
+        },
+        device: ggml_backend_device {
+            iface: shell::DEVICE_IFACE,
+            reg: ptr::null_mut(),
+            context: ptr::null_mut(),
+        },
+        buft: ggml_backend_buffer_type {
+            iface: buffer::BUFT_IFACE,
+            device: ptr::null_mut(),
+            context: ptr::null_mut(),
+        },
+        backend: ggml_backend {
+            guid: ptr::null_mut(),
+            iface: shell::BACKEND_IFACE,
+            device: ptr::null_mut(),
+            context: ptr::null_mut(),
+        },
+        guid: NPU_GUID_BYTES,
+    }));
+    unsafe {
+        (*hp).device.reg = &mut (*hp).reg;
+        (*hp).buft.device = &mut (*hp).device;
+        (*hp).backend.device = &mut (*hp).device;
+        (*hp).backend.guid = &mut (*hp).guid as *mut ggml_guid;
+    }
+    hp
+}
+
+pub(crate) fn registry() -> *mut ggml_backend_reg {
+    unsafe { &mut (*get_or_init()).reg }
+}
+
+fn device() -> *mut ggml_backend_device {
+    unsafe { &mut (*get_or_init()).device }
+}
+
+fn buffer_type() -> *mut ggml_backend_buffer_type {
+    unsafe { &mut (*get_or_init()).buft }
+}
+
+fn backend_instance() -> *mut ggml_backend {
+    unsafe { &mut (*get_or_init()).backend }
+}

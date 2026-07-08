@@ -1,0 +1,55 @@
+name: ci
+
+# Phase 0 gate: the cdylib must build on BOTH x86_64 and aarch64 (Snapdragon hosts are
+# ARM), and the registration harness must pass on the native runner. No x86-only code in
+# the shell / HAL is the invariant this protects.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pin the llama.cpp source used for headers. Bump deliberately.
+  LLAMA_CPP_REF: master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch ggml headers (llama.cpp)
+        run: git clone --depth 1 --branch "$LLAMA_CPP_REF" https://github.com/ggml-org/llama.cpp ../llama.cpp
+
+      - name: Install libclang + build deps
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
+
+      - name: Install aarch64 cross toolchain
+        if: matrix.cross
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Nightly is required for allocator_api (also pinned by rust-toolchain.toml).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      # bindgen runs host-side; the ggml ABI structs are LP64-identical on x86_64 and
+      # aarch64-linux, so host-generated bindings are correct for both. The cross build
+      # only needs a cross linker (below).
+      - name: Build (${{ matrix.target }})
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Registration check (native only)
+        if: '!matrix.cross'
+        run: ./tests/run_registration_check.sh target/${{ matrix.target }}/release/libggml_npu.so
