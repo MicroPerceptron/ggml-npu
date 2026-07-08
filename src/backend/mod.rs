@@ -59,9 +59,9 @@ fn get_or_init() -> *mut Handles {
 /// Device description: the probed NPU name if present, else a generic fallback. The
 /// literals contain no interior NUL, so `CString::new` cannot fail on them.
 fn make_description() -> CString {
-    match crate::vendor::primary_npu_name() {
-        Some(name) => CString::new(alloc::format!("NPU: {name} (Level Zero)"))
-            .unwrap_or_else(|_| CString::new("NPU (Level Zero)").unwrap()),
+    match crate::vendor::devices().into_iter().next() {
+        Some(dev) => CString::new(alloc::format!("NPU: {}", dev.name))
+            .unwrap_or_else(|_| CString::new("NPU").unwrap()),
         None => CString::new("Universal NPU (no device; CPU fallback)").unwrap(),
     }
 }

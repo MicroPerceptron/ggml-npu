@@ -1,44 +1,46 @@
-//! Intel NPU (`intel_vpu` driver) — the active bring-up vendor.
+//! Intel NPU (`intel_vpu` driver) — the active vendor.
 //!
-//! Runtime: **Level Zero** ([`ze`]) + the NPU graph extension (`ze_graph_ext.h`, to come).
-//! Compile: OpenVINO (`ov::Model` → native blob). Binding model: **INDEXED** — arguments
-//! are bound by graph argument index queried from the blob.
-//!
-//! Status: `probe` is live (dlopen Level Zero, enumerate the VPU device). Next:
-//! `ze_graph_ext.h` bindings, then `load`/`submit` over the graph extension and wiring the
-//! first `MUL_MAT` into `graph_compute`. The other verbs are `unimplemented!()` until then.
+//! Runtime: **Level Zero** ([`ze`], [`graph`]). Compile: OpenVINO via the shim, cached
+//! per-shape ([`compile`]). Op lowerings live under [`lower`]. [`IvpuVendor`] is the
+//! [`crate::vendor::Vendor`] impl the agnostic backend dispatches to; [`IvpuHal`] is the
+//! (still-aspirational) 5-verb submission seam.
 
 mod compile;
 mod graph;
+mod lower;
 mod ze;
 
 use alloc::vec::Vec;
 
 use crate::hal::{BufFlags, NpuHal};
+use crate::ops::Op;
+use crate::vendor::{DeviceInfo, Vendor};
 
 pub use ze::Device as IvpuDevice;
 
-/// Can we run a ggml `MUL_MAT` of shape `(M, K, N)` on the NPU? True iff a blob for it is
-/// available (compiled on first sight, then cached). Called from `supports_op`.
-pub fn can_matmul(m: i64, k: i64, n: i64) -> bool {
-    compile::get_or_compile_matmul(m, k, n).is_some()
-}
+/// The Intel NPU vendor: probe via Level Zero, lower/run ops via the JIT cache + graph submit.
+pub struct IvpuVendor;
 
-/// Run a ggml `MUL_MAT` of shape `(M, K, N)` on the NPU: `weight` is src0 (`[K,N]`),
-/// `activation` is src1 (`[K,M]`), result into `out` (`[N,M]`). Fetches the shape's blob from
-/// the JIT cache and feeds `[activation, weight]` in graph-arg order. Returns true on success.
-///
-/// TODO: re-probes the device and re-creates the graph every call; cache the device + a graph
-/// handle per shape, and route weights through a persistent device buffer.
-pub fn run_matmul(m: i64, k: i64, n: i64, weight: &[f32], activation: &[f32], out: &mut [f32]) -> bool {
-    let Some(blob) = compile::get_or_compile_matmul(m, k, n) else {
-        return false;
-    };
-    let devices = <IvpuHal as NpuHal>::probe();
-    let Some(dev) = devices.first() else {
-        return false;
-    };
-    graph::run_native_blob(dev, blob, &[activation, weight], out).is_ok()
+impl Vendor for IvpuVendor {
+    fn name(&self) -> &'static str {
+        "ivpu"
+    }
+
+    fn probe(&self) -> Vec<DeviceInfo> {
+        ze::probe().into_iter().map(|d| DeviceInfo { name: d.name }).collect()
+    }
+
+    fn can_lower(&self, op: Op) -> bool {
+        match op {
+            Op::MatMul { m, k, n } => compile::get_or_compile_matmul(m, k, n).is_some(),
+        }
+    }
+
+    fn run(&self, op: Op, inputs: &[&[f32]], output: &mut [f32]) -> bool {
+        match op {
+            Op::MatMul { m, k, n } => lower::matmul::run(m, k, n, inputs, output),
+        }
+    }
 }
 
 /// Bring-up self-test: run a native (OpenVINO-compiled) blob on the first discovered NPU,

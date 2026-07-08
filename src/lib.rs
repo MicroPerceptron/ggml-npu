@@ -35,7 +35,9 @@ pub(crate) mod ffi {
 }
 
 mod backend;
+mod engine;
 mod hal;
+mod ops;
 mod vendor;
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ pub extern "C" fn ggml_backend_init() -> *mut ffi::ggml_backend_reg {
 /// (Level Zero VPU devices), so the loader gates on real hardware being present.
 #[no_mangle]
 pub extern "C" fn ggml_backend_score() -> c_int {
-    vendor::npu_count() as c_int
+    vendor::devices().len() as c_int
 }
 
 /// Bring-up self-test (NOT part of the ggml ABI): run a native NPU blob through our Level

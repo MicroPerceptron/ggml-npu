@@ -65,7 +65,13 @@ static CACHE: Mutex<Option<HashMap<Key, Option<&'static [u8]>>>> = Mutex::new(No
 
 fn compile_matmul(m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     let s = shim()?;
-    if m <= 0 || k <= 0 || n <= 0 || m > i32::MAX as i64 || k > i32::MAX as i64 || n > i32::MAX as i64 {
+    if m <= 0
+        || k <= 0
+        || n <= 0
+        || m > i32::MAX as i64
+        || k > i32::MAX as i64
+        || n > i32::MAX as i64
+    {
         return None;
     }
     let mut blob: *mut u8 = core::ptr::null_mut();
