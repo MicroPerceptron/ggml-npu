@@ -181,6 +181,39 @@ pub(super) fn lib() -> Option<&'static ZeLib> {
     }
 }
 
+/// Allocate `size` bytes of NPU-accessible host memory in the shared runtime context. Such
+/// memory is pinned + mapped into the NPU's address space, so its pointer can be bound as a
+/// graph argument with **no per-dispatch copy** (unlike a plain `malloc` pointer, which the NPU
+/// cannot DMA). Page-aligned (matches the arg allocations in [`super::session`]). Returns null
+/// if Level Zero / the NPU is absent or the allocation fails — the caller then falls back to
+/// ordinary host memory (correct, just not zero-copy).
+pub(super) fn alloc_host(size: usize) -> *mut c_void {
+    let (Some(l), Some(rt)) = (lib(), runtime()) else {
+        return ptr::null_mut();
+    };
+    unsafe {
+        let mut hd: ze_host_mem_alloc_desc_t = mem::zeroed();
+        hd.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+        let mut p: *mut c_void = ptr::null_mut();
+        if (l.mem_alloc_host)(rt.context, &hd, size.max(1), 4096, &mut p) != ZE_RESULT_SUCCESS {
+            return ptr::null_mut();
+        }
+        p
+    }
+}
+
+/// Free memory returned by [`alloc_host`]. No-op on a null pointer or absent runtime.
+pub(super) fn free_host(p: *mut c_void) {
+    if p.is_null() {
+        return;
+    }
+    if let (Some(l), Some(rt)) = (lib(), runtime()) {
+        unsafe {
+            (l.mem_free)(rt.context, p);
+        }
+    }
+}
+
 /// A discovered Level Zero NPU device (and the driver that owns it, needed to create a
 /// context and fetch the graph dispatch table).
 pub struct Device {

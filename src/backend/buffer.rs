@@ -1,16 +1,22 @@
-//! Buffer-type and buffer vtables: a minimal host allocation backed by the crate's
-//! global allocator. Required to be present and valid, but never exercised while
-//! `supports_op == false` (no tensor is ever placed on this device in Phase 0). The
-//! set/get/memset paths become real weight-upload/repack code in Phase 2.
+//! Buffer-type and buffer vtables — the **zero-copy** memory model.
+//!
+//! Allocations are NPU-mapped host memory (via the present vendor's `alloc_host`, e.g. Intel's
+//! `zeMemAllocHost`): pinned + mapped into the NPU's address space so a tensor placed here can be
+//! bound directly as a graph argument with no per-dispatch copy. It's still host-visible
+//! (`is_host == true`), so the CPU reads/writes `tensor->data` directly and `set_tensor` (the
+//! one-time weight upload at model load) is a plain memcpy into NPU memory. A weight offloaded to
+//! us therefore costs one copy at load and **zero copies per token**.
 
-use alloc::alloc::{alloc, dealloc};
-use core::alloc::Layout;
 use core::ffi::{c_char, c_void};
 use core::ptr;
 
 use crate::ffi::*;
 
-const BUFFER_ALIGN: usize = 32;
+/// Page alignment for tensor offsets within a buffer. The base is page-aligned (the vendor
+/// allocator returns page-aligned memory); keeping per-tensor offsets page-aligned too means
+/// every bound argument pointer (`base + offset`) is page-aligned, which the NPU DMA path wants.
+/// Weights are large, so the padding is negligible.
+const BUFFER_ALIGN: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Buffer type
@@ -32,11 +38,13 @@ unsafe extern "C" fn buft_alloc_buffer(
     buft: ggml_backend_buffer_type_t,
     size: usize,
 ) -> ggml_backend_buffer_t {
-    let layout = match Layout::from_size_align(size.max(1), BUFFER_ALIGN) {
-        Ok(l) => l,
-        Err(_) => return ptr::null_mut(),
+    // NPU-mapped host memory so tensors placed here bind as graph args with no copy. If no
+    // vendor is present (or the device allocation fails) we return null: ggml treats that as
+    // OOM for this buffer type rather than silently handing back unbindable host memory.
+    let base = match crate::vendor::present() {
+        Some(v) => v.alloc_host(size.max(1)),
+        None => ptr::null_mut(),
     };
-    let base = alloc(layout) as *mut c_void;
     if base.is_null() {
         return ptr::null_mut();
     }
@@ -75,12 +83,11 @@ unsafe extern "C" fn buffer_free_buffer(buffer: ggml_backend_buffer_t) {
         return;
     }
     let base = (*buffer).context;
-    let size = (*buffer).size.max(1);
     if base.is_null() {
         return;
     }
-    if let Ok(layout) = Layout::from_size_align(size, BUFFER_ALIGN) {
-        dealloc(base as *mut u8, layout);
+    if let Some(v) = crate::vendor::present() {
+        v.free_host(base);
     }
 }
 

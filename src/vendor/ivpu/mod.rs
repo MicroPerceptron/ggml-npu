@@ -13,9 +13,10 @@ mod session;
 mod ze;
 
 use alloc::vec::Vec;
+use core::ffi::c_void;
 
 use crate::hal::{BufFlags, NpuHal};
-use crate::ops::Op;
+use crate::ops::{Op, Operand};
 use crate::vendor::{DeviceInfo, Vendor};
 
 pub use ze::Device as IvpuDevice;
@@ -44,10 +45,18 @@ impl Vendor for IvpuVendor {
         }
     }
 
-    fn run(&self, op: Op, inputs: &[&[f32]], output: &mut [f32]) -> bool {
+    fn run(&self, op: Op, inputs: &[Operand], output: &Operand) -> bool {
         match op {
             Op::MatMul { m, k, n } => lower::matmul::run(m, k, n, inputs, output),
         }
+    }
+
+    unsafe fn alloc_host(&self, size: usize) -> *mut c_void {
+        ze::alloc_host(size)
+    }
+
+    unsafe fn free_host(&self, ptr: *mut c_void) {
+        ze::free_host(ptr)
     }
 }
 

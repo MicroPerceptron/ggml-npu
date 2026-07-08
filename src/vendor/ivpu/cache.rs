@@ -1,4 +1,4 @@
-//! A lock-free, append-only cache keyed by an op shape `(M, K, N)`.
+//! A lock-free, append-only cache keyed by a `Copy + PartialEq` key.
 //!
 //! Reads (the hot path) are a plain atomic-load traversal — no lock (per the atomics-over-locks
 //! rule). Entries are never removed (they hold leaked, process-lifetime artifacts), so there is
@@ -6,33 +6,40 @@
 //! lookup touches one line per entry and the hot `head` never false-shares. Concurrent misses of
 //! the same key could duplicate an entry (harmless — both valid, lookup returns one), but compute
 //! is single-threaded per backend, so that path is a formality.
+//!
+//! Two keys are in use: `(M,K,N)` shape (the JIT blob / per-shape graph) and the per-node operand
+//! pointer-tuple (the recorded execute list) — see [`ShapeKey`] / [`PtrKey`].
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+/// Op-shape key: `(M, K, N)`.
 pub(super) type ShapeKey = (i64, i64, i64);
+/// Per-node binding key: the operand data-pointer addresses `(activation, weight, output)`.
+/// Uniquely identifies one graph node's bindings, which are stable across tokens.
+pub(super) type PtrKey = (usize, usize, usize);
 
-struct Node<V> {
-    key: ShapeKey,
+struct Node<K, V> {
+    key: K,
     val: V,
-    next: AtomicPtr<Node<V>>,
+    next: AtomicPtr<Node<K, V>>,
 }
 
 /// Aligned to a cacheline so the hot `head` atomic (read on every lookup) never false-shares
 /// with adjacent statics. (Nodes are left unaligned — they're heap-scattered anyway, and forcing
 /// one-per-line would only waste space, not improve traversal locality.)
 #[repr(align(64))]
-pub(super) struct ShapeCache<V: Copy> {
-    head: AtomicPtr<Node<V>>,
+pub(super) struct Cache<K, V> {
+    head: AtomicPtr<Node<K, V>>,
 }
 
-impl<V: Copy> ShapeCache<V> {
+impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
     pub(super) const fn new() -> Self {
-        ShapeCache { head: AtomicPtr::new(core::ptr::null_mut()) }
+        Cache { head: AtomicPtr::new(core::ptr::null_mut()) }
     }
 
     /// Lock-free lookup.
-    pub(super) fn get(&self, key: ShapeKey) -> Option<V> {
+    pub(super) fn get(&self, key: K) -> Option<V> {
         let mut p = self.head.load(Ordering::Acquire);
         while !p.is_null() {
             let node = unsafe { &*p };
@@ -45,8 +52,8 @@ impl<V: Copy> ShapeCache<V> {
     }
 
     /// Cached value for `key`, computing + inserting it on a miss. `f` runs with **no lock held**
-    /// (it may compile a blob / build a session — seconds); on a race the loser's node is dropped.
-    pub(super) fn get_or_insert_with(&self, key: ShapeKey, f: impl FnOnce() -> V) -> V {
+    /// (it may compile a blob / build a graph — seconds); on a race the loser's node is dropped.
+    pub(super) fn get_or_insert_with(&self, key: K, f: impl FnOnce() -> V) -> V {
         if let Some(v) = self.get(key) {
             return v;
         }
@@ -75,5 +82,8 @@ impl<V: Copy> ShapeCache<V> {
     }
 }
 
-// SAFETY: shared across threads; all mutation is via atomics, values are Copy + 'static.
-unsafe impl<V: Copy + Send> Sync for ShapeCache<V> {}
+/// A per-shape cache (the common case: JIT blob + graph keyed by `(M,K,N)`).
+pub(super) type ShapeCache<V> = Cache<ShapeKey, V>;
+
+// SAFETY: shared across threads; all mutation is via atomics, keys/values are Copy + 'static.
+unsafe impl<K: Copy + Send, V: Copy + Send> Sync for Cache<K, V> {}

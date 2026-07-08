@@ -1,13 +1,9 @@
 //! MUL_MAT recognition + tensor mapping (vendor-agnostic). Lowering to a device artifact is
 //! per-vendor (`crate::vendor::*::lower::matmul`).
 
-use super::Op;
+use super::{Op, Operand};
 use crate::ffi::*;
 use crate::vendor::Vendor;
-
-fn nelements(t: &ggml_tensor) -> usize {
-    (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) as usize
-}
 
 /// Recognize a 2D f32 `MUL_MAT`: src0 (weight) `[K,N]`, src1 (activation) `[K,M]`, both
 /// contiguous, K matching, within sane bounds. Returns the shape key.
@@ -41,20 +37,21 @@ pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
     Some(Op::MatMul { m, k, n })
 }
 
-/// Read the operand host data and run on `vendor`. Contract: the artifact's input args are
-/// ordered `[activation, weight]` (src1, then src0); the output maps directly to dst.
+/// Describe the operands (pointer + element count + NPU-ownership) and run on `vendor`, which
+/// binds them directly when they're in NPU memory (no copy) and bounces them otherwise.
+/// Contract: the artifact's input args are ordered `[activation, weight]` (src1, then src0);
+/// the output maps directly to dst.
 pub unsafe fn run(op: Op, node: *mut ggml_tensor, vendor: &dyn Vendor) -> bool {
     let t = &*node;
     let (src0, src1) = (t.src[0], t.src[1]);
     if src0.is_null() || src1.is_null() || t.data.is_null() {
         return false;
     }
-    let (s0, s1) = (&*src0, &*src1);
-    if s0.data.is_null() || s1.data.is_null() {
+    if (*src0).data.is_null() || (*src1).data.is_null() {
         return false;
     }
-    let weight = core::slice::from_raw_parts(s0.data as *const f32, nelements(s0));
-    let activation = core::slice::from_raw_parts(s1.data as *const f32, nelements(s1));
-    let out = core::slice::from_raw_parts_mut(t.data as *mut f32, nelements(t));
-    vendor.run(op, &[activation, weight], out)
+    let weight = Operand::from_tensor(src0);
+    let activation = Operand::from_tensor(src1);
+    let out = Operand::from_tensor(node as *const ggml_tensor);
+    vendor.run(op, &[activation, weight], &out)
 }

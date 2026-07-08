@@ -18,8 +18,9 @@ pub mod xdna;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 
-use crate::ops::Op;
+use crate::ops::{Op, Operand};
 
 /// A discovered NPU device — the agnostic view used for the ggml device description.
 pub struct DeviceInfo {
@@ -35,8 +36,16 @@ pub trait Vendor: Sync {
     fn probe(&self) -> Vec<DeviceInfo>;
     /// Can this op run here? (Compiles + caches the artifact on first sight.)
     fn can_lower(&self, op: Op) -> bool;
-    /// Run `op` with operands already extracted (in the op's arg order) into `inputs`/`output`.
-    fn run(&self, op: Op, inputs: &[&[f32]], output: &mut [f32]) -> bool;
+    /// Run `op` on the device. `inputs` are the op's operands in arg order, `output` the dst;
+    /// each carries whether it lives in NPU memory (bind directly) or must be staged.
+    fn run(&self, op: Op, inputs: &[Operand], output: &Operand) -> bool;
+
+    /// Allocate `size` bytes of NPU-mapped host memory for the backend's buffer type — memory
+    /// whose pointer can be bound as a graph argument with **no copy**. Null on failure (the
+    /// buffer type then reports OOM rather than hand out unbindable memory).
+    unsafe fn alloc_host(&self, size: usize) -> *mut c_void;
+    /// Free memory returned by [`alloc_host`](Vendor::alloc_host).
+    unsafe fn free_host(&self, ptr: *mut c_void);
 }
 
 static IVPU: ivpu::IvpuVendor = ivpu::IvpuVendor;
