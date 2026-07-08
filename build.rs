@@ -1,22 +1,19 @@
-//! Build script: generate ggml C-ABI bindings with bindgen.
+//! Build script: generate ggml + Level Zero C-ABI bindings with bindgen.
 //!
-//! Header source tree is the sibling llama.cpp checkout by default; override with
-//! `GGML_DIR=/path/to/llama.cpp`.
+//! ggml headers come from the sibling llama.cpp checkout by default (override with
+//! `GGML_DIR`). Level Zero types come from the vendored `ze_api.h`; we generate **types
+//! and constants only** — the functions are resolved at runtime via `dlopen`/`dlsym`
+//! (see `vendor/ivpu/ze.rs`), so the cdylib has no hard dependency on `libze_loader`.
 //!
-//! Linking: by default we leave the `ggml_*` helper symbols (e.g.
-//! ggml_backend_buffer_init) UNDEFINED. A cdylib is allowed undefined symbols; they
-//! resolve at dlopen time from the host process (llama-cli / test-backend-ops), which
-//! already has ggml loaded in its global scope. Set `GGML_LIB_DIR=/path/with/libggml`
-//! to link against a prebuilt ggml instead (deterministic, catches typos early).
+//! Linking: `ggml_*` helper symbols are left UNDEFINED and resolve at dlopen from the
+//! host. Set `GGML_LIB_DIR` to link a prebuilt ggml instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Resolve clang's resource directory (the freestanding headers: stddef.h, stdint.h,
-/// stdbool.h). Prefer the installed clang's own answer; fall back to scanning known
-/// locations for machines whose libclang can't self-locate them (e.g. Fedora's
-/// lib/lib64 split).
+/// Resolve clang's resource directory (freestanding headers: stddef.h, stdint.h). Prefer
+/// the installed clang's own answer; fall back to scanning known locations.
 fn clang_resource_dir() -> Option<String> {
     if let Ok(out) = Command::new("clang").arg("-print-resource-dir").output() {
         if out.status.success() {
@@ -46,6 +43,26 @@ fn clang_resource_dir() -> Option<String> {
     None
 }
 
+/// Common bindgen settings: no_std output, clang resource dir, and host-target parsing
+/// (cross builds need only a linker, not a cross libc sysroot — ggml/L0 ABI structs are
+/// LP64-identical across x86_64 and aarch64-linux).
+fn base_builder(header: &str, resource: &Option<String>, host: &str) -> bindgen::Builder {
+    let mut b = bindgen::Builder::default()
+        .header(header)
+        .use_core()
+        .clang_arg("-xc")
+        .default_enum_style(bindgen::EnumVariation::Consts)
+        .prepend_enum_name(false)
+        .layout_tests(false);
+    if let Some(r) = resource {
+        b = b.clang_arg(format!("-resource-dir={r}"));
+    }
+    if !host.is_empty() {
+        b = b.clang_arg(format!("--target={host}"));
+    }
+    b
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let ggml_root = env::var("GGML_DIR")
@@ -53,14 +70,19 @@ fn main() {
         .unwrap_or_else(|_| manifest.join("../llama.cpp"));
     let inc = ggml_root.join("ggml/include");
     let src = ggml_root.join("ggml/src");
-
     assert!(
         inc.join("ggml-backend.h").exists(),
         "ggml headers not found under {} — set GGML_DIR to your llama.cpp checkout",
         ggml_root.display()
     );
+    // ze_graph_ext.h pulls in ze_api.h + ze_graph_profiling_ext.h (same dir), so one bindgen
+    // pass yields the core Level Zero types plus the NPU graph extension.
+    let ze_dir = manifest.join("src/vendor/ivpu/level_zero");
+    let ze_header = ze_dir.join("ze_graph_ext.h");
+    assert!(ze_header.exists(), "vendored ze_graph_ext.h not found at {}", ze_header.display());
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed={}", ze_header.display());
     println!("cargo:rerun-if-env-changed=GGML_DIR");
     println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");
 
@@ -69,35 +91,18 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=ggml-base");
     }
 
-    let mut builder = bindgen::Builder::default()
-        .header("wrapper.h")
-        .clang_arg(format!("-I{}", inc.display()))
-        .clang_arg(format!("-I{}", src.display()))
-        .clang_arg("-xc")
-        // no_std crate: emit ::core::ffi::* instead of ::std::os::raw::*.
-        .use_core();
-
-    // Point libclang at clang's resource dir so the freestanding headers resolve
-    // (some libclang installs don't auto-find them across a lib/lib64 split).
-    if let Some(rd) = clang_resource_dir() {
-        builder = builder.clang_arg(format!("-resource-dir={rd}"));
-    }
-
-    // Force host-target parsing. bindgen otherwise derives its clang `--target` from
-    // cargo's $TARGET, which for a cross build would require a full cross libc sysroot
-    // just to parse <stdlib.h>. ggml's ABI structs are LP64-identical across our x86_64
-    // and aarch64-linux targets, so host-parsed bindings are correct for both — the cross
-    // build then needs only a cross linker, not a sysroot. (Revisit for a non-LP64 or
-    // Windows LLP64 host.)
+    let resource = clang_resource_dir();
     let host = env::var("HOST").unwrap_or_default();
+    // Neutralize bindgen's auto --target (would demand a cross sysroot); see base_builder.
     if !host.is_empty() {
         env::set_var("TARGET", &host);
-        builder = builder.clang_arg(format!("--target={host}"));
     }
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let bindings = builder
-        .default_enum_style(bindgen::EnumVariation::Consts)
-        .prepend_enum_name(false)
+    // ---- ggml bindings ----
+    base_builder("wrapper.h", &resource, &host)
+        .clang_arg(format!("-I{}", inc.display()))
+        .clang_arg(format!("-I{}", src.display()))
         .allowlist_type("ggml_backend.*")
         .allowlist_type("ggml_tensor")
         .allowlist_type("ggml_cgraph")
@@ -105,12 +110,22 @@ fn main() {
         .allowlist_type("ggml_guid.*")
         .allowlist_function("ggml_backend_buffer_init")
         .allowlist_var("GGML_BACKEND_API_VERSION")
-        .layout_tests(false)
         .generate()
-        .expect("bindgen failed to generate ggml bindings");
-
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
+        .expect("bindgen failed for ggml")
         .write_to_file(out.join("bindings.rs"))
-        .expect("failed to write bindings.rs");
+        .expect("write bindings.rs");
+
+    // ---- Level Zero bindings (types + constants only; functions are dlsym'd) ----
+    // ze_graph_ext.h uses `bool` without including <stdbool.h> (valid in C++, not C), so
+    // force-include it for the C parse.
+    base_builder(ze_header.to_str().unwrap(), &resource, &host)
+        .clang_arg(format!("-I{}", ze_dir.display()))
+        .clang_arg("-include")
+        .clang_arg("stdbool.h")
+        .allowlist_type("ze_.*")
+        .allowlist_var("ZE_.*")
+        .generate()
+        .expect("bindgen failed for Level Zero")
+        .write_to_file(out.join("ze_bindings.rs"))
+        .expect("write ze_bindings.rs");
 }

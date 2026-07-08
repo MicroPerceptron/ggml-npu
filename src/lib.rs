@@ -15,6 +15,9 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+extern crate std;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::{c_int, c_void};
 use core::panic::PanicInfo;
@@ -77,6 +80,19 @@ fn on_panic(_info: &PanicInfo) -> ! {
     unsafe { abort() }
 }
 
+// The precompiled `core`/`alloc` are built with unwinding and reference these symbols,
+// even though `panic = "abort"` means we never unwind. Provide self-contained no-op shims
+// so the cdylib does not depend on the host's libgcc; neither is ever actually called (a
+// panic aborts in `on_panic` first). A leaner alternative is `-Zbuild-std` with
+// `panic_immediate_abort`, but that would force an explicit `--target` on every build.
+#[no_mangle]
+extern "C" fn rust_eh_personality() {}
+
+#[no_mangle]
+extern "C" fn _Unwind_Resume() -> ! {
+    unsafe { abort() }
+}
+
 // ---------------------------------------------------------------------------
 // DL entry points — the whole binary contract.
 // ---------------------------------------------------------------------------
@@ -88,8 +104,35 @@ pub extern "C" fn ggml_backend_init() -> *mut ffi::ggml_backend_reg {
     backend::registry()
 }
 
-/// Optional support probe; non-zero = usable. The CPU-fallback skeleton is always up.
+/// Optional support probe; non-zero = usable. Reports the number of NPUs discovered
+/// (Level Zero VPU devices), so the loader gates on real hardware being present.
 #[no_mangle]
 pub extern "C" fn ggml_backend_score() -> c_int {
-    1
+    vendor::npu_count() as c_int
+}
+
+/// Bring-up self-test (NOT part of the ggml ABI): run a native NPU blob through our Level
+/// Zero HAL. Feeds `input` (f32) to the graph's first input, writes its first output into
+/// `output` (f32). Returns the number of f32 outputs written, or negative on error. Used by
+/// the Intel submit-path harness; will be removed once wired into `graph_compute`.
+#[no_mangle]
+pub extern "C" fn ggml_npu_ivpu_selftest(
+    blob: *const u8,
+    blob_len: usize,
+    input: *const f32,
+    input_len: usize,
+    output: *mut f32,
+    output_cap: usize,
+) -> c_int {
+    if blob.is_null() || output.is_null() || (input.is_null() && input_len != 0) {
+        return -1;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(blob, blob_len) };
+    let input = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(input, input_len) }
+    };
+    let output = unsafe { core::slice::from_raw_parts_mut(output, output_cap) };
+    vendor::ivpu::run_blob_selftest(blob, input, output)
 }

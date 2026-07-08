@@ -8,7 +8,10 @@ behind one runtime seam, with CPU fallback for everything it does not claim.
 ggml `ACCEL` device and claims **no** operations (`supports_op == false`), so the scheduler
 runs the whole model on CPU — proving registration + the C ABI + the DL entry point. The
 Intel NPU stack is validated end-to-end (a fixed-shape MatMul runs on the Lunar Lake NPU and
-matches CPU); the Level Zero submit path is next. See
+matches CPU). **The Level Zero submit path works in Rust:** the backend `dlopen`s the loader,
+enumerates the NPU, and runs an OpenVINO-compiled native blob through the graph extension,
+reproducing OpenVINO's output on hardware (see `ggml_npu_ivpu_selftest`). Wiring this into
+`graph_compute` (with a shape-keyed blob cache) is next. See
 [`../llama.cpp/tmp/NPU-gameplan.md`](../llama.cpp/tmp/NPU-gameplan.md) and
 [`../llama.cpp/tmp/NPU.md`](../llama.cpp/tmp/NPU.md).
 
@@ -74,7 +77,8 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 
 ## What's next
 
-Bring up `vendor/ivpu`: bindgen `ze_api.h` + `ze_graph_ext.h`, implement `probe` (zeInit +
-enumerate the NPU) and `load`/`submit` over the graph extension, load an OpenVINO-compiled
-blob, and wire the first fixed-shape `MUL_MAT` into `graph_compute` — verified vs CPU with
-`ggml_backend_compare_graph_backend`.
+`vendor/ivpu`: `probe` and the raw Level Zero graph-ext submit (`ze.rs` + `graph.rs`) are
+done and verified on hardware. Next: wire it into `graph_compute` — have `supports_op` claim
+a fixed-shape `MUL_MAT`, map ggml tensors to graph args, and compile-on-miss into a
+shape-keyed blob cache — verified vs CPU with `ggml_backend_compare_graph_backend`. Then
+decompose `run_native_blob` into the `NpuHal` load/alloc/bind/submit/sync verbs.

@@ -15,6 +15,10 @@ pub mod ivpu;
 pub mod stub;
 pub mod xdna;
 
+use alloc::string::String;
+
+use crate::hal::NpuHal;
+
 /// The NPU families this backend targets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Vendor {
@@ -24,4 +28,16 @@ pub enum Vendor {
     Xdna,
     /// Qualcomm Snapdragon X (Hexagon HTP), aarch64 host.
     Hexagon,
+}
+
+/// Number of NPUs discovered across all supported vendors. Currently probes Intel only;
+/// AMD/Qualcomm join here as they come online.
+pub fn npu_count() -> usize {
+    ivpu::IvpuHal::probe().len()
+}
+
+/// Human-readable name of the primary discovered NPU, if any (for the ggml device
+/// description).
+pub fn primary_npu_name() -> Option<String> {
+    ivpu::IvpuHal::probe().into_iter().next().map(|d| d.name)
 }

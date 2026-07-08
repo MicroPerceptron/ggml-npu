@@ -9,23 +9,27 @@
 mod buffer;
 mod shell;
 
-use core::ffi::c_int;
+use core::ffi::{c_char, c_int};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use alloc::boxed::Box;
+use alloc::ffi::CString;
 
 use crate::ffi::*;
 
 const _: () = assert!(GGML_BACKEND_API_VERSION == 2);
 
-/// One allocation holding the whole self-referential vtable graph.
+/// One allocation holding the whole self-referential vtable graph, plus the owned device
+/// description string (the probed NPU name, so `dev_get_description` can hand out a stable
+/// pointer).
 struct Handles {
     reg: ggml_backend_reg,
     device: ggml_backend_device,
     buft: ggml_backend_buffer_type,
     backend: ggml_backend,
     guid: ggml_guid,
+    desc: CString,
 }
 
 // SAFETY: written once during init, only read afterwards, never moved.
@@ -49,6 +53,16 @@ fn get_or_init() -> *mut Handles {
             drop(unsafe { Box::from_raw(built) });
             winner
         }
+    }
+}
+
+/// Device description: the probed NPU name if present, else a generic fallback. The
+/// literals contain no interior NUL, so `CString::new` cannot fail on them.
+fn make_description() -> CString {
+    match crate::vendor::primary_npu_name() {
+        Some(name) => CString::new(alloc::format!("NPU: {name} (Level Zero)"))
+            .unwrap_or_else(|_| CString::new("NPU (Level Zero)").unwrap()),
+        None => CString::new("Universal NPU (no device; CPU fallback)").unwrap(),
     }
 }
 
@@ -77,6 +91,7 @@ fn build() -> *mut Handles {
             context: ptr::null_mut(),
         },
         guid: NPU_GUID_BYTES,
+        desc: make_description(),
     }));
     unsafe {
         (*hp).device.reg = &mut (*hp).reg;
@@ -101,4 +116,9 @@ fn buffer_type() -> *mut ggml_backend_buffer_type {
 
 fn backend_instance() -> *mut ggml_backend {
     unsafe { &mut (*get_or_init()).backend }
+}
+
+/// Stable pointer to the owned device-description C string.
+fn description() -> *const c_char {
+    unsafe { (*get_or_init()).desc.as_ptr() }
 }

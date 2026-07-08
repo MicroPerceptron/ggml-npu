@@ -58,7 +58,7 @@ unsafe extern "C" fn dev_get_name(_dev: ggml_backend_dev_t) -> *const c_char {
 }
 
 unsafe extern "C" fn dev_get_description(_dev: ggml_backend_dev_t) -> *const c_char {
-    c"Universal NPU (Phase 0 skeleton, CPU fallback)".as_ptr()
+    super::description()
 }
 
 unsafe extern "C" fn dev_get_memory(_dev: ggml_backend_dev_t, free: *mut usize, total: *mut usize) {
