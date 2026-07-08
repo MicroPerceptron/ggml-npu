@@ -17,16 +17,34 @@ use crate::hal::{BufFlags, NpuHal};
 
 pub use ze::Device as IvpuDevice;
 
+/// Precompiled shape-generic MatMul blob for `[M=1, K=64, N=64]` (weights are a graph
+/// input, so one blob serves any weights of this shape). Graph input args are ordered
+/// `[activation, weight]`; see `ov_matmul_ggml.cpp`.
+static MATMUL_1X64X64: &[u8] = include_bytes!("artifacts/matmul_1x64x64.blob");
+
+/// Run a ggml `MUL_MAT` of the supported fixed shape on the NPU: `weight` is src0
+/// (`[N,K]=[64,64]`), `activation` is src1 (`[K,M]=[64,1]`), result into `out`
+/// (`[N,M]=[64,1]`). Returns true on success. Feeds `[activation, weight]` in arg order.
+///
+/// TODO: this re-probes and re-creates the graph every call; cache the device + graph
+/// handle, and route weights through a persistent buffer once the JIT cache lands.
+pub fn run_mul_mat(weight: &[f32], activation: &[f32], out: &mut [f32]) -> bool {
+    let devices = <IvpuHal as NpuHal>::probe();
+    let Some(dev) = devices.first() else {
+        return false;
+    };
+    graph::run_native_blob(dev, MATMUL_1X64X64, &[activation, weight], out).is_ok()
+}
+
 /// Bring-up self-test: run a native (OpenVINO-compiled) blob on the first discovered NPU,
 /// feeding `input` (f32) and writing the first output into `output` (f32). Returns the
-/// number of outputs written, or a negative error. This is a scaffold for the eventual
-/// `load`/`submit` verbs + `graph_compute` wiring, not a shipped entry point.
+/// number of outputs written, or a negative error. Scaffold for the submit path.
 pub fn run_blob_selftest(blob: &[u8], input: &[f32], output: &mut [f32]) -> i32 {
     let devices = <IvpuHal as NpuHal>::probe();
     let Some(dev) = devices.first() else {
         return -100;
     };
-    match graph::run_native_blob(dev, blob, input, output) {
+    match graph::run_native_blob(dev, blob, &[input], output) {
         Ok(n) => n as i32,
         Err(code) if code > 0 => -code,
         Err(0) => -1,

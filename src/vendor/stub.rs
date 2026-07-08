@@ -36,7 +36,9 @@ impl NpuHal for StubHal {
 
     fn probe() -> Vec<StubDevice> {
         let mut v = Vec::new();
-        v.push(StubDevice { name: "npu-stub0".to_string() });
+        v.push(StubDevice {
+            name: "npu-stub0".to_string(),
+        });
         v
     }
 
@@ -45,7 +47,10 @@ impl NpuHal for StubHal {
     }
 
     fn load(&self, _dev: &StubDevice, artifact: &[u8]) -> StubBinary {
-        StubBinary { bytes: artifact.to_vec(), args: Vec::new() }
+        StubBinary {
+            bytes: artifact.to_vec(),
+            args: Vec::new(),
+        }
     }
 
     fn alloc(&self, _dev: &StubDevice, bytes: usize, _flags: BufFlags) -> StubBuffer {

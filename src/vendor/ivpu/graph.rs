@@ -20,15 +20,17 @@ fn chk(r: ze_result_t) -> Result<(), i32> {
     }
 }
 
-/// Run `blob` on `dev`, feeding the first INPUT argument from `input` (f32) and copying the
-/// first OUTPUT argument into `output` (f32). Returns the number of f32 outputs written.
+/// Run `blob` on `dev`, feeding its INPUT arguments in order from `inputs` (each f32) and
+/// copying the first OUTPUT argument into `output` (f32). Returns the number of f32 outputs
+/// written. `inputs` must be in the graph's input-argument order (for our MatMul blob:
+/// `[activation, weight]`); each is only written if its length matches the arg.
 ///
 /// Assumes FP32 device I/O (true for the OpenVINO f32 MatMul); other precisions are left
 /// zero-filled for now. All Level Zero objects are cleaned up before returning.
 pub(super) fn run_native_blob(
     dev: &ze::Device,
     blob: &[u8],
-    input: &[f32],
+    inputs: &[&[f32]],
     output: &mut [f32],
 ) -> Result<usize, i32> {
     let l = ze::lib().ok_or(-1)?;
@@ -40,7 +42,7 @@ pub(super) fn run_native_blob(
         chk((l.context_create)(dev.driver, &ctx_desc, &mut ctx))?;
 
         // Run the body; always tear the context down afterwards.
-        let r = run_inner(l, dev, ctx, blob, input, output);
+        let r = run_inner(l, dev, ctx, blob, inputs, output);
         (l.context_destroy)(ctx);
         r
     }
@@ -51,7 +53,7 @@ unsafe fn run_inner(
     dev: &ze::Device,
     ctx: ze_context_handle_t,
     blob: &[u8],
-    input: &[f32],
+    inputs: &[&[f32]],
     output: &mut [f32],
 ) -> Result<usize, i32> {
     // Graph dispatch table (v1.0 fields only; base name gives a >=1.0 table).
@@ -91,6 +93,7 @@ unsafe fn run_inner(
     let mut mems: Vec<*mut c_void> = Vec::new();
     let mut out_ptr: *mut c_void = ptr::null_mut();
     let mut out_elems: usize = 0;
+    let mut input_idx: usize = 0;
 
     for i in 0..gp.numGraphArgs {
         let mut ap: ze_graph_argument_properties_t = mem::zeroed();
@@ -129,12 +132,16 @@ unsafe fn run_inner(
 
         if ap.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
             if psz == 4 {
-                let dst = mem_ptr as *mut f32;
-                let n = core::cmp::min(input.len(), elems);
-                for j in 0..n {
-                    *dst.add(j) = input[j];
+                if let Some(src) = inputs.get(input_idx) {
+                    if src.len() == elems {
+                        let dst = mem_ptr as *mut f32;
+                        for j in 0..elems {
+                            *dst.add(j) = src[j];
+                        }
+                    }
                 }
             }
+            input_idx += 1;
         } else {
             out_ptr = mem_ptr;
             out_elems = elems;

@@ -103,16 +103,36 @@ unsafe extern "C" fn dev_get_buffer_type(_dev: ggml_backend_dev_t) -> ggml_backe
     super::buffer_type()
 }
 
-unsafe extern "C" fn dev_supports_op(_dev: ggml_backend_dev_t, _op: *const ggml_tensor) -> bool {
-    // Phase 0: claim nothing. Recognizing fusible regions is Phase 3 work.
-    false
+unsafe extern "C" fn dev_supports_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
+    // First real claim: a single fixed-shape f32 MUL_MAT we have a precompiled blob for —
+    // src0 (weight) [K=64, N=64], src1 (activation) [K=64, M=1]. Everything else -> CPU.
+    if op.is_null() {
+        return false;
+    }
+    let t = &*op;
+    if t.op != GGML_OP_MUL_MAT || t.type_ != GGML_TYPE_F32 {
+        return false;
+    }
+    let (src0, src1) = (t.src[0], t.src[1]);
+    if src0.is_null() || src1.is_null() {
+        return false;
+    }
+    let (s0, s1) = (&*src0, &*src1);
+    s0.type_ == GGML_TYPE_F32
+        && s1.type_ == GGML_TYPE_F32
+        && s0.ne == [64i64, 64, 1, 1]
+        && s1.ne == [64i64, 1, 1, 1]
+        && ggml_is_contiguous(src0 as *const ggml_tensor)
+        && ggml_is_contiguous(src1 as *const ggml_tensor)
 }
 
 unsafe extern "C" fn dev_supports_buft(
     _dev: ggml_backend_dev_t,
-    _buft: ggml_backend_buffer_type_t,
+    buft: ggml_backend_buffer_type_t,
 ) -> bool {
-    false
+    // Integrated SoC: NPU and CPU share RAM, so we can read operands from any host buffer
+    // (ours or the CPU backend's) without a copy. Accept host bufts.
+    !buft.is_null() && ggml_backend_buft_is_host(buft)
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +167,45 @@ unsafe extern "C" fn backend_free(_backend: ggml_backend_t) {
 
 unsafe extern "C" fn backend_graph_compute(
     _backend: ggml_backend_t,
-    _cgraph: *mut ggml_cgraph,
+    cgraph: *mut ggml_cgraph,
 ) -> ggml_status {
-    // Unreachable while supports_op == false; return SUCCESS for an empty assignment.
+    if cgraph.is_null() {
+        return GGML_STATUS_SUCCESS;
+    }
+    // The scheduler hands us a split of claimed ops; run each MUL_MAT on the NPU.
+    let n = ggml_graph_n_nodes(cgraph);
+    for i in 0..n {
+        let node = ggml_graph_node(cgraph, i);
+        if node.is_null() {
+            continue;
+        }
+        let t = &*node;
+        if t.op != GGML_OP_MUL_MAT {
+            continue;
+        }
+        if !dispatch_mul_mat(t) {
+            return GGML_STATUS_FAILED;
+        }
+    }
     GGML_STATUS_SUCCESS
+}
+
+fn nelements(t: &ggml_tensor) -> usize {
+    (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) as usize
+}
+
+/// Read src0 (weight) and src1 (activation) host data, run the NPU MatMul, write dst.
+unsafe fn dispatch_mul_mat(dst: &ggml_tensor) -> bool {
+    let (src0, src1) = (dst.src[0], dst.src[1]);
+    if src0.is_null() || src1.is_null() || dst.data.is_null() {
+        return false;
+    }
+    let (s0, s1) = (&*src0, &*src1);
+    if s0.data.is_null() || s1.data.is_null() {
+        return false;
+    }
+    let w = core::slice::from_raw_parts(s0.data as *const f32, nelements(s0));
+    let x = core::slice::from_raw_parts(s1.data as *const f32, nelements(s1));
+    let out = core::slice::from_raw_parts_mut(dst.data as *mut f32, nelements(dst));
+    crate::vendor::ivpu::run_mul_mat(w, x, out)
 }
