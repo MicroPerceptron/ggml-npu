@@ -29,6 +29,8 @@ pub enum SgOp {
     MatMul { n: i64 },
     /// Elementwise `out = a * b`.
     Mul,
+    /// Elementwise `out = a + b`.
+    Add,
     /// `out = silu(a)`.
     Silu,
 }
@@ -71,60 +73,66 @@ unsafe fn is_const_weight(w: *mut ggml_tensor) -> bool {
 
 /// Recognize the split as a fusible subgraph, or `None` (caller then dispatches per node).
 ///
-/// **FFN GLU**: `gate = X@Wg`, `up = X@Wu` (shared activation `X`), `down = Wd @ (silu(gate) * up)`
-/// — the five computed nodes `{matmul, matmul, silu, mul, matmul}`. Requiring the split to be
-/// exactly these five keeps the boundary unambiguous: the sole external input is `X` and the sole
-/// output is `down` (safe outlining without cross-split consumer analysis).
+/// **FFN SwiGLU**: `gate = X@Wg`, `up = X@Wu` (shared activation `X`), `down = Wd @ (silu(gate)*up)`.
+/// ggml emits the gated activation two ways: separate `silu` + `mul` (5-node split) or a fused
+/// `GGML_OP_GLU`/SwiGLU node (4-node split — what modern models use). Both are anchored on the
+/// `down` matmul (its activation `src1` is a `MUL` or a SwiGLU `GLU`) and lower to the **same** IR
+/// (`silu`+`mul`). Requiring the split to be exactly the FFN nodes keeps the boundary unambiguous:
+/// sole external input `X`, sole output `down` (safe outlining without cross-split consumer analysis).
 pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
-    if ggml_graph_n_nodes(cgraph) != 5 {
+    let n = ggml_graph_n_nodes(cgraph);
+    if n != 5 && n != 4 {
         return None;
     }
 
-    // Classify the five nodes: expect three MUL_MAT, one MUL, one UNARY(silu).
-    let mut matmuls: Vec<*mut ggml_tensor> = Vec::new();
-    let mut mul: *mut ggml_tensor = core::ptr::null_mut();
-    let mut silu: *mut ggml_tensor = core::ptr::null_mut();
-    for i in 0..5 {
+    // The `down` matmul is the one whose activation is a gated-activation node (MUL or SwiGLU GLU).
+    let mut down: *mut ggml_tensor = core::ptr::null_mut();
+    for i in 0..n {
         let t = ggml_graph_node(cgraph, i);
         if t.is_null() {
             return None;
         }
-        match (*t).op {
-            GGML_OP_MUL_MAT => matmuls.push(t),
-            GGML_OP_MUL => {
-                if !mul.is_null() {
-                    return None;
+        if (*t).op == GGML_OP_MUL_MAT {
+            let act = (*t).src[1];
+            if !act.is_null() && ((*act).op == GGML_OP_MUL || is_swiglu(act)) {
+                if !down.is_null() {
+                    return None; // ambiguous — two candidate down matmuls
                 }
-                mul = t;
+                down = t;
             }
-            GGML_OP_UNARY => {
-                if (*t).op_params[0] != GGML_UNARY_OP_SILU as i32 || !silu.is_null() {
-                    return None;
-                }
-                silu = t;
-            }
-            _ => return None,
         }
     }
-    if matmuls.len() != 3 || mul.is_null() || silu.is_null() {
+    if down.is_null() {
         return None;
     }
+    let act = (*down).src[1];
 
-    // gate = silu's input matmul; up = mul's other input; down = the remaining matmul (fed by mul).
-    let gate = (*silu).src[0];
-    let (ms0, ms1) = ((*mul).src[0], (*mul).src[1]);
-    let up = if ms0 == silu {
-        ms1
-    } else if ms1 == silu {
-        ms0
+    // Extract gate + up from the gated activation. `silu` is tracked only to gate the node count.
+    let (gate, up, has_silu_node) = if (*act).op == GGML_OP_MUL {
+        let (a, b) = ((*act).src[0], (*act).src[1]);
+        let (silu, up) = if is_silu(a) {
+            (a, b)
+        } else if is_silu(b) {
+            (b, a)
+        } else {
+            return None;
+        };
+        ((*silu).src[0], up, true)
     } else {
-        return None;
+        // SwiGLU GLU(gate, up): src0=gate, src1=up; `swapped` flips which operand gets the silu.
+        let swapped = (*act).op_params[1] != 0;
+        let (a, b) = ((*act).src[0], (*act).src[1]);
+        if swapped {
+            (b, a, false)
+        } else {
+            (a, b, false)
+        }
     };
-    if !matmuls.contains(&gate) || !matmuls.contains(&up) || gate == up {
+
+    if gate.is_null() || up.is_null() || gate == up {
         return None;
     }
-    let down = *matmuls.iter().find(|&&t| t != gate && t != up)?;
-    if (*down).src[1] != mul {
+    if (*gate).op != GGML_OP_MUL_MAT || (*up).op != GGML_OP_MUL_MAT {
         return None;
     }
 
@@ -138,23 +146,63 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
         return None;
     }
 
-    // Build the IR in canonical topological order: 0=gate, 1=up, 2=silu, 3=mul, 4=down.
+    // Optional trailing residual: an `ADD` whose one operand is `down` and the other is a distinct
+    // 2D runtime tensor (the pre-FFN residual). Folds `x_out = down + residual` into the program as
+    // a 2nd input. `residual == x` (no norm between input and residual) is left unfused for simplicity.
+    let mut residual: *mut ggml_tensor = core::ptr::null_mut();
+    let mut residual_add: *mut ggml_tensor = core::ptr::null_mut();
+    for i in 0..n {
+        let t = ggml_graph_node(cgraph, i);
+        if t.is_null() || (*t).op != GGML_OP_ADD {
+            continue;
+        }
+        let (s0, s1) = ((*t).src[0], (*t).src[1]);
+        let other = if s0 == down {
+            s1
+        } else if s1 == down {
+            s0
+        } else {
+            continue;
+        };
+        if !other.is_null() && other != x && glue_2d(other) && !(*other).data.is_null() {
+            residual = other;
+            residual_add = t;
+        }
+        break;
+    }
+
+    // Exactly the FFN nodes (+ silu for the MUL form) (+ the residual add if folded) — no extras.
+    let ffn_count = if has_silu_node { 5 } else { 4 };
+    let total = ffn_count + if residual_add.is_null() { 0 } else { 1 };
+    if n != total {
+        return None;
+    }
+
+    // Build the canonical IR: 0=gate, 1=up, 2=silu, 3=mul, 4=down (+ 5=residual add when folded).
     let m = (*x).ne[1];
     let consts = vec![sg_const(gate_w), sg_const(up_w), sg_const(down_w)];
-    let nodes = vec![
+    let mut nodes = vec![
         SgNode { op: SgOp::MatMul { n: (*gate_w).ne[1] }, a: Ref::Input(0), b: None, weight: Some(0) },
         SgNode { op: SgOp::MatMul { n: (*up_w).ne[1] }, a: Ref::Input(0), b: None, weight: Some(1) },
         SgNode { op: SgOp::Silu, a: Ref::Node(0), b: None, weight: None },
         SgNode { op: SgOp::Mul, a: Ref::Node(2), b: Some(Ref::Node(1)), weight: None },
         SgNode { op: SgOp::MatMul { n: (*down_w).ne[1] }, a: Ref::Node(3), b: None, weight: Some(2) },
     ];
+    let (mut inputs, output, out) = (vec![Operand::from_tensor(x)], 4u32, down);
+    let (inputs, output, out) = if residual_add.is_null() {
+        (inputs, output, out)
+    } else {
+        inputs.push(Operand::from_tensor(residual));
+        nodes.push(SgNode { op: SgOp::Add, a: Ref::Node(4), b: Some(Ref::Input(1)), weight: None });
+        (inputs, 5u32, residual_add)
+    };
     Some(Subgraph {
         m,
-        inputs: vec![Operand::from_tensor(x)],
+        inputs,
         consts,
         nodes,
-        output: 4,
-        out: Operand::from_tensor(down),
+        output,
+        out: Operand::from_tensor(out),
     })
 }
 
@@ -174,6 +222,11 @@ unsafe fn is_silu(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_UNARY && (*t).op_params[0] == GGML_UNARY_OP_SILU as i32
 }
 
+/// Is `t` a fused SwiGLU `GLU` node (`glu = silu(a)*b`, the modern-model FFN activation)?
+unsafe fn is_swiglu(t: *const ggml_tensor) -> bool {
+    !t.is_null() && (*t).op == GGML_OP_GLU && (*t).op_params[0] == GGML_GLU_OP_SWIGLU as i32
+}
+
 /// Plain 2D (`[K, M]`), so the single-node subgraph's `[M, K]` mapping is exact.
 unsafe fn glue_2d(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).ne[2] == 1 && (*t).ne[3] == 1
@@ -184,14 +237,18 @@ unsafe fn is_claimable_matmul(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_MUL_MAT && super::matmul::match_node(t).is_some()
 }
 
-/// Is `node` a glue op *type* (silu or mul) — dispatched via [`recognize_glue`], not `match_node`?
+/// Is `node` a glue op *type* (silu, mul, SwiGLU, or add) — dispatched via [`recognize_glue`], not
+/// `match_node`?
 pub unsafe fn is_glue_op(node: *const ggml_tensor) -> bool {
-    !node.is_null() && (is_silu(node) || (*node).op == GGML_OP_MUL)
+    !node.is_null() && (is_silu(node) || (*node).op == GGML_OP_MUL || (*node).op == GGML_OP_ADD || is_swiglu(node))
 }
 
 /// Should `supports_op` claim this glue node as part of a claimable FFN? Upstream structure only
 /// (per-node can't see downstream): a silu fed by a claimable matmul; a mul combining such a silu
-/// and a claimable matmul. Claiming these + the matmuls groups the FFN into one NPU split.
+/// and a claimable matmul; a SwiGLU fed by two claimable matmuls (gate + up); a **residual add**
+/// combining a claimable matmul (the `down` projection) and a runtime tensor. Claiming these + the
+/// matmuls groups the FFN (+ its residual) into one NPU split. (The residual-add claim also grabs
+/// e.g. the attention residual, which then runs as a standalone 1-node add — correct, minor cost.)
 pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
     if node.is_null() || !glue_2d(node) {
         return false;
@@ -199,10 +256,21 @@ pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
     if is_silu(node) {
         return is_claimable_matmul((*node).src[0]);
     }
+    if is_swiglu(node) {
+        return is_claimable_matmul((*node).src[0]) && is_claimable_matmul((*node).src[1]);
+    }
     if (*node).op == GGML_OP_MUL {
         let (a, b) = ((*node).src[0], (*node).src[1]);
         let silu_mm = |s: *const ggml_tensor| is_silu(s) && is_claimable_matmul((*s).src[0]);
         return (silu_mm(a) && is_claimable_matmul(b)) || (silu_mm(b) && is_claimable_matmul(a));
+    }
+    if (*node).op == GGML_OP_ADD {
+        let (a, b) = ((*node).src[0], (*node).src[1]);
+        // matmul output + a runtime tensor (op != NONE) — a residual, not a const-bias add.
+        let residual = |mm: *const ggml_tensor, r: *const ggml_tensor| {
+            is_claimable_matmul(mm) && !r.is_null() && (*r).op != GGML_OP_NONE && glue_2d(r)
+        };
+        return residual(a, b) || residual(b, a);
     }
     false
 }
@@ -243,6 +311,49 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             consts: Vec::new(),
             nodes: vec![SgNode { op: SgOp::Mul, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
             output: 0,
+            out: Operand::from_tensor(node),
+        });
+    }
+    if (*node).op == GGML_OP_ADD {
+        let (a, b) = ((*node).src[0], (*node).src[1]);
+        if a.is_null() || b.is_null() || (*a).data.is_null() || (*b).data.is_null() {
+            return None;
+        }
+        if (*a).ne[0] != (*b).ne[0] || (*a).ne[1] != (*b).ne[1] {
+            return None;
+        }
+        return Some(Subgraph {
+            m: (*a).ne[1],
+            inputs: vec![Operand::from_tensor(a), Operand::from_tensor(b)],
+            consts: Vec::new(),
+            nodes: vec![SgNode { op: SgOp::Add, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
+            output: 0,
+            out: Operand::from_tensor(node),
+        });
+    }
+    if is_swiglu(node) {
+        // Standalone SwiGLU → a 2-node silu+mul subgraph. `swapped` picks which operand gets silu.
+        let swapped = (*node).op_params[1] != 0;
+        let (g, u) = if swapped {
+            ((*node).src[1], (*node).src[0])
+        } else {
+            ((*node).src[0], (*node).src[1])
+        };
+        if g.is_null() || u.is_null() || (*g).data.is_null() || (*u).data.is_null() {
+            return None;
+        }
+        if (*g).ne[0] != (*u).ne[0] || (*g).ne[1] != (*u).ne[1] {
+            return None;
+        }
+        return Some(Subgraph {
+            m: (*g).ne[1],
+            inputs: vec![Operand::from_tensor(g), Operand::from_tensor(u)],
+            consts: Vec::new(),
+            nodes: vec![
+                SgNode { op: SgOp::Silu, a: Ref::Input(0), b: None, weight: None },
+                SgNode { op: SgOp::Mul, a: Ref::Node(0), b: Some(Ref::Input(1)), weight: None },
+            ],
+            output: 1,
             out: Operand::from_tensor(node),
         });
     }

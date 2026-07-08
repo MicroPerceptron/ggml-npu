@@ -7,6 +7,7 @@
 //
 // Build: shim/build.sh  ->  libggml_npu_ovc.so
 #include <openvino/openvino.hpp>
+#include <openvino/op/add.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
 #include <openvino/op/matmul.hpp>
@@ -136,7 +137,7 @@ static std::shared_ptr<ov::Node> make_weight(int32_t bits, int32_t group, int64_
 // ov::Model (so the NPU runs it as one program: intra-graph fusion + pipelining, one submit). Op
 // codes and struct layouts must match src/vendor/ivpu/lower/subgraph.rs.
 // ---------------------------------------------------------------------------
-enum { NPU_SG_MATMUL = 1, NPU_SG_MUL = 2, NPU_SG_SILU = 3 };
+enum { NPU_SG_MATMUL = 1, NPU_SG_MUL = 2, NPU_SG_SILU = 3, NPU_SG_ADD = 4 };
 
 // Value reference: r in [0, n_inputs) → external input r; r >= n_inputs → node (r - n_inputs); < 0
 // → unused. All values are f16 inside the graph (inputs are Converted at the boundary).
@@ -365,6 +366,11 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
                 case NPU_SG_MUL: {
                     if (!value(nd.a, a) || !value(nd.b, b)) return -1;
                     node_val[(size_t)j] = std::make_shared<v1::Multiply>(a, b);
+                    break;
+                }
+                case NPU_SG_ADD: {
+                    if (!value(nd.a, a) || !value(nd.b, b)) return -1;
+                    node_val[(size_t)j] = std::make_shared<v1::Add>(a, b);
                     break;
                 }
                 case NPU_SG_SILU: {

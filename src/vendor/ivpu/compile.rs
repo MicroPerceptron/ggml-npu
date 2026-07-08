@@ -301,6 +301,7 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
             let (op, out_n) = match nd.op {
                 SgOp::MatMul { n } => (1, n as i32),
                 SgOp::Mul => (2, 0),
+                SgOp::Add => (4, 0),
                 SgOp::Silu => (3, 0),
             };
             SgNodeAbi {
