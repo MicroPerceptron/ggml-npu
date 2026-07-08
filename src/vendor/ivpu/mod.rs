@@ -10,6 +10,7 @@ mod compile;
 mod graph;
 mod lower;
 mod session;
+mod weights;
 mod ze;
 
 use alloc::vec::Vec;

@@ -110,6 +110,10 @@ fn main() {
         .allowlist_type("ggml_op")
         .allowlist_type("ggml_type")
         .allowlist_type("ggml_guid.*")
+        // Dequant: ggml_get_type_traits(type)->to_float turns a quantized weight into f32 (pulls
+        // in ggml_type_traits + ggml_to_float_t). Symbols resolve at dlopen from libggml-base.
+        .allowlist_type("ggml_type_traits")
+        .allowlist_function("ggml_get_type_traits")
         .allowlist_function("ggml_backend_buffer_init")
         // cgraph stays opaque; iterate via the public accessors instead of the private struct.
         .allowlist_function("ggml_graph_n_nodes")

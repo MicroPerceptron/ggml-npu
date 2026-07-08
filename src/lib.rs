@@ -12,6 +12,7 @@
 //! Load it with `GGML_BACKEND_PATH=/abs/path/libggml_npu.so`.
 #![no_std]
 #![feature(allocator_api)]
+#![feature(f16)]
 
 extern crate alloc;
 

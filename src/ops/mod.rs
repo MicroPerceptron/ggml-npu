@@ -17,25 +17,27 @@ pub enum Op {
     MatMul { m: i64, k: i64, n: i64 },
 }
 
-/// One operand of an op, described so a vendor can bind it to the device **without copying**:
-/// the raw data pointer (`tensor->data`), its element count, and whether it already lives in
-/// NPU-mapped memory (`owned` — bindable directly) or in a foreign buffer (must be staged
-/// through a bounce buffer). Elements are f32 — the only device precision we compile for today.
+/// One operand of an op, described so a vendor can bind it to the device: the raw data pointer
+/// (`tensor->data`), its element count, its ggml element type (`dtype` — f32 for activations and
+/// outputs, possibly a quantized type for weights), and whether it already lives in NPU-mapped
+/// memory (`owned` — bindable directly) or in a foreign buffer (staged through a bounce buffer).
 #[derive(Clone, Copy)]
 pub struct Operand {
     pub ptr: *mut c_void,
     pub elems: usize,
+    pub dtype: crate::ffi::ggml_type,
     pub owned: bool,
 }
 
 impl Operand {
-    /// Describe a ggml tensor as an operand: data pointer, element count, and whether it's in
-    /// our (NPU-mapped) buffer. Caller must ensure `t` is non-null with a valid `data`.
+    /// Describe a ggml tensor as an operand: data pointer, element count, element type, and
+    /// whether it's in our (NPU-mapped) buffer. Caller must ensure `t` is non-null.
     pub unsafe fn from_tensor(t: *const ggml_tensor) -> Operand {
         let d = &*t;
         Operand {
             ptr: d.data,
             elems: (d.ne[0] * d.ne[1] * d.ne[2] * d.ne[3]) as usize,
+            dtype: d.type_,
             owned: crate::backend::owns_tensor(t),
         }
     }

@@ -20,7 +20,21 @@ pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
         return None;
     }
     let (s0, s1) = (&*src0, &*src1);
-    if s0.type_ != GGML_TYPE_F32 || s1.type_ != GGML_TYPE_F32 {
+    // Weight (src0) may be f32 or any quantized type ggml can dequantize; activation (src1)
+    // stays f32. For a quantized weight the K dim must be a whole number of quant blocks so a
+    // row-major `to_float` over the tensor stays block-aligned.
+    if s1.type_ != GGML_TYPE_F32 {
+        return None;
+    }
+    let traits = ggml_get_type_traits(s0.type_);
+    if traits.is_null() {
+        return None;
+    }
+    let tr = &*traits;
+    if s0.type_ != GGML_TYPE_F32 && !tr.is_quantized {
+        return None;
+    }
+    if tr.is_quantized && (tr.blck_size <= 0 || s0.ne[0] % tr.blck_size != 0) {
         return None;
     }
     // 2D only (no batch dims), contraction dim K must match, both contiguous.

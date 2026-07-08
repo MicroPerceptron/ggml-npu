@@ -112,9 +112,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         if pfn_arg(handle, i, &mut ap) != ZE_RESULT_SUCCESS {
             return None;
         }
-        if ap.devicePrecision != ZE_GRAPH_ARGUMENT_PRECISION_FP32 {
-            return None; // we only compile + copy f32
-        }
+        // Mixed precision: the weight arg is FP16, activation/output FP32. We don't gate on
+        // precision here — the weight is always bound directly from its (owned) f16 shadow, and
+        // only the f32 activation/output ever go through a bounce buffer (sized in f32 below).
         let mut elems = 1usize;
         for d in 0..(ZE_MAX_GRAPH_ARGUMENT_DIMENSIONS_SIZE as usize) {
             if ap.dims[d] > 0 {

@@ -7,6 +7,7 @@
 //
 // Build: shim/build.sh  ->  libggml_npu_ovc.so
 #include <openvino/openvino.hpp>
+#include <openvino/op/convert.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/result.hpp>
@@ -28,15 +29,24 @@ extern "C" {
 // Compile a ggml-convention MatMul for the NPU: A[M,K] @ B[N,K]^T -> [M,N] (transpose_b),
 // with BOTH operands as inputs (shape-generic; weights are not baked). On success, writes a
 // malloc'd native blob to *blob / *len (free with ggml_npu_ov_free) and returns 0.
+//
+// Mixed precision: the activation A and output stay **f32** (so the backend binds ggml's own
+// f32 tensor pointers with no copy), while the weight B is an **f16** input (half the bytes of
+// f32, and the NPU's native math precision) — the backend dequantizes each weight once into an
+// f16 shadow. A is converted to f16 in-graph so the MatMul runs in f16; the result converts back
+// to f32. The NPU compiler accepts an f16 weight *input*, so this stays shape-generic (one blob
+// per shape, any weights) rather than needing per-weight compiled Constants.
 int ggml_npu_ov_compile_matmul(int32_t M, int32_t K, int32_t N, uint8_t** blob, size_t* len) {
     if (!blob || !len || M <= 0 || K <= 0 || N <= 0) {
         return -1;
     }
     try {
         auto a = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{(size_t)M, (size_t)K});
-        auto b = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{(size_t)N, (size_t)K});
-        auto mm = std::make_shared<ov::op::v0::MatMul>(a, b, /*transpose_a=*/false, /*transpose_b=*/true);
-        auto r = std::make_shared<ov::op::v0::Result>(mm);
+        auto b = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{(size_t)N, (size_t)K});
+        auto a16 = std::make_shared<ov::op::v0::Convert>(a, ov::element::f16);
+        auto mm = std::make_shared<ov::op::v0::MatMul>(a16, b, /*transpose_a=*/false, /*transpose_b=*/true);
+        auto out = std::make_shared<ov::op::v0::Convert>(mm, ov::element::f32);
+        auto r = std::make_shared<ov::op::v0::Result>(out);
         auto model = std::make_shared<ov::Model>(ov::ResultVector{r}, ov::ParameterVector{a, b});
 
         auto compiled = core().compile_model(model, "NPU");
