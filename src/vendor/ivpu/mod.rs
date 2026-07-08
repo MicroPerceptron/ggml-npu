@@ -5,9 +5,11 @@
 //! [`crate::vendor::Vendor`] impl the agnostic backend dispatches to; [`IvpuHal`] is the
 //! (still-aspirational) 5-verb submission seam.
 
+mod cache;
 mod compile;
 mod graph;
 mod lower;
+mod session;
 mod ze;
 
 use alloc::vec::Vec;
@@ -27,7 +29,13 @@ impl Vendor for IvpuVendor {
     }
 
     fn probe(&self) -> Vec<DeviceInfo> {
-        ze::probe().into_iter().map(|d| DeviceInfo { name: d.name }).collect()
+        // The cached runtime (created once) holds the device; deriving the name from it means
+        // supports_op no longer re-enumerates Level Zero on every call.
+        let mut v = Vec::new();
+        if let Some(r) = ze::runtime() {
+            v.push(DeviceInfo { name: r.name.clone() });
+        }
+        v
     }
 
     fn can_lower(&self, op: Op) -> bool {

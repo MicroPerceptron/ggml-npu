@@ -244,3 +244,93 @@ pub fn probe() -> Vec<Device> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Cached device runtime — context, graph dispatch table, and command queue, built once.
+// ---------------------------------------------------------------------------
+
+/// Process-lifetime Level Zero runtime for the NPU: driver/device plus a context, the graph
+/// dispatch table, and a command queue — all created once and reused by every session.
+pub(super) struct Runtime {
+    pub(super) driver: ze_driver_handle_t,
+    pub(super) device: ze_device_handle_t,
+    pub(super) context: ze_context_handle_t,
+    pub(super) ddi: *mut ze_graph_dditable_ext_t,
+    pub(super) queue: ze_command_queue_handle_t,
+    pub(super) name: String,
+}
+
+// SAFETY: immutable after init; the Level Zero handles are shared read-only across threads.
+unsafe impl Send for Runtime {}
+unsafe impl Sync for Runtime {}
+
+static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
+const RT_FAILED: *mut Runtime = 1usize as *mut Runtime;
+
+unsafe fn build_runtime() -> Option<Runtime> {
+    let l = lib()?;
+    let dev = probe().into_iter().next()?; // zeInit + enumerate; keeps the VPU device
+
+    let mut ctx_desc: ze_context_desc_t = mem::zeroed();
+    ctx_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
+    let mut context: ze_context_handle_t = ptr::null_mut();
+    if (l.context_create)(dev.driver, &ctx_desc, &mut context) != ZE_RESULT_SUCCESS {
+        return None;
+    }
+
+    let mut table: *mut c_void = ptr::null_mut();
+    if (l.get_ext_fn_addr)(dev.driver, c"ZE_extension_graph".as_ptr(), &mut table) != ZE_RESULT_SUCCESS
+        || table.is_null()
+    {
+        return None;
+    }
+
+    let mut qd: ze_command_queue_desc_t = mem::zeroed();
+    qd.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+    qd.ordinal = 0;
+    qd.mode = ZE_COMMAND_QUEUE_MODE_DEFAULT;
+    let mut queue: ze_command_queue_handle_t = ptr::null_mut();
+    if (l.cmd_queue_create)(context, dev.handle, &qd, &mut queue) != ZE_RESULT_SUCCESS {
+        return None;
+    }
+
+    Some(Runtime {
+        driver: dev.driver,
+        device: dev.handle,
+        context,
+        ddi: table as *mut ze_graph_dditable_ext_t,
+        queue,
+        name: dev.name,
+    })
+}
+
+/// The cached device runtime, initialized on first use (and cached even on failure).
+pub(super) fn runtime() -> Option<&'static Runtime> {
+    let cur = RUNTIME.load(Ordering::Acquire);
+    if cur == RT_FAILED {
+        return None;
+    }
+    if !cur.is_null() {
+        return Some(unsafe { &*cur });
+    }
+    match unsafe { build_runtime() } {
+        Some(rt) => {
+            let boxed = Box::into_raw(Box::new(rt));
+            match RUNTIME.compare_exchange(ptr::null_mut(), boxed, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => Some(unsafe { &*boxed }),
+                Err(w) => {
+                    drop(unsafe { Box::from_raw(boxed) });
+                    if w == RT_FAILED {
+                        None
+                    } else {
+                        Some(unsafe { &*w })
+                    }
+                }
+            }
+        }
+        None => {
+            let _ = RUNTIME.compare_exchange(ptr::null_mut(), RT_FAILED, Ordering::AcqRel, Ordering::Acquire);
+            None
+        }
+    }
+}

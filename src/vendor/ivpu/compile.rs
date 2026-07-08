@@ -1,17 +1,18 @@
 //! Runtime blob compilation + shape-keyed cache for the Intel NPU.
 //!
-//! The OpenVINO compile shim (`libggml_npu_ovc.so`) is `dlopen`'d on demand and compiles a
-//! native NPU blob for a MatMul shape; blobs are cached by `(M, K, N)` so each distinct shape
-//! is compiled at most once — the JIT-on-miss model (§7.3). `no_std`: the shim, `dlopen`, and
-//! `getenv` all resolve from the host. The cache is a `spin::Mutex` over a `hashbrown::HashMap`,
-//! held only for short lookups/inserts — the (slow) compile runs with the lock released.
+//! The OpenVINO compile shim (`libggml_npu_ovc.so`) is `dlopen`'d on demand and compiles a native
+//! NPU blob for a MatMul shape; blobs are cached by `(M, K, N)` so each shape compiles at most
+//! once (JIT-on-miss, §7.3). `no_std`: the shim, `dlopen`, and `getenv` resolve from the host. The
+//! cache and the shim handle are both lock-free ([`super::cache`] / an `AtomicPtr` once-init).
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void};
 use core::mem;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-use hashbrown::HashMap;
-use spin::{Mutex, Once};
+use super::cache::ShapeCache;
 
 extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -28,10 +29,11 @@ struct Shim {
     free: FreeBlob,
 }
 
-static SHIM: Once<Option<Shim>> = Once::new();
+/// `null` = untried, `FAILED` = tried & unavailable, else a leaked `*mut Shim`.
+static SHIM: AtomicPtr<Shim> = AtomicPtr::new(ptr::null_mut());
+const SHIM_FAILED: *mut Shim = 1usize as *mut Shim;
 
 unsafe fn load_shim() -> Option<Shim> {
-    // GGML_NPU_OVC overrides the shim path; else the default soname on the loader path.
     let env = getenv(c"GGML_NPU_OVC".as_ptr());
     let h = if env.is_null() {
         dlopen(c"libggml_npu_ovc.so".as_ptr(), RTLD_NOW)
@@ -53,28 +55,44 @@ unsafe fn load_shim() -> Option<Shim> {
 }
 
 fn shim() -> Option<&'static Shim> {
-    SHIM.call_once(|| unsafe { load_shim() }).as_ref()
+    let cur = SHIM.load(Ordering::Acquire);
+    if cur == SHIM_FAILED {
+        return None;
+    }
+    if !cur.is_null() {
+        return Some(unsafe { &*cur });
+    }
+    match unsafe { load_shim() } {
+        Some(s) => {
+            let boxed = Box::into_raw(Box::new(s));
+            match SHIM.compare_exchange(ptr::null_mut(), boxed, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => Some(unsafe { &*boxed }),
+                Err(w) => {
+                    drop(unsafe { Box::from_raw(boxed) });
+                    if w == SHIM_FAILED {
+                        None
+                    } else {
+                        Some(unsafe { &*w })
+                    }
+                }
+            }
+        }
+        None => {
+            let _ = SHIM.compare_exchange(ptr::null_mut(), SHIM_FAILED, Ordering::AcqRel, Ordering::Acquire);
+            None
+        }
+    }
 }
 
-/// MatMul shape key `(M, K, N)`.
-type Key = (i64, i64, i64);
-
-/// `None` value = compiled and failed (don't retry); `Some` = the leaked, process-lifetime
-/// blob. The map itself is lazily created inside the lock.
-static CACHE: Mutex<Option<HashMap<Key, Option<&'static [u8]>>>> = Mutex::new(None);
+/// `None` = compiled and failed (cached, not retried); `Some` = the leaked native blob.
+static CACHE: ShapeCache<Option<&'static [u8]>> = ShapeCache::new();
 
 fn compile_matmul(m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     let s = shim()?;
-    if m <= 0
-        || k <= 0
-        || n <= 0
-        || m > i32::MAX as i64
-        || k > i32::MAX as i64
-        || n > i32::MAX as i64
-    {
+    if m <= 0 || k <= 0 || n <= 0 || m > i32::MAX as i64 || k > i32::MAX as i64 || n > i32::MAX as i64 {
         return None;
     }
-    let mut blob: *mut u8 = core::ptr::null_mut();
+    let mut blob: *mut u8 = ptr::null_mut();
     let mut len: usize = 0;
     let rc = unsafe { (s.compile)(m as i32, k as i32, n as i32, &mut blob, &mut len) };
     if rc != 0 || blob.is_null() || len == 0 {
@@ -85,25 +103,7 @@ fn compile_matmul(m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Get the cached native blob for a MatMul of shape `(M, K, N)`, compiling on a miss. Returns
-/// `None` if there is no shim, or the shape does not compile (cached so it is not retried).
+/// Get the cached native blob for a MatMul of shape `(M, K, N)`, compiling on a miss.
 pub(super) fn get_or_compile_matmul(m: i64, k: i64, n: i64) -> Option<&'static [u8]> {
-    let key = (m, k, n);
-    {
-        let mut guard = CACHE.lock();
-        if let Some(v) = guard.get_or_insert_with(HashMap::new).get(&key) {
-            return *v;
-        }
-    }
-    // Compile with the lock released (seconds); other shapes proceed concurrently.
-    let compiled = compile_matmul(m, k, n);
-
-    let mut guard = CACHE.lock();
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(v) = map.get(&key) {
-        return *v; // another thread won the race; our `compiled` drops here (freed)
-    }
-    let stored = compiled.map(|v| &*Vec::leak(v));
-    map.insert(key, stored);
-    stored
+    CACHE.get_or_insert_with((m, k, n), || compile_matmul(m, k, n).map(|v| &*Vec::leak(v)))
 }

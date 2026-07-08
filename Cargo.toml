@@ -11,13 +11,8 @@ publish = false
 # via GGML_BACKEND_PATH, so the exact filename does not matter for discovery.
 crate-type = ["cdylib"]
 
-[dependencies]
-# no_std building blocks for the JIT blob cache: a spinlock/once (no core::Mutex) and a
-# no_std HashMap (foldhash default hasher; nightly allocator_api for Global).
-spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "once"] }
-# Use hashbrown's stable allocator path (allocator-api2), not its "nightly" feature, which
-# hits a specialization break on current nightly.
-hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "allocator-api2"] }
+# No runtime dependencies: the JIT caches and shim/loader handles are all lock-free (AtomicPtr),
+# so `spin`/`hashbrown` are gone (see vendor/ivpu/cache.rs).
 
 [build-dependencies]
 bindgen = "0.72.1"
