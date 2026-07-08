@@ -7,16 +7,15 @@
 //! the same key could duplicate an entry (harmless — both valid, lookup returns one), but compute
 //! is single-threaded per backend, so that path is a formality.
 //!
-//! Two keys are in use: `(M,K,N)` shape (the JIT blob / per-shape graph) and the per-node operand
-//! pointer-tuple (the recorded execute list) — see [`ShapeKey`] / [`PtrKey`].
+//! Keys in use are all `Copy` tuples: `(weight pointer, M)` for the per-weight Constant blob,
+//! the blob address for its per-blob graph, and a per-node pointer-triple for the recorded
+//! execute list — see [`PtrKey`].
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// Op-shape key: `(M, K, N)`.
-pub(super) type ShapeKey = (i64, i64, i64);
-/// Per-node binding key: the operand data-pointer addresses `(activation, weight, output)`.
-/// Uniquely identifies one graph node's bindings, which are stable across tokens.
+/// Per-node binding key: `(activation, output, blob)` data/artifact addresses. Uniquely
+/// identifies one graph node's bindings, which are stable across tokens.
 pub(super) type PtrKey = (usize, usize, usize);
 
 struct Node<K, V> {
@@ -81,9 +80,6 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
         }
     }
 }
-
-/// A per-shape cache (the common case: JIT blob + graph keyed by `(M,K,N)`).
-pub(super) type ShapeCache<V> = Cache<ShapeKey, V>;
 
 // SAFETY: shared across threads; all mutation is via atomics, keys/values are Copy + 'static.
 unsafe impl<K: Copy + Send, V: Copy + Send> Sync for Cache<K, V> {}

@@ -40,9 +40,9 @@ impl Vendor for IvpuVendor {
         v
     }
 
-    fn can_lower(&self, op: Op) -> bool {
+    fn can_lower(&self, op: Op, inputs: &[Operand]) -> bool {
         match op {
-            Op::MatMul { m, k, n } => compile::get_or_compile_matmul(m, k, n).is_some(),
+            Op::MatMul { m, k, n } => lower::matmul::can_lower(m, k, n, inputs),
         }
     }
 
@@ -50,6 +50,10 @@ impl Vendor for IvpuVendor {
         match op {
             Op::MatMul { m, k, n } => lower::matmul::run(m, k, n, inputs, output),
         }
+    }
+
+    fn run_subgraph(&self, sg: &crate::ops::subgraph::Subgraph) -> bool {
+        lower::subgraph::run(sg)
     }
 
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void {

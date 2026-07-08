@@ -20,6 +20,13 @@ pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
         return None;
     }
     let (s0, s1) = (&*src0, &*src1);
+    // Only a **constant weight** — a loaded model leaf (`op == GGML_OP_NONE`) — can be baked as a
+    // compile-time Constant. A runtime tensor (`op != NONE`) changes across tokens, so baking it
+    // would be wrong; we never claim those (they stay on CPU). In llama.cpp every offloadable
+    // projection matmul has its weight as such a leaf, so this excludes nothing we accelerated.
+    if s0.op != GGML_OP_NONE {
+        return None;
+    }
     // Weight (src0) may be f32 or any quantized type ggml can dequantize; activation (src1)
     // stays f32. For a quantized weight the K dim must be a whole number of quant blocks so a
     // row-major `to_float` over the tensor stays block-aligned.
@@ -49,6 +56,21 @@ pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
         return None;
     }
     Some(Op::MatMul { m, k, n })
+}
+
+/// Scheduler probe (`supports_op`): can `vendor` lower this node? Builds the `[activation, weight]`
+/// operands and asks the vendor, which (for the Constant path) re-quantizes + compiles the weight
+/// blob now so a later [`run`] is guaranteed to find it. The weight (src0) must be materialized;
+/// src1/dst may still be unallocated at probe time (their pointers aren't dereferenced here).
+pub unsafe fn can_lower(op: Op, node: *const ggml_tensor, vendor: &dyn Vendor) -> bool {
+    let t = &*node;
+    let (src0, src1) = (t.src[0], t.src[1]);
+    if src0.is_null() || src1.is_null() || (*src0).data.is_null() {
+        return false;
+    }
+    let weight = Operand::from_tensor(src0);
+    let activation = Operand::from_tensor(src1);
+    vendor.can_lower(op, &[activation, weight])
 }
 
 /// Describe the operands (pointer + element count + NPU-ownership) and run on `vendor`, which

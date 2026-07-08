@@ -3,3 +3,4 @@
 //! ([`super::compile`]) and runs it via the Level Zero HAL ([`super::graph`]).
 
 pub mod matmul;
+pub mod subgraph;

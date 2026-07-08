@@ -4,6 +4,7 @@
 //! [`crate::vendor`].
 
 pub mod matmul;
+pub mod subgraph;
 
 use core::ffi::c_void;
 
@@ -47,6 +48,14 @@ impl Operand {
 pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
     matmul::match_node(node)
     // future: .or_else(|| ffn::match_node(node)).or_else(|| attention::match_node(node))
+}
+
+/// Ask `vendor` whether it can lower this recognized op, extracting the operands it needs from
+/// the node (the scheduler `supports_op` path — mirrors [`run`]).
+pub unsafe fn can_lower(op: Op, node: *const ggml_tensor, vendor: &dyn Vendor) -> bool {
+    match op {
+        Op::MatMul { .. } => matmul::can_lower(op, node, vendor),
+    }
 }
 
 /// Extract the op's operands from the node and run it on `vendor`.

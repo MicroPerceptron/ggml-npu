@@ -108,6 +108,7 @@ fn main() {
         .allowlist_type("ggml_cgraph")
         .allowlist_type("ggml_status")
         .allowlist_type("ggml_op")
+        .allowlist_type("ggml_unary_op")
         .allowlist_type("ggml_type")
         .allowlist_type("ggml_guid.*")
         // Dequant: ggml_get_type_traits(type)->to_float turns a quantized weight into f32 (pulls

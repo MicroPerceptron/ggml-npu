@@ -20,6 +20,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
+use crate::ops::subgraph::Subgraph;
 use crate::ops::{Op, Operand};
 
 /// A discovered NPU device — the agnostic view used for the ggml device description.
@@ -34,11 +35,17 @@ pub trait Vendor: Sync {
     fn name(&self) -> &'static str;
     /// Devices of this vendor present on the host (empty if none / no runtime).
     fn probe(&self) -> Vec<DeviceInfo>;
-    /// Can this op run here? (Compiles + caches the artifact on first sight.)
-    fn can_lower(&self, op: Op) -> bool;
+    /// Can this op run here? (Compiles + caches the artifact on first sight.) `inputs` are the
+    /// op's operands in arg order — a vendor whose artifact depends on operand contents (e.g. a
+    /// weight baked as a compile-time Constant) needs them to compile; others may ignore them.
+    fn can_lower(&self, op: Op, inputs: &[Operand]) -> bool;
     /// Run `op` on the device. `inputs` are the op's operands in arg order, `output` the dst;
     /// each carries whether it lives in NPU memory (bind directly) or must be staged.
     fn run(&self, op: Op, inputs: &[Operand], output: &Operand) -> bool;
+
+    /// Run a recognized fused subgraph as **one** compiled program (weights baked, single submit).
+    /// `false` if this vendor can't lower it (caller then dispatches the split node by node).
+    fn run_subgraph(&self, sg: &Subgraph) -> bool;
 
     /// Allocate `size` bytes of NPU-mapped host memory for the backend's buffer type — memory
     /// whose pointer can be bound as a graph argument with **no copy**. Null on failure (the

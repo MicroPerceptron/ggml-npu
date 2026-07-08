@@ -1,29 +1,30 @@
-//! Zero-copy dispatch: a per-shape graph plus a per-node recorded execute list.
+//! Zero-copy dispatch for a compiled NPU program (one matmul, or a fused subgraph): a per-blob
+//! graph plus a per-node recorded execute list. The program has **N inputs and one output**; all
+//! weights are baked into the blob as compile-time `Constant`s, so they are neither bound nor
+//! copied. A single matmul is just the `N == 1` case (its one input is the activation); a fused
+//! subgraph (e.g. an FFN) has one input per external boundary tensor.
 //!
 //! Two caches, both lock-free:
-//! - **[`GRAPHS`]** — one Level Zero graph per `(M,K,N)` shape (`pfnCreate` re-parses the blob and
-//!   `pfnAppendGraphInitialize` runs once; both are expensive, so a shape is built once and shared
-//!   by every node that has it).
-//! - **[`LISTS`]** — one recorded execute command list per graph *node*, keyed by its operand
-//!   pointer-tuple `(activation, weight, output)`. On first sight of a node we bind its operands
-//!   and record the list; thereafter a dispatch is just execute + sync.
+//! - **[`GRAPHS`]** — one Level Zero graph per distinct blob (keyed by the blob's leaked address).
+//!   `pfnCreate` re-parses the blob and `pfnAppendGraphInitialize` runs once per blob.
+//! - **[`LISTS`]** — one recorded execute command list per program *instance*, keyed by
+//!   `(output pointer, blob)`. The output tensor's address uniquely identifies the instance (each
+//!   node writes its own dst), and its input/output addresses are stable across tokens, so the
+//!   recorded list is replayed verbatim; a dispatch is just execute + sync.
 //!
-//! **The bindings are the operands' own `tensor->data` pointers** whenever those live in NPU
-//! memory (our buffer type) — so the large weight, and usually the output, are bound with **zero
-//! copy**, once, and reused for every token (a node's operand addresses are stable across tokens;
-//! the recorded list snapshots them — validated by the `ze_{latebind,multilist,subrange}` spikes).
-//! A foreign operand (e.g. a CPU-produced activation) is staged through a small bounce buffer.
-//!
-//! Assumes single-threaded compute per backend (ggml calls `graph_compute` serially) and FP32
-//! device I/O (the OpenVINO f32 MatMul).
+//! Bindings are the operands' own `tensor->data` pointers when those live in NPU memory (our
+//! buffer type) — bound **zero copy**. A foreign operand (a CPU-produced activation, or an output
+//! consumed on CPU) is staged through a small bounce buffer. Single-threaded compute per backend;
+//! FP32 device I/O at the boundary.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cmp::min;
 use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
-use super::cache::{Cache, PtrKey, ShapeCache};
+use super::cache::Cache;
 use super::ze;
 use super::ze::raw::*;
 use crate::ops::Operand;
@@ -35,12 +36,11 @@ struct ArgInfo {
     elems: usize,
 }
 
-/// A per-shape compiled graph: created + initialized once, shared by every node of this shape.
+/// A per-blob compiled graph: created + initialized once, shared by every instance using this blob.
 struct Graph {
     handle: ze_graph_handle_t,
-    act: ArgInfo, // first input  (activation)
-    wgt: ArgInfo, // second input (weight)
-    out: ArgInfo, // output
+    inputs: Vec<ArgInfo>, // the N inputs, in blob argument order; weights are baked, not args
+    out: ArgInfo,         // the single output
 }
 // SAFETY: immutable after build; the Level Zero handle is shared read-only.
 unsafe impl Send for Graph {}
@@ -55,26 +55,22 @@ struct Bind {
     elems: usize,
 }
 
-/// A per-node recorded execute list. Operand pointers are baked in at record time (binding
+/// A per-instance recorded execute list. Operand pointers are baked in at record time (binding
 /// snapshot), so it is replayed verbatim across tokens.
 struct NodeList {
     exec: ze_command_list_handle_t,
-    act: Bind,
-    wgt: Bind,
+    inputs: Vec<Bind>,
     out: Bind,
 }
 // SAFETY: immutable after build; compute is single-threaded per backend.
 unsafe impl Send for NodeList {}
 unsafe impl Sync for NodeList {}
 
-static GRAPHS: ShapeCache<Option<&'static Graph>> = ShapeCache::new();
-static LISTS: Cache<PtrKey, Option<&'static NodeList>> = Cache::new();
+static GRAPHS: Cache<usize, Option<&'static Graph>> = Cache::new();
+static LISTS: Cache<(usize, usize), Option<&'static NodeList>> = Cache::new();
 
-fn graph(m: i64, k: i64, n: i64) -> Option<&'static Graph> {
-    GRAPHS.get_or_insert_with((m, k, n), || {
-        let blob = super::compile::get_or_compile_matmul(m, k, n)?;
-        unsafe { build_graph(blob) }
-    })
+fn graph(blob: &'static [u8]) -> Option<&'static Graph> {
+    GRAPHS.get_or_insert_with(blob.as_ptr() as usize, || unsafe { build_graph(blob) })
 }
 
 unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
@@ -102,9 +98,8 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         return None;
     }
 
-    // Classify args: inputs in blob order [activation, weight]; one output. FP32 device I/O only.
-    let mut inputs = [ArgInfo { index: 0, elems: 0 }; 2];
-    let mut n_in = 0usize;
+    // Classify args: inputs in blob order, exactly one output. FP32 device I/O.
+    let mut inputs: Vec<ArgInfo> = Vec::new();
     let mut out: Option<ArgInfo> = None;
     for i in 0..gp.numGraphArgs {
         let mut ap: ze_graph_argument_properties_t = mem::zeroed();
@@ -112,9 +107,6 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         if pfn_arg(handle, i, &mut ap) != ZE_RESULT_SUCCESS {
             return None;
         }
-        // Mixed precision: the weight arg is FP16, activation/output FP32. We don't gate on
-        // precision here — the weight is always bound directly from its (owned) f16 shadow, and
-        // only the f32 activation/output ever go through a bounce buffer (sized in f32 below).
         let mut elems = 1usize;
         for d in 0..(ZE_MAX_GRAPH_ARGUMENT_DIMENSIONS_SIZE as usize) {
             if ap.dims[d] > 0 {
@@ -123,22 +115,17 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         }
         let info = ArgInfo { index: i, elems };
         if ap.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
-            if n_in >= 2 {
-                return None;
-            }
-            inputs[n_in] = info;
-            n_in += 1;
+            inputs.push(info);
+        } else if out.is_some() {
+            return None; // exactly one output expected
         } else {
-            if out.is_some() {
-                return None;
-            }
             out = Some(info);
         }
     }
-    if n_in != 2 {
+    let out = out?;
+    if inputs.is_empty() {
         return None;
     }
-    let out = out?;
 
     // Initialize the graph once — independent of argument binding (validated).
     let mut ld: ze_command_list_desc_t = mem::zeroed();
@@ -157,12 +144,22 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         return None;
     }
 
-    Some(Box::leak(Box::new(Graph { handle, act: inputs[0], wgt: inputs[1], out })))
+    Some(Box::leak(Box::new(Graph { handle, inputs, out })))
 }
 
-fn node_list(g: &'static Graph, act: &Operand, wgt: &Operand, out: &Operand) -> Option<&'static NodeList> {
-    let key: PtrKey = (act.ptr as usize, wgt.ptr as usize, out.ptr as usize);
-    LISTS.get_or_insert_with(key, || unsafe { build_node_list(g, act, wgt, out) })
+fn node_list(
+    g: &'static Graph,
+    blob_addr: usize,
+    inputs: &[&Operand],
+    out: &Operand,
+) -> Option<&'static NodeList> {
+    if inputs.len() != g.inputs.len() {
+        return None;
+    }
+    // (output pointer, blob) uniquely identifies this instance: each node writes its own dst, and a
+    // given output is always produced by the same node with the same inputs.
+    let key = (out.ptr as usize, blob_addr);
+    LISTS.get_or_insert_with(key, || unsafe { build_node_list(g, inputs, out) })
 }
 
 /// Bind one operand: its own NPU pointer directly when owned (zero copy), else a fresh bounce
@@ -192,16 +189,18 @@ unsafe fn bind_arg(
     }
 }
 
-unsafe fn build_node_list(g: &Graph, act: &Operand, wgt: &Operand, out: &Operand) -> Option<&'static NodeList> {
+unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], out: &Operand) -> Option<&'static NodeList> {
     let l = ze::lib()?;
     let rt = ze::runtime()?;
     let ddi = rt.ddi;
     let pfn_set = (*ddi).pfnSetArgumentValue?;
     let pfn_exec = (*ddi).pfnAppendGraphExecute?;
 
-    let act = bind_arg(pfn_set, g.handle, g.act, act)?;
-    let wgt = bind_arg(pfn_set, g.handle, g.wgt, wgt)?;
-    let out = bind_arg(pfn_set, g.handle, g.out, out)?;
+    let mut binds: Vec<Bind> = Vec::with_capacity(inputs.len());
+    for (i, op) in inputs.iter().enumerate() {
+        binds.push(bind_arg(pfn_set, g.handle, g.inputs[i], op)?);
+    }
+    let out_bind = bind_arg(pfn_set, g.handle, g.out, out)?;
 
     let mut ld: ze_command_list_desc_t = mem::zeroed();
     ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
@@ -215,16 +214,18 @@ unsafe fn build_node_list(g: &Graph, act: &Operand, wgt: &Operand, out: &Operand
     {
         return None;
     }
-    Some(Box::leak(Box::new(NodeList { exec, act, wgt, out })))
+    Some(Box::leak(Box::new(NodeList { exec, inputs: binds, out: out_bind })))
 }
 
-/// Run a MatMul of shape `(M,K,N)`, reusing (or building) its graph + this node's recorded list.
-/// Operands in NPU memory are bound directly (no copy); foreign ones are staged through bounces.
-pub(super) fn run_matmul(m: i64, k: i64, n: i64, act: &Operand, wgt: &Operand, out: &Operand) -> bool {
-    let Some(g) = graph(m, k, n) else {
+/// Run the program baked into `blob` (a matmul or a fused subgraph): reuse (or build) its graph +
+/// this instance's recorded list, stage any foreign inputs, replay the list, wait, and copy back a
+/// foreign output. `inputs` must match the blob's input arg order; NPU-resident operands are bound
+/// directly (no copy), foreign ones staged through bounces.
+pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], out: &Operand) -> bool {
+    let Some(g) = graph(blob) else {
         return false;
     };
-    let Some(node) = node_list(g, act, wgt, out) else {
+    let Some(node) = node_list(g, blob.as_ptr() as usize, inputs, out) else {
         return false;
     };
     let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
@@ -232,8 +233,9 @@ pub(super) fn run_matmul(m: i64, k: i64, n: i64, act: &Operand, wgt: &Operand, o
     };
     unsafe {
         // Stage foreign inputs (owned inputs are already bound to their own memory).
-        stage_in(&node.act, act);
-        stage_in(&node.wgt, wgt);
+        for (bind, op) in node.inputs.iter().zip(inputs.iter()) {
+            stage_in(bind, op);
+        }
         // Replay the pre-recorded execute list, then wait for completion.
         let mut list = node.exec;
         if (l.cmd_queue_exec)(rt.queue, 1, &mut list, ptr::null_mut()) != ZE_RESULT_SUCCESS
