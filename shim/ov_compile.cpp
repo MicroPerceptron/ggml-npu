@@ -10,12 +10,15 @@
 #include <openvino/op/add.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
+#include <openvino/op/divide.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/parameter.hpp>
+#include <openvino/op/reduce_mean.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
 #include <openvino/op/sigmoid.hpp>
+#include <openvino/op/sqrt.hpp>
 
 #include <sys/stat.h>
 
@@ -137,7 +140,7 @@ static std::shared_ptr<ov::Node> make_weight(int32_t bits, int32_t group, int64_
 // ov::Model (so the NPU runs it as one program: intra-graph fusion + pipelining, one submit). Op
 // codes and struct layouts must match src/vendor/ivpu/lower/subgraph.rs.
 // ---------------------------------------------------------------------------
-enum { NPU_SG_MATMUL = 1, NPU_SG_MUL = 2, NPU_SG_SILU = 3, NPU_SG_ADD = 4 };
+enum { NPU_SG_MATMUL = 1, NPU_SG_MUL = 2, NPU_SG_SILU = 3, NPU_SG_ADD = 4, NPU_SG_RMSNORM = 5 };
 
 // Value reference: r in [0, n_inputs) → external input r; r >= n_inputs → node (r - n_inputs); < 0
 // → unused. All values are f16 inside the graph (inputs are Converted at the boundary).
@@ -371,6 +374,20 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
                 case NPU_SG_ADD: {
                     if (!value(nd.a, a) || !value(nd.b, b)) return -1;
                     node_val[(size_t)j] = std::make_shared<v1::Add>(a, b);
+                    break;
+                }
+                case NPU_SG_RMSNORM: {
+                    // RMSNorm over the last dim (K): x / sqrt(mean(x²) + eps). Weight-multiply is a
+                    // separate Mul node. eps arrives as f32 bits in out_n.
+                    if (!value(nd.a, a)) return -1;
+                    float eps;
+                    std::memcpy(&eps, &nd.out_n, sizeof(float));
+                    auto x2 = std::make_shared<v1::Multiply>(a, a);
+                    auto axis = v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+                    auto mean = std::make_shared<v1::ReduceMean>(x2, axis, /*keep_dims=*/true);
+                    auto epsc = v0::Constant::create(ov::element::f16, ov::Shape{1}, std::vector<ov::float16>{ov::float16(eps)});
+                    auto rms = std::make_shared<v0::Sqrt>(std::make_shared<v1::Add>(mean, epsc));
+                    node_val[(size_t)j] = std::make_shared<v1::Divide>(a, rms);
                     break;
                 }
                 case NPU_SG_SILU: {

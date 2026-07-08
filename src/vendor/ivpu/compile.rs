@@ -303,6 +303,7 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
                 SgOp::Mul => (2, 0),
                 SgOp::Add => (4, 0),
                 SgOp::Silu => (3, 0),
+                SgOp::RmsNorm { eps } => (5, eps.to_bits() as i32),
             };
             SgNodeAbi {
                 op,

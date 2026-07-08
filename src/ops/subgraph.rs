@@ -33,6 +33,9 @@ pub enum SgOp {
     Add,
     /// `out = silu(a)`.
     Silu,
+    /// `out = a / sqrt(mean(a²) + eps)` over the last dim (the per-channel weight-multiply is a
+    /// separate [`Mul`] node).
+    RmsNorm { eps: f32 },
 }
 
 /// One node: its op, up to two value inputs, and (for MatMul) the baked-weight index.
@@ -80,8 +83,10 @@ unsafe fn is_const_weight(w: *mut ggml_tensor) -> bool {
 /// (`silu`+`mul`). Requiring the split to be exactly the FFN nodes keeps the boundary unambiguous:
 /// sole external input `X`, sole output `down` (safe outlining without cross-split consumer analysis).
 pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
+    // The FFN core is 4 (fused GLU) or 5 (silu+mul) nodes; a prepended norm adds 2, a trailing
+    // residual adds 1 — so 4..=8. The exact `total` check below validates the count precisely.
     let n = ggml_graph_n_nodes(cgraph);
-    if n != 5 && n != 4 {
+    if !(4..=8).contains(&n) {
         return None;
     }
 
@@ -93,8 +98,14 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
             return None;
         }
         if (*t).op == GGML_OP_MUL_MAT {
+            // `down`'s activation is the FFN gated activation: a SwiGLU, or a MUL that contains a
+            // silu (silu(gate)*up) — NOT the rms_norm-weight MUL that feeds gate/up.
             let act = (*t).src[1];
-            if !act.is_null() && ((*act).op == GGML_OP_MUL || is_swiglu(act)) {
+            let ffn_act = !act.is_null()
+                && (is_swiglu(act)
+                    || ((*act).op == GGML_OP_MUL
+                        && (is_silu((*act).src[0]) || is_silu((*act).src[1]))));
+            if ffn_act {
                 if !down.is_null() {
                     return None; // ambiguous — two candidate down matmuls
                 }
@@ -146,9 +157,35 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
         return None;
     }
 
-    // Optional trailing residual: an `ADD` whose one operand is `down` and the other is a distinct
-    // 2D runtime tensor (the pre-FFN residual). Folds `x_out = down + residual` into the program as
-    // a 2nd input. `residual == x` (no norm between input and residual) is left unfused for simplicity.
+    let m = (*x).ne[1];
+
+    // Optional prepended norm: if the FFN input `x = mul(rms_norm(x_in), norm_w)` and that pair is
+    // in OUR split, fold it — the subgraph input becomes `x_in` (pre-norm) + `norm_w`, and gate/up
+    // read the folded norm output. Gated on M==1: there the per-channel weight-multiply is same-
+    // shape, so `norm_w` is just another bounced input (no broadcast / const machinery). At M>1 the
+    // norm stays on CPU (not claimed) and the FFN fuses without it.
+    let mut norm: Option<(*mut ggml_tensor, *mut ggml_tensor, f32)> = None;
+    if m == 1 && (*x).op == GGML_OP_MUL && in_split(cgraph, n, x) {
+        let (a, b) = ((*x).src[0], (*x).src[1]);
+        let (rn, nw) = if is_rms_norm(a) {
+            (a, b)
+        } else if is_rms_norm(b) {
+            (b, a)
+        } else {
+            (core::ptr::null_mut(), core::ptr::null_mut())
+        };
+        if !rn.is_null() && in_split(cgraph, n, rn) {
+            let x_in = (*rn).src[0];
+            if !x_in.is_null() && !nw.is_null() && glue_2d(x_in) && glue_2d(nw)
+                && !(*x_in).data.is_null() && !(*nw).data.is_null()
+            {
+                norm = Some((x_in, nw, f32::from_bits((*rn).op_params[0] as u32)));
+            }
+        }
+    }
+
+    // Optional trailing residual: an `ADD` whose one operand is `down` and the other a distinct 2D
+    // runtime tensor (the pre-FFN residual — which, when a norm is folded, is the norm's own x_in).
     let mut residual: *mut ggml_tensor = core::ptr::null_mut();
     let mut residual_add: *mut ggml_tensor = core::ptr::null_mut();
     for i in 0..n {
@@ -171,31 +208,51 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
         break;
     }
 
-    // Exactly the FFN nodes (+ silu for the MUL form) (+ the residual add if folded) — no extras.
+    // Exactly the split's nodes: [rms_norm + mul] (norm) + FFN (+ silu form) (+ residual add).
     let ffn_count = if has_silu_node { 5 } else { 4 };
-    let total = ffn_count + if residual_add.is_null() { 0 } else { 1 };
+    let total = ffn_count + if norm.is_some() { 2 } else { 0 } + if residual_add.is_null() { 0 } else { 1 };
     if n != total {
         return None;
     }
 
-    // Build the canonical IR: 0=gate, 1=up, 2=silu, 3=mul, 4=down (+ 5=residual add when folded).
-    let m = (*x).ne[1];
+    // Build the IR with running indices (the norm, when present, prepends 2 nodes).
     let consts = vec![sg_const(gate_w), sg_const(up_w), sg_const(down_w)];
-    let mut nodes = vec![
-        SgNode { op: SgOp::MatMul { n: (*gate_w).ne[1] }, a: Ref::Input(0), b: None, weight: Some(0) },
-        SgNode { op: SgOp::MatMul { n: (*up_w).ne[1] }, a: Ref::Input(0), b: None, weight: Some(1) },
-        SgNode { op: SgOp::Silu, a: Ref::Node(0), b: None, weight: None },
-        SgNode { op: SgOp::Mul, a: Ref::Node(2), b: Some(Ref::Node(1)), weight: None },
-        SgNode { op: SgOp::MatMul { n: (*down_w).ne[1] }, a: Ref::Node(3), b: None, weight: Some(2) },
-    ];
-    let (mut inputs, output, out) = (vec![Operand::from_tensor(x)], 4u32, down);
-    let (inputs, output, out) = if residual_add.is_null() {
-        (inputs, output, out)
+    let mut nodes: Vec<SgNode> = Vec::new();
+    let mut inputs: Vec<Operand> = Vec::new();
+    let x_in_tensor: *mut ggml_tensor;
+    let ffn_in: Ref = if let Some((x_in, norm_w, eps)) = norm {
+        x_in_tensor = x_in;
+        inputs.push(Operand::from_tensor(x_in)); // Input(0) = x_in (pre-norm)
+        inputs.push(Operand::from_tensor(norm_w)); // Input(1) = norm weight
+        nodes.push(SgNode { op: SgOp::RmsNorm { eps }, a: Ref::Input(0), b: None, weight: None });
+        nodes.push(SgNode { op: SgOp::Mul, a: Ref::Node(0), b: Some(Ref::Input(1)), weight: None });
+        Ref::Node(1)
     } else {
-        inputs.push(Operand::from_tensor(residual));
-        nodes.push(SgNode { op: SgOp::Add, a: Ref::Node(4), b: Some(Ref::Input(1)), weight: None });
-        (inputs, 5u32, residual_add)
+        x_in_tensor = core::ptr::null_mut();
+        inputs.push(Operand::from_tensor(x)); // Input(0) = the FFN input
+        Ref::Input(0)
     };
+    let g = nodes.len() as u32;
+    nodes.push(SgNode { op: SgOp::MatMul { n: (*gate_w).ne[1] }, a: ffn_in, b: None, weight: Some(0) });
+    nodes.push(SgNode { op: SgOp::MatMul { n: (*up_w).ne[1] }, a: ffn_in, b: None, weight: Some(1) });
+    nodes.push(SgNode { op: SgOp::Silu, a: Ref::Node(g), b: None, weight: None });
+    nodes.push(SgNode { op: SgOp::Mul, a: Ref::Node(g + 2), b: Some(Ref::Node(g + 1)), weight: None });
+    nodes.push(SgNode { op: SgOp::MatMul { n: (*down_w).ne[1] }, a: Ref::Node(g + 3), b: None, weight: Some(2) });
+    let mut output = g + 4;
+    let mut out = down;
+    if !residual_add.is_null() {
+        // Reuse Input(0) when the residual is the norm's own x_in (the common real-layer case).
+        let residual_ref = if !x_in_tensor.is_null() && residual == x_in_tensor {
+            Ref::Input(0)
+        } else {
+            let ri = inputs.len() as u32;
+            inputs.push(Operand::from_tensor(residual));
+            Ref::Input(ri)
+        };
+        nodes.push(SgNode { op: SgOp::Add, a: Ref::Node(g + 4), b: Some(residual_ref), weight: None });
+        output = g + 5;
+        out = residual_add;
+    }
     Some(Subgraph {
         m,
         inputs,
@@ -227,6 +284,21 @@ unsafe fn is_swiglu(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_GLU && (*t).op_params[0] == GGML_GLU_OP_SWIGLU as i32
 }
 
+/// Is `t` an RMSNorm node?
+unsafe fn is_rms_norm(t: *const ggml_tensor) -> bool {
+    !t.is_null() && (*t).op == GGML_OP_RMS_NORM
+}
+
+/// Is `t` one of the split's computed nodes (vs an external boundary input the split reads)?
+unsafe fn in_split(cgraph: *mut ggml_cgraph, n: i32, t: *const ggml_tensor) -> bool {
+    for i in 0..n {
+        if ggml_graph_node(cgraph, i) as *const ggml_tensor == t {
+            return true;
+        }
+    }
+    false
+}
+
 /// Plain 2D (`[K, M]`), so the single-node subgraph's `[M, K]` mapping is exact.
 unsafe fn glue_2d(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).ne[2] == 1 && (*t).ne[3] == 1
@@ -237,10 +309,15 @@ unsafe fn is_claimable_matmul(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_MUL_MAT && super::matmul::match_node(t).is_some()
 }
 
-/// Is `node` a glue op *type* (silu, mul, SwiGLU, or add) — dispatched via [`recognize_glue`], not
-/// `match_node`?
+/// Is `node` a glue op *type* (silu, mul, SwiGLU, add, or RMSNorm) — dispatched via
+/// [`recognize_glue`], not `match_node`?
 pub unsafe fn is_glue_op(node: *const ggml_tensor) -> bool {
-    !node.is_null() && (is_silu(node) || (*node).op == GGML_OP_MUL || (*node).op == GGML_OP_ADD || is_swiglu(node))
+    !node.is_null()
+        && (is_silu(node)
+            || (*node).op == GGML_OP_MUL
+            || (*node).op == GGML_OP_ADD
+            || is_swiglu(node)
+            || is_rms_norm(node))
 }
 
 /// Should `supports_op` claim this glue node as part of a claimable FFN? Upstream structure only
@@ -259,10 +336,20 @@ pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
     if is_swiglu(node) {
         return is_claimable_matmul((*node).src[0]) && is_claimable_matmul((*node).src[1]);
     }
+    // RMSNorm and its weight-multiply — only at decode (M==1), where the per-channel weight-multiply
+    // is same-shape (no broadcast). Over-claims: an attention norm gets claimed too and runs as its
+    // own standalone dispatch (correct, minor cost) until attention fuses.
+    if is_rms_norm(node) {
+        return (*node).ne[1] == 1;
+    }
     if (*node).op == GGML_OP_MUL {
         let (a, b) = ((*node).src[0], (*node).src[1]);
         let silu_mm = |s: *const ggml_tensor| is_silu(s) && is_claimable_matmul((*s).src[0]);
-        return (silu_mm(a) && is_claimable_matmul(b)) || (silu_mm(b) && is_claimable_matmul(a));
+        if (silu_mm(a) && is_claimable_matmul(b)) || (silu_mm(b) && is_claimable_matmul(a)) {
+            return true;
+        }
+        // norm-weight mul: rms_norm × per-channel weight, at decode.
+        return (*node).ne[1] == 1 && (is_rms_norm(a) || is_rms_norm(b));
     }
     if (*node).op == GGML_OP_ADD {
         let (a, b) = ((*node).src[0], (*node).src[1]);
@@ -354,6 +441,25 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
                 SgNode { op: SgOp::Mul, a: Ref::Node(0), b: Some(Ref::Input(1)), weight: None },
             ],
             output: 1,
+            out: Operand::from_tensor(node),
+        });
+    }
+    if is_rms_norm(node) {
+        let s0 = (*node).src[0];
+        if s0.is_null() || (*s0).data.is_null() {
+            return None;
+        }
+        return Some(Subgraph {
+            m: (*s0).ne[1],
+            inputs: vec![Operand::from_tensor(s0)],
+            consts: Vec::new(),
+            nodes: vec![SgNode {
+                op: SgOp::RmsNorm { eps: f32::from_bits((*node).op_params[0] as u32) },
+                a: Ref::Input(0),
+                b: None,
+                weight: None,
+            }],
+            output: 0,
             out: Operand::from_tensor(node),
         });
     }
