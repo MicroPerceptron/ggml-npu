@@ -9,6 +9,7 @@ mod cache;
 mod compile;
 mod graph;
 mod lower;
+mod profile;
 mod session;
 mod weights;
 mod ze;

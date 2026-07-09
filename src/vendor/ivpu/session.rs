@@ -1,8 +1,9 @@
 //! Zero-copy dispatch for a compiled NPU program (one matmul, or a fused subgraph): a per-blob
-//! graph plus a per-node recorded execute list. The program has **N inputs and one output**; all
+//! graph plus a per-node recorded execute list. The program has **N inputs and N outputs**; all
 //! weights are baked into the blob as compile-time `Constant`s, so they are neither bound nor
-//! copied. A single matmul is just the `N == 1` case (its one input is the activation); a fused
-//! subgraph (e.g. an FFN) has one input per external boundary tensor.
+//! copied. A single matmul is just the `1 input, 1 output` case (its input is the activation); a
+//! fused subgraph has one input per external boundary tensor and one output per node whose value
+//! leaves the subgraph (usually one — e.g. an FFN `down` — but several for a fan-out like Q/K/V).
 //!
 //! Two caches, both lock-free:
 //! - **[`GRAPHS`]** — one Level Zero graph per distinct blob (keyed by the blob's leaked address).
@@ -25,6 +26,7 @@ use core::mem;
 use core::ptr;
 
 use super::cache::Cache;
+use super::profile;
 use super::ze;
 use super::ze::raw::*;
 use crate::ops::Operand;
@@ -231,11 +233,18 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
     let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
         return false;
     };
+    let prof = profile::enabled();
     unsafe {
+        let t0 = if prof { profile::now_ns() } else { 0 };
         // Stage foreign inputs (owned inputs are already bound to their own memory).
+        let mut bytes_in = 0u64;
         for (bind, op) in node.inputs.iter().zip(inputs.iter()) {
             stage_in(bind, op);
+            if prof && !bind.bounce.is_null() {
+                bytes_in += bind.elems as u64 * 4;
+            }
         }
+        let t1 = if prof { profile::now_ns() } else { 0 };
         // Replay the pre-recorded execute list, then wait for completion.
         let mut list = node.exec;
         if (l.cmd_queue_exec)(rt.queue, 1, &mut list, ptr::null_mut()) != ZE_RESULT_SUCCESS
@@ -243,12 +252,24 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
         {
             return false;
         }
+        let t2 = if prof { profile::now_ns() } else { 0 };
         // Copy foreign outputs back (owned outputs were written in place — zero copy).
+        let mut bytes_out = 0u64;
         for (bind, op) in node.outs.iter().zip(outs.iter()) {
             if !bind.bounce.is_null() {
                 let nout = min(op.elems, bind.elems);
                 ptr::copy_nonoverlapping(bind.bounce as *const f32, op.ptr as *mut f32, nout);
+                if prof {
+                    bytes_out += nout as u64 * 4;
+                }
             }
+        }
+        if prof {
+            let t3 = profile::now_ns();
+            let owned =
+                node.inputs.iter().chain(node.outs.iter()).filter(|b| b.bounce.is_null()).count() as u64;
+            let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
+            profile::record(t0, t1, t2, t3, owned, bounced, bytes_in, bytes_out);
         }
     }
     true
