@@ -50,7 +50,7 @@ type CompileConst = unsafe extern "C" fn(
 type FreeBlob = unsafe extern "C" fn(*mut u8);
 
 // int ggml_npu_ov_compile_subgraph(M, n_inputs, input_k, n_nodes, nodes, n_consts, consts,
-//                                  out_node, cache_key, &blob, &len)
+//                                  out_nodes, n_outs, cache_key, &blob, &len)
 type CompileSubgraph = unsafe extern "C" fn(
     i32,
     i32,
@@ -59,6 +59,7 @@ type CompileSubgraph = unsafe extern "C" fn(
     *const SgNodeAbi,
     i32,
     *const SgConstAbi,
+    *const i32,
     i32,
     *const c_char,
     *mut *mut u8,
@@ -162,6 +163,22 @@ fn shim() -> Option<&'static Shim> {
 /// Key = `(weight data pointer, M)`: a weight's blob is specific to it *and* the activation rows.
 static CACHE: Cache<(usize, i64), Option<&'static [u8]>> = Cache::new();
 
+/// Cheap feasibility check (no compile): is the shim present and the weight re-quantizable at this
+/// shape? A `true` means [`get_or_compile_const`] will (barring a rare OpenVINO failure) succeed, so
+/// `can_lower` can claim the matmul and its blob compiles **lazily in `run`** — avoiding a wasted
+/// standalone compile for a matmul that then fuses into an FFN subgraph (the common case). Same
+/// contract as the fused-subgraph path, which also compiles lazily at `graph_compute`.
+pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
+    m > 0
+        && k > 0
+        && n > 0
+        && m <= i32::MAX as i64
+        && k <= i32::MAX as i64
+        && n <= i32::MAX as i64
+        && shim().is_some()
+        && weights::can_requant(weight, k as usize)
+}
+
 /// Get the cached Constant blob for `weight` at shape `(M, K, N)`, re-quantizing + compiling (or
 /// disk-loading) on a miss. `None` if the shim/NPU is absent or the weight can't take this path.
 pub(super) fn get_or_compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<&'static [u8]> {
@@ -254,10 +271,13 @@ fn cache_key(rq: &Requant, m: i64, k: i64, n: i64) -> CString {
 static SG_CACHE: Cache<(usize, i64), Option<&'static [u8]>> = Cache::new();
 
 pub(super) fn get_or_compile_subgraph(sg: &Subgraph) -> Option<&'static [u8]> {
-    if sg.m <= 0 || sg.inputs.is_empty() || sg.nodes.is_empty() || sg.output as usize >= sg.nodes.len() {
+    if sg.m <= 0 || sg.inputs.is_empty() || sg.nodes.is_empty() || sg.outputs.is_empty() || sg.outs.is_empty() {
         return None;
     }
-    SG_CACHE.get_or_insert_with((sg.out.ptr as usize, sg.m), || {
+    if sg.outputs.iter().any(|&o| o as usize >= sg.nodes.len()) {
+        return None;
+    }
+    SG_CACHE.get_or_insert_with((sg.outs[0].ptr as usize, sg.m), || {
         compile_subgraph(sg).map(|v| &*Vec::leak(v))
     })
 }
@@ -315,8 +335,9 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
         })
         .collect();
 
+    let out_nodes: Vec<i32> = sg.outputs.iter().map(|&o| o as i32).collect();
     let input_k: Vec<i32> = sg.inputs.iter().map(|op| (op.elems / sg.m as usize) as i32).collect();
-    let key = subgraph_cache_key(sg, &requants, &nodes, &input_k);
+    let key = subgraph_cache_key(sg, &requants, &nodes, &input_k, &out_nodes);
 
     let mut blob: *mut u8 = ptr::null_mut();
     let mut len: usize = 0;
@@ -329,7 +350,8 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
             nodes.as_ptr(),
             consts.len() as i32,
             consts.as_ptr(),
-            sg.output as i32,
+            out_nodes.as_ptr(),
+            out_nodes.len() as i32,
             key.as_ptr(),
             &mut blob,
             &mut len,
@@ -343,7 +365,13 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn subgraph_cache_key(sg: &Subgraph, requants: &[Requant], nodes: &[SgNodeAbi], input_k: &[i32]) -> CString {
+fn subgraph_cache_key(
+    sg: &Subgraph,
+    requants: &[Requant],
+    nodes: &[SgNodeAbi],
+    input_k: &[i32],
+    out_nodes: &[i32],
+) -> CString {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     h = fnv1a(h, &FORMAT_VERSION.to_le_bytes());
     h = fnv1a(h, &sg.m.to_le_bytes());
@@ -355,11 +383,15 @@ fn subgraph_cache_key(sg: &Subgraph, requants: &[Requant], nodes: &[SgNodeAbi], 
             h = fnv1a(h, &v.to_le_bytes());
         }
     }
+    // The output selection (which nodes are Results, and their order) is part of the compiled model.
+    for o in out_nodes {
+        h = fnv1a(h, &o.to_le_bytes());
+    }
     for rq in requants {
         h = fnv1a(h, &[rq.bits as u8, rq.group as u8]);
         h = fnv1a(h, &rq.weight);
         h = fnv1a(h, &rq.scales);
     }
-    let s = alloc::format!("sg-{h:016x}-m{}-n{}", sg.m, sg.nodes.len());
+    let s = alloc::format!("sg-{h:016x}-m{}-n{}-o{}", sg.m, sg.nodes.len(), out_nodes.len());
     CString::new(s).unwrap_or_else(|_| CString::new("badkey").unwrap())
 }

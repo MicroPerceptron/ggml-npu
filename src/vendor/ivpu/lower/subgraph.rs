@@ -14,5 +14,6 @@ pub fn run(sg: &Subgraph) -> bool {
         return false;
     };
     let inputs: Vec<&Operand> = sg.inputs.iter().collect();
-    session::run(blob, &inputs, &sg.out)
+    let outs: Vec<&Operand> = sg.outs.iter().collect();
+    session::run(blob, &inputs, &outs)
 }

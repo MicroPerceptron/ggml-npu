@@ -55,14 +55,16 @@ pub struct SgConst {
 
 /// A recognized, offloadable subgraph the vendor compiles into one program. Vendor-agnostic, like
 /// [`Operand`]: `inputs` are boundary activations (`[M, K_i]`), `consts` the weights to bake,
-/// `nodes` a topologically-ordered DAG, `output` the node whose result leaves the subgraph.
+/// `nodes` a topologically-ordered DAG, and `outputs`/`outs` the node(s) whose results leave the
+/// subgraph (usually one — e.g. `down`; but multiple for a fan-out like the attention `Q`/`K`/`V`
+/// projections). `outputs[i]` is a node index, `outs[i]` the matching boundary tensor.
 pub struct Subgraph {
     pub m: i64,
     pub inputs: Vec<Operand>,
     pub consts: Vec<SgConst>,
     pub nodes: Vec<SgNode>,
-    pub output: u32,
-    pub out: Operand,
+    pub outputs: Vec<u32>,
+    pub outs: Vec<Operand>,
 }
 
 unsafe fn sg_const(w: *mut ggml_tensor) -> SgConst {
@@ -76,6 +78,9 @@ unsafe fn is_const_weight(w: *mut ggml_tensor) -> bool {
 
 /// Upper bound on split size (keeps the O(n²) operand/consumer scans cheap; a layer is ~30 nodes).
 const MAX_SG_NODES: usize = 64;
+
+/// Upper bound on a subgraph's outputs (a fan-out like Q/K/V; a single-output artifact is the norm).
+const MAX_SG_OUTPUTS: usize = 8;
 
 /// Elementwise ops require identical 2D shapes (the `[M, K]` boundary model has no broadcast).
 unsafe fn same_2d(a: *const ggml_tensor, b: *const ggml_tensor) -> bool {
@@ -218,18 +223,28 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
             }
         }
     }
-    let mut out_ci: Option<usize> = None;
+    // Outputs = the nodes no other split node consumes (in topo order for a stable Result order).
+    // One is the usual case (`down`); several is a fan-out like the Q/K/V projections.
+    let mut outputs: Vec<u32> = Vec::new();
+    let mut outs: Vec<Operand> = Vec::new();
+    let mut m = 0i64;
     for ci in 0..n {
         if !consumed[ci] {
-            if out_ci.is_some() {
-                return None; // multiple outputs — not a single-output subgraph
+            if outputs.len() >= MAX_SG_OUTPUTS {
+                return None;
             }
-            out_ci = Some(ci);
+            let t = cnodes[ci];
+            // All outputs must share the batch rows `m` (= ne[1]); the `[M, K]` model has no batch dim.
+            if m == 0 {
+                m = (*t).ne[1];
+            } else if (*t).ne[1] != m {
+                return None;
+            }
+            outputs.push(ir_out[ci]);
+            outs.push(Operand::from_tensor(t));
         }
     }
-    let out_t = cnodes[out_ci?];
-    let m = (*out_t).ne[1];
-    if m <= 0 {
+    if outputs.is_empty() || m <= 0 {
         return None;
     }
     // Every activation must be `[K, m]`-shaped (so input_k = elems/m is exact at the shim).
@@ -239,14 +254,7 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
         }
     }
 
-    Some(Subgraph {
-        m,
-        inputs,
-        consts,
-        nodes: ir_nodes,
-        output: ir_out[out_ci?],
-        out: Operand::from_tensor(out_t),
-    })
+    Some(Subgraph { m, inputs, consts, nodes: ir_nodes, outputs, outs })
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +364,8 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             inputs: vec![Operand::from_tensor(s0)],
             consts: Vec::new(),
             nodes: vec![SgNode { op: SgOp::Silu, a: Ref::Input(0), b: None, weight: None }],
-            output: 0,
-            out: Operand::from_tensor(node),
+            outputs: vec![0],
+            outs: vec![Operand::from_tensor(node)],
         });
     }
     if (*node).op == GGML_OP_MUL {
@@ -374,8 +382,8 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             inputs: vec![Operand::from_tensor(a), Operand::from_tensor(b)],
             consts: Vec::new(),
             nodes: vec![SgNode { op: SgOp::Mul, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
-            output: 0,
-            out: Operand::from_tensor(node),
+            outputs: vec![0],
+            outs: vec![Operand::from_tensor(node)],
         });
     }
     if (*node).op == GGML_OP_ADD {
@@ -391,8 +399,8 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             inputs: vec![Operand::from_tensor(a), Operand::from_tensor(b)],
             consts: Vec::new(),
             nodes: vec![SgNode { op: SgOp::Add, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
-            output: 0,
-            out: Operand::from_tensor(node),
+            outputs: vec![0],
+            outs: vec![Operand::from_tensor(node)],
         });
     }
     if is_swiglu(node) {
@@ -417,8 +425,8 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
                 SgNode { op: SgOp::Silu, a: Ref::Input(0), b: None, weight: None },
                 SgNode { op: SgOp::Mul, a: Ref::Node(0), b: Some(Ref::Input(1)), weight: None },
             ],
-            output: 1,
-            out: Operand::from_tensor(node),
+            outputs: vec![1],
+            outs: vec![Operand::from_tensor(node)],
         });
     }
     if is_rms_norm(node) {
@@ -436,8 +444,8 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
                 b: None,
                 weight: None,
             }],
-            output: 0,
-            out: Operand::from_tensor(node),
+            outputs: vec![0],
+            outs: vec![Operand::from_tensor(node)],
         });
     }
     None

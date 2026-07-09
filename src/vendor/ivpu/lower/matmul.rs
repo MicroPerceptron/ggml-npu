@@ -6,14 +6,16 @@
 use super::super::{compile, session};
 use crate::ops::Operand;
 
-/// Can this MatMul run on the NPU? True iff we can re-quantize the weight and compile (or
-/// disk-load) its Constant blob. Compiling here upholds the scheduler contract: a `true` here
-/// means the blob is cached, so [`run`] cannot then fail to find it.
+/// Can this MatMul run on the NPU? A cheap **feasibility** check (shim present + weight
+/// re-quantizable) — it does **not** compile the blob. The blob compiles lazily in [`run`] (or,
+/// when the matmul fuses into an FFN, only the fused subgraph blob is built). This avoids a wasted
+/// standalone compile for every FFN matmul at scheduling time; the fused-subgraph path likewise
+/// compiles lazily at `graph_compute`, so the scheduler contract is the same.
 pub fn can_lower(m: i64, k: i64, n: i64, inputs: &[Operand]) -> bool {
     let Some(weight) = inputs.get(1) else {
         return false;
     };
-    compile::get_or_compile_const(weight, m, k, n).is_some()
+    compile::const_feasible(weight, m, k, n)
 }
 
 pub fn run(m: i64, k: i64, n: i64, inputs: &[Operand], output: &Operand) -> bool {
@@ -23,5 +25,5 @@ pub fn run(m: i64, k: i64, n: i64, inputs: &[Operand], output: &Operand) -> bool
     let Some(blob) = compile::get_or_compile_const(weight, m, k, n) else {
         return false;
     };
-    session::run(blob, &[activation], output)
+    session::run(blob, &[activation], &[output])
 }

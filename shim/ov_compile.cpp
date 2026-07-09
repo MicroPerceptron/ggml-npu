@@ -289,20 +289,25 @@ int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bi
 int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* input_k,
                                  int32_t n_nodes, const struct npu_sg_node* nodes,
                                  int32_t n_consts, const struct npu_sg_const* consts,
-                                 int32_t out_node, const char* cache_key,
+                                 const int32_t* out_nodes, int32_t n_outs, const char* cache_key,
                                  uint8_t** blob, size_t* len) {
     if (!blob || !len || M <= 0 || n_inputs <= 0 || n_nodes <= 0 || !input_k || !nodes) {
         return -1;
     }
-    if (out_node < 0 || out_node >= n_nodes) {
+    if (!out_nodes || n_outs <= 0) {
         return -1;
+    }
+    for (int i = 0; i < n_outs; i++) {
+        if (out_nodes[i] < 0 || out_nodes[i] >= n_nodes) {
+            return -1;
+        }
     }
     *blob = nullptr;
     *len = 0;
 
     if (std::getenv("GGML_NPU_DEBUG")) {
-        std::fprintf(stderr, "[sg] M=%d n_inputs=%d n_nodes=%d n_consts=%d out_node=%d\n",
-                     M, n_inputs, n_nodes, n_consts, out_node);
+        std::fprintf(stderr, "[sg] M=%d n_inputs=%d n_nodes=%d n_consts=%d n_outs=%d\n",
+                     M, n_inputs, n_nodes, n_consts, n_outs);
         for (int i = 0; i < n_inputs; i++) std::fprintf(stderr, "[sg]  input[%d] k=%d\n", i, input_k[i]);
         for (int j = 0; j < n_nodes; j++)
             std::fprintf(stderr, "[sg]  node[%d] op=%d a=%d b=%d const=%d out_n=%d\n", j, nodes[j].op,
@@ -311,6 +316,7 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
             std::fprintf(stderr, "[sg]  const[%d] bits=%d group=%d n=%d k=%d wlen=%zu slen=%zu\n", c,
                          consts[c].bits, consts[c].group, consts[c].n, consts[c].k,
                          consts[c].weight_len, consts[c].scales_len);
+        for (int i = 0; i < n_outs; i++) std::fprintf(stderr, "[sg]  out[%d] node=%d\n", i, out_nodes[i]);
     }
 
     std::string path;
@@ -402,9 +408,15 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
             }
         }
 
-        auto out = std::make_shared<v0::Convert>(node_val[(size_t)out_node], ov::element::f32);
-        auto r = std::make_shared<v0::Result>(out);
-        auto model = std::make_shared<ov::Model>(ov::ResultVector{r}, params);
+        // One Result per requested output node, in the caller's order. This fixes the blob's output
+        // argument order, which the Rust session binds `outs[i]` to in the same order.
+        ov::ResultVector results;
+        results.reserve((size_t)n_outs);
+        for (int i = 0; i < n_outs; i++) {
+            auto out = std::make_shared<v0::Convert>(node_val[(size_t)out_nodes[i]], ov::element::f32);
+            results.push_back(std::make_shared<v0::Result>(out));
+        }
+        auto model = std::make_shared<ov::Model>(results, params);
 
         auto compiled = core().compile_model(model, "NPU");
         std::ostringstream os(std::ios::binary);

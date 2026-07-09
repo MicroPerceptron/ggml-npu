@@ -61,6 +61,21 @@ fn choose_bits(tr: &crate::ffi::ggml_type_traits, force: Option<i32>) -> i32 {
     }
 }
 
+/// Cheap feasibility check for [`requant`] — no dequant, no allocation: is this weight
+/// re-quantizable at width `k`? (A quantized type ggml can `to_float`, or f32, with `k` a whole
+/// number of groups.) Lets `can_lower` claim a matmul without compiling its blob.
+pub(super) fn can_requant(weight: &Operand, k: usize) -> bool {
+    if k == 0 || k % GROUP != 0 || weight.ptr.is_null() {
+        return false;
+    }
+    let traits = unsafe { ggml_get_type_traits(weight.dtype) };
+    if traits.is_null() {
+        return false;
+    }
+    let tr = unsafe { &*traits };
+    (tr.is_quantized && tr.to_float.is_some()) || weight.dtype == GGML_TYPE_F32
+}
+
 /// Little-endian f16 bytes of `x`, appended to `out`.
 fn push_f16(out: &mut Vec<u8>, x: f32) {
     let b = (x as f16).to_bits();
