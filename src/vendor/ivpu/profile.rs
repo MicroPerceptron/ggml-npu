@@ -35,19 +35,48 @@ const CLOCK_MONOTONIC: i32 = 1;
 
 /// Monotonic clock in nanoseconds (vDSO-fast). Only sampled when profiling is on.
 pub(super) fn now_ns() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) } != 0 {
         return 0;
     }
-    (ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64)
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
 }
 
 // 0 = untried, 1 = off, 2 = on. Resolved once from the environment on the first dispatch.
 static ENABLED: AtomicU8 = AtomicU8::new(0);
+static DEBUG: AtomicU8 = AtomicU8::new(0);
+
+/// Is `GGML_NPU_DEBUG` set? (Cached.) Gates the failure-path diagnostics.
+pub(super) fn debug_on() -> bool {
+    let s = DEBUG.load(Ordering::Acquire);
+    if s != 0 {
+        return s == 2;
+    }
+    let on = unsafe {
+        let p = getenv(c"GGML_NPU_DEBUG".as_ptr());
+        !p.is_null() && *p != 0
+    };
+    DEBUG.store(if on { 2 } else { 1 }, Ordering::Release);
+    on
+}
+
+/// Write `s` to stderr when `GGML_NPU_DEBUG` is set (a `no_std` eprintln for failure diagnostics).
+pub(super) fn note(s: &str) {
+    if debug_on() {
+        unsafe { write(2, s.as_ptr(), s.len()) };
+    }
+}
 
 static N_DISPATCH: AtomicU64 = AtomicU64::new(0);
 static T_STAGE_IN: AtomicU64 = AtomicU64::new(0); // ns, host copy of foreign inputs into bounces
-static T_DEVICE: AtomicU64 = AtomicU64::new(0); // ns, submit + NPU compute + sync
+static T_DEVICE: AtomicU64 = AtomicU64::new(0); // ns, submit + NPU compute + sync (= submit + sync)
+static T_SUBMIT: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_exec — async submit (host cost only)
+static T_SYNC: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_sync — wait for the NPU to drain
 static T_COPY_OUT: AtomicU64 = AtomicU64::new(0); // ns, host copy of foreign outputs out of bounces
 static N_ARGS_OWNED: AtomicU64 = AtomicU64::new(0); // bound directly (zero copy)
 static N_ARGS_BOUNCED: AtomicU64 = AtomicU64::new(0); // staged through a bounce buffer
@@ -66,7 +95,11 @@ pub(super) fn enabled() -> bool {
     };
     let want = if on { 2 } else { 1 };
     // Only the thread that flips 0 -> want registers the exit dump (once).
-    if ENABLED.compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire).is_ok() && on {
+    if ENABLED
+        .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && on
+    {
         unsafe { __cxa_atexit(dump_at_exit, ptr::null_mut(), ptr::null_mut()) };
     }
     on
@@ -74,10 +107,13 @@ pub(super) fn enabled() -> bool {
 
 /// Record one dispatch's phase timings (ns) and byte volumes. `t0..t3` are `now_ns` samples taken
 /// around stage-in, the device round-trip, and copy-out.
+/// `t0..t3` are `now_ns` samples: t0 before stage-in, t1 after stage-in (= before submit), `tmid`
+/// after the async submit returns (= before sync), t2 after sync, t3 after copy-out.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record(
     t0: u64,
     t1: u64,
+    tmid: u64,
     t2: u64,
     t3: u64,
     owned: u64,
@@ -88,6 +124,8 @@ pub(super) fn record(
     N_DISPATCH.fetch_add(1, Ordering::Relaxed);
     T_STAGE_IN.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
     T_DEVICE.fetch_add(t2.saturating_sub(t1), Ordering::Relaxed);
+    T_SUBMIT.fetch_add(tmid.saturating_sub(t1), Ordering::Relaxed);
+    T_SYNC.fetch_add(t2.saturating_sub(tmid), Ordering::Relaxed);
     T_COPY_OUT.fetch_add(t3.saturating_sub(t2), Ordering::Relaxed);
     N_ARGS_OWNED.fetch_add(owned, Ordering::Relaxed);
     N_ARGS_BOUNCED.fetch_add(bounced, Ordering::Relaxed);
@@ -123,16 +161,28 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         T_DEVICE.load(Ordering::Relaxed),
         T_COPY_OUT.load(Ordering::Relaxed),
     );
+    let (tsub, tsync) = (
+        T_SUBMIT.load(Ordering::Relaxed),
+        T_SYNC.load(Ordering::Relaxed),
+    );
     let total = ti + td + to;
     let host = ti + to;
-    let (owned, bounced) = (N_ARGS_OWNED.load(Ordering::Relaxed), N_ARGS_BOUNCED.load(Ordering::Relaxed));
-    let (bin, bout) = (BYTES_IN.load(Ordering::Relaxed), BYTES_OUT.load(Ordering::Relaxed));
+    let (owned, bounced) = (
+        N_ARGS_OWNED.load(Ordering::Relaxed),
+        N_ARGS_BOUNCED.load(Ordering::Relaxed),
+    );
+    let (bin, bout) = (
+        BYTES_IN.load(Ordering::Relaxed),
+        BYTES_OUT.load(Ordering::Relaxed),
+    );
     let args = owned + bounced;
 
     let s = alloc::format!(
         "\n[ggml-npu profile]  dispatches={n}   measured host+device wall={:.3} ms ({:.3} us/disp)\n\
          \x20 stage-in (host->bounce) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 device  (submit+sync)   : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%\n\
+         \x20   |- submit (exec async): {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
+         \x20   \\- sync   (wait NPU)  : {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
          \x20 copy-out (bounce->host) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 ---- host copy total    : {:>9.3} ms  ({:.1}%)     device total: {:.3} ms ({:.1}%)\n\
          \x20 args: {owned} owned (zero-copy) / {bounced} bounced  ({:.1}% zero-copy of {args})\n",
@@ -145,6 +195,12 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         ms(td),
         us_per(td, n),
         pct(td, total),
+        ms(tsub),
+        us_per(tsub, n),
+        pct(tsub, td),
+        ms(tsync),
+        us_per(tsync, n),
+        pct(tsync, td),
         ms(to),
         us_per(to, n),
         pct(to, total),

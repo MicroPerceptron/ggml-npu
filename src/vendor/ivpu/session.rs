@@ -225,9 +225,17 @@ unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], outs: &[&Operand]) -> 
 /// directly (no copy), foreign ones staged through bounces.
 pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -> bool {
     let Some(g) = graph(blob) else {
+        profile::note("[npu] run FAIL: graph(blob) None\n");
         return false;
     };
     let Some(node) = node_list(g, blob.as_ptr() as usize, inputs, outs) else {
+        profile::note(&alloc::format!(
+            "[npu] run FAIL: node_list None — inputs {} (g.inputs {}) outs {} (g.outs {})\n",
+            inputs.len(),
+            g.inputs.len(),
+            outs.len(),
+            g.outs.len(),
+        ));
         return false;
     };
     let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
@@ -245,11 +253,16 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
             }
         }
         let t1 = if prof { profile::now_ns() } else { 0 };
-        // Replay the pre-recorded execute list, then wait for completion.
+        // Replay the pre-recorded execute list (async submit), then wait for completion. Split so
+        // the profiler can separate host submit cost from the NPU round-trip (the ~fixed floor).
         let mut list = node.exec;
-        if (l.cmd_queue_exec)(rt.queue, 1, &mut list, ptr::null_mut()) != ZE_RESULT_SUCCESS
-            || (l.cmd_queue_sync)(rt.queue, u64::MAX) != ZE_RESULT_SUCCESS
-        {
+        if (l.cmd_queue_exec)(rt.queue, 1, &mut list, ptr::null_mut()) != ZE_RESULT_SUCCESS {
+            profile::note("[npu] run FAIL: cmd_queue_exec\n");
+            return false;
+        }
+        let tmid = if prof { profile::now_ns() } else { 0 };
+        if (l.cmd_queue_sync)(rt.queue, u64::MAX) != ZE_RESULT_SUCCESS {
+            profile::note("[npu] run FAIL: cmd_queue_sync\n");
             return false;
         }
         let t2 = if prof { profile::now_ns() } else { 0 };
@@ -269,7 +282,7 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
             let owned =
                 node.inputs.iter().chain(node.outs.iter()).filter(|b| b.bounce.is_null()).count() as u64;
             let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
-            profile::record(t0, t1, t2, t3, owned, bounced, bytes_in, bytes_out);
+            profile::record(t0, t1, tmid, t2, t3, owned, bounced, bytes_in, bytes_out);
         }
     }
     true
