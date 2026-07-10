@@ -14,13 +14,45 @@ mod session;
 mod ze;
 
 use alloc::vec::Vec;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::ffi::c_void;
+use core::ptr::NonNull;
 
 use crate::hal::{BufFlags, NpuHal};
 use crate::ops::{Op, Operand};
 use crate::vendor::{DeviceInfo, Vendor};
 
 pub use ze::Device as IvpuDevice;
+
+/// [`Allocator`] over NPU-MMU-mapped host memory (`zeMemAllocHost`), so NPU-resident buffers are
+/// first-class `Vec<u8, NpuHostAlloc>` instead of the raw-pointer + length bookkeeping the session
+/// does today (issue #1). The driver page-aligns (4096), satisfying any alignment we bind. Returns
+/// [`AllocError`] when the Level Zero runtime is absent (no NPU) or the request is over-aligned —
+/// a caller then falls back to [`crate::HostAlloc`]. ZST: free to pass by value.
+#[derive(Clone, Copy, Default)]
+pub(super) struct NpuHostAlloc;
+
+unsafe impl Allocator for NpuHostAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            let d = unsafe { NonNull::new_unchecked(layout.align() as *mut u8) };
+            return Ok(NonNull::slice_from_raw_parts(d, 0));
+        }
+        if layout.align() > 4096 {
+            return Err(AllocError);
+        }
+        let p = ze::alloc_host(layout.size()) as *mut u8;
+        NonNull::new(p)
+            .map(|p| NonNull::slice_from_raw_parts(p, layout.size()))
+            .ok_or(AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            ze::free_host(ptr.as_ptr() as *mut c_void);
+        }
+    }
+}
 
 /// The Intel NPU vendor: probe via Level Zero, lower/run ops via the JIT cache + graph submit.
 pub struct IvpuVendor;

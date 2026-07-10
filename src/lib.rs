@@ -19,9 +19,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use core::alloc::{GlobalAlloc, Layout};
+use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::ffi::{c_int, c_void};
 use core::panic::PanicInfo;
+use core::ptr::NonNull;
 
 /// Raw ggml C-ABI bindings, generated at build time by bindgen (see build.rs). `use_core`
 /// keeps them `no_std` (`::core::ffi` rather than `::std::os::raw`).
@@ -51,9 +52,13 @@ extern "C" {
     fn abort() -> !;
 }
 
-/// Global allocator forwarding to the host libc. `malloc` is `max_align_t`-aligned
-/// (16 on our targets); over-aligned requests go through `posix_memalign`.
-struct HostAlloc;
+/// The host libc allocator: `malloc`/`free` (`max_align_t`-aligned, 16 on our targets;
+/// over-aligned requests go through `posix_memalign`). Serves as **both** the global hook
+/// ([`GlobalAlloc`]) and a first-class allocator value ([`Allocator`]) so owning types can be
+/// constructed with an explicit allocator — `Vec::new_in(HostAlloc)` — rather than the implicit
+/// `Global` (issue #1). A zero-size ZST, so passing it by value is free.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostAlloc;
 
 unsafe impl GlobalAlloc for HostAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -71,6 +76,27 @@ unsafe impl GlobalAlloc for HostAlloc {
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         free(ptr as *mut c_void);
+    }
+}
+
+// The `Allocator` (not `GlobalAlloc`) view of the same libc heap, for explicit `*_in` construction.
+unsafe impl Allocator for HostAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            // A valid, aligned, non-null dangling pointer for a zero-size request (never read).
+            let d = unsafe { NonNull::new_unchecked(layout.align() as *mut u8) };
+            return Ok(NonNull::slice_from_raw_parts(d, 0));
+        }
+        let p = unsafe { <Self as GlobalAlloc>::alloc(self, layout) };
+        NonNull::new(p)
+            .map(|p| NonNull::slice_from_raw_parts(p, layout.size()))
+            .ok_or(AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            <Self as GlobalAlloc>::dealloc(self, ptr.as_ptr(), layout);
+        }
     }
 }
 

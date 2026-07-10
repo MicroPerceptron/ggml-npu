@@ -31,6 +31,7 @@ use super::cache::Cache;
 use super::profile;
 use super::ze;
 use super::ze::raw::*;
+use super::NpuHostAlloc;
 use crate::ops::Operand;
 
 /// One graph argument: its index in the blob and element count (FP32 device I/O).
@@ -50,12 +51,13 @@ struct Graph {
 unsafe impl Send for Graph {}
 unsafe impl Sync for Graph {}
 
-/// How one operand is fed. `bounce` null → the operand's own NPU pointer was bound directly
-/// (zero copy); otherwise `bounce` is a staging buffer through which `elems` f32 are copied each
-/// dispatch (the operand is in foreign, non-NPU memory).
-#[derive(Clone, Copy)]
+/// How one operand is fed. `bounce == None` → the operand's own NPU pointer was bound directly
+/// (zero copy). `Some(buf)` → a staging buffer, NPU-mapped via [`NpuHostAlloc`] and **owned** (freed
+/// with the [`NodeList`] rather than leaked as a raw pointer), through which `elems` f32 are copied
+/// each dispatch (the operand is in foreign, non-NPU memory). Its address is bound into the recorded
+/// execute list, so the allocation must outlive the list — which it does, being owned by it.
 struct Bind {
-    bounce: *mut c_void,
+    bounce: Option<Vec<u8, NpuHostAlloc>>,
     elems: usize,
 }
 
@@ -197,18 +199,19 @@ unsafe fn bind_arg(
         if pfn_set(handle, arg.index, op.ptr) != ZE_RESULT_SUCCESS {
             return None;
         }
-        Some(Bind { bounce: ptr::null_mut(), elems: 0 })
+        Some(Bind { bounce: None, elems: 0 })
     } else {
         let bytes = arg.elems * 4;
-        let bounce = ze::alloc_host(bytes);
-        if bounce.is_null() {
+        // NPU-mapped staging buffer, owned via `NpuHostAlloc` (no leaked raw pointer). `try_reserve`
+        // so a missing runtime / OOM returns None rather than aborting.
+        let mut buf = Vec::<u8, NpuHostAlloc>::new_in(NpuHostAlloc);
+        buf.try_reserve_exact(bytes).ok()?;
+        ptr::write_bytes(buf.as_mut_ptr(), 0, bytes);
+        buf.set_len(bytes);
+        if pfn_set(handle, arg.index, buf.as_ptr() as *const c_void) != ZE_RESULT_SUCCESS {
             return None;
         }
-        ptr::write_bytes(bounce as *mut u8, 0, bytes);
-        if pfn_set(handle, arg.index, bounce) != ZE_RESULT_SUCCESS {
-            return None;
-        }
-        Some(Bind { bounce, elems: min(op.elems, arg.elems) })
+        Some(Bind { bounce: Some(buf), elems: min(op.elems, arg.elems) })
     }
 }
 
@@ -272,7 +275,7 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
         let mut bytes_in = 0u64;
         for (bind, op) in node.inputs.iter().zip(inputs.iter()) {
             stage_in(bind, op);
-            if prof && !bind.bounce.is_null() {
+            if prof && bind.bounce.is_some() {
                 bytes_in += bind.elems as u64 * 4;
             }
         }
@@ -293,9 +296,9 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
         // Copy foreign outputs back (owned outputs were written in place — zero copy).
         let mut bytes_out = 0u64;
         for (bind, op) in node.outs.iter().zip(outs.iter()) {
-            if !bind.bounce.is_null() {
+            if let Some(buf) = &bind.bounce {
                 let nout = min(op.elems, bind.elems);
-                ptr::copy_nonoverlapping(bind.bounce as *const f32, op.ptr as *mut f32, nout);
+                ptr::copy_nonoverlapping(buf.as_ptr() as *const f32, op.ptr as *mut f32, nout);
                 if prof {
                     bytes_out += nout as u64 * 4;
                 }
@@ -304,7 +307,7 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
         if prof {
             let t3 = profile::now_ns();
             let owned =
-                node.inputs.iter().chain(node.outs.iter()).filter(|b| b.bounce.is_null()).count() as u64;
+                node.inputs.iter().chain(node.outs.iter()).filter(|b| b.bounce.is_none()).count() as u64;
             let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
             profile::record(t0, t1, tmid, t2, t3, owned, bounced, bytes_in, bytes_out);
         }
@@ -313,8 +316,10 @@ pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -
 }
 
 /// Copy a foreign input's current data into its bounce buffer. No-op for a directly-bound operand.
+/// The bounce is NPU-mapped memory whose address is bound into the graph; each dispatch overwrites
+/// its contents in place (mutated through the bound pointer, hence the `as *mut`).
 unsafe fn stage_in(bind: &Bind, op: &Operand) {
-    if !bind.bounce.is_null() {
-        ptr::copy_nonoverlapping(op.ptr as *const f32, bind.bounce as *mut f32, bind.elems);
+    if let Some(buf) = &bind.bounce {
+        ptr::copy_nonoverlapping(op.ptr as *const f32, buf.as_ptr() as *mut f32, bind.elems);
     }
 }
