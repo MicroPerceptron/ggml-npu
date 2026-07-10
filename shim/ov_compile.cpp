@@ -18,6 +18,7 @@
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
 #include <openvino/op/sigmoid.hpp>
+#include <openvino/op/subtract.hpp>
 #include <openvino/op/sqrt.hpp>
 
 #include <sys/stat.h>
@@ -101,13 +102,17 @@ static std::shared_ptr<ov::Node> reshape_to(const std::shared_ptr<ov::Node>& x,
     return std::make_shared<ov::op::v1::Reshape>(x, c, false);
 }
 
-// Build the dequantized f16 weight node `[N, K]` for a baked Constant: bits 16 → f16 Constant
-// (no dequant); bits 8/4 → int Constant + per-group f16 scales, dequant in-graph
-// (Convert → Reshape → Multiply). For int4 the weight arrives unpacked (one signed byte per nibble)
-// and Constant::create packs it. Returns nullptr on a bad request. Shared by the single-matmul and
-// the fused-subgraph compile paths.
+// Build the dequantized f16 weight node `[N, K]` for a baked Constant. bits 16 → f16 Constant (no
+// dequant). bits 8/4 → grouped low-bit Constant `[N, K/group, group]` + per-group f16 scale, dequant
+// in-graph. `zeros != nullptr` selects the **canonical asymmetric-unsigned** form the NPU compiler
+// keeps compressed (u4/u8 stays low-bit in device memory, dequant fused in-kernel):
+//   `(Convert(u4 weight) - Convert(u4 zero)) * f16 scale`.
+// `zeros == nullptr` is the symmetric signed form (i4/i8, no zero-point). The weight/zeros arrive
+// **unpacked** (one value per byte); `Constant::create` packs the sub-byte types. Returns nullptr on
+// a bad request. Shared by the single-matmul and fused-subgraph compile paths.
 static std::shared_ptr<ov::Node> make_weight(int32_t bits, int32_t group, int64_t N, int64_t K,
-                                             const uint8_t* weight, const uint8_t* scales) {
+                                             const uint8_t* weight, const uint8_t* scales,
+                                             const uint8_t* zeros) {
     namespace v0 = ov::op::v0;
     namespace v1 = ov::op::v1;
     if (bits == 16) {
@@ -118,21 +123,51 @@ static std::shared_ptr<ov::Node> make_weight(int32_t bits, int32_t group, int64_
         return nullptr;
     }
     const int64_t KG = K / group;
+    const bool asym = (zeros != nullptr);
+    const ov::Shape wshape{(size_t)N, (size_t)KG, (size_t)group};
+    const ov::Shape gshape{(size_t)N, (size_t)KG, 1};
+
+    if (std::getenv("GGML_NPU_DEBUG")) {
+        std::fprintf(stderr, "[mw] bits=%d group=%d N=%ld K=%ld asym=%d  w[0..7]=", bits, group, (long)N, (long)K, asym);
+        for (int i = 0; i < 8 && i < N * K; i++) std::fprintf(stderr, "%u ", weight[i]);
+        std::fprintf(stderr, " zp[0..3]=");
+        for (int i = 0; zeros && i < 4; i++) std::fprintf(stderr, "%u ", zeros[i]);
+        const uint16_t* sh = (const uint16_t*)scales;
+        std::fprintf(stderr, " sc[0..3]=");
+        for (int i = 0; i < 4; i++) std::fprintf(stderr, "%.4f ", (float)*(const ov::float16*)&sh[i]);
+        std::fprintf(stderr, "\n");
+    }
+
+    // Weight Constant (unsigned when asymmetric, signed otherwise). int4/int8 arrive unpacked.
     std::shared_ptr<ov::Node> bc;
     if (bits == 4) {
-        std::vector<int8_t> vals(reinterpret_cast<const int8_t*>(weight),
-                                 reinterpret_cast<const int8_t*>(weight) + (size_t)N * K);
-        bc = v0::Constant::create(ov::element::i4, ov::Shape{(size_t)N, (size_t)K}, vals);
+        if (asym) {
+            std::vector<uint8_t> v(weight, weight + (size_t)N * K);
+            bc = v0::Constant::create(ov::element::u4, wshape, v);
+        } else {
+            std::vector<int8_t> v(reinterpret_cast<const int8_t*>(weight),
+                                  reinterpret_cast<const int8_t*>(weight) + (size_t)N * K);
+            bc = v0::Constant::create(ov::element::i4, wshape, v);
+        }
     } else {
-        bc = std::make_shared<v0::Constant>(ov::element::i8, ov::Shape{(size_t)N, (size_t)K},
+        bc = std::make_shared<v0::Constant>(asym ? ov::element::u8 : ov::element::i8, wshape,
                                             (const void*)weight);
     }
-    auto sc = std::make_shared<v0::Constant>(ov::element::f16, ov::Shape{(size_t)N, (size_t)KG},
-                                             (const void*)scales);
-    auto bcf = std::make_shared<v0::Convert>(bc, ov::element::f16);
-    return reshape_to(std::make_shared<v1::Multiply>(reshape_to(bcf, {N, KG, group}),
-                                                     reshape_to(sc, {N, KG, 1})),
-                      {N, K});
+    std::shared_ptr<ov::Node> deq = std::make_shared<v0::Convert>(bc, ov::element::f16);
+
+    if (asym) {
+        std::shared_ptr<ov::Node> zc;
+        if (bits == 4) {
+            std::vector<uint8_t> z(zeros, zeros + (size_t)N * KG);
+            zc = v0::Constant::create(ov::element::u4, gshape, z);
+        } else {
+            zc = std::make_shared<v0::Constant>(ov::element::u8, gshape, (const void*)zeros);
+        }
+        auto zcf = std::make_shared<v0::Convert>(zc, ov::element::f16);
+        deq = std::make_shared<v1::Subtract>(deq, zcf);
+    }
+    auto sc = std::make_shared<v0::Constant>(ov::element::f16, gshape, (const void*)scales);
+    return reshape_to(std::make_shared<v1::Multiply>(deq, sc), {N, K});
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +193,8 @@ struct npu_sg_const {
     size_t weight_len;
     const uint8_t* scales;
     size_t scales_len;
+    const uint8_t* zeros;  // per-group zero-points (asymmetric); null/empty → symmetric
+    size_t zeros_len;
 };
 
 extern "C" {
@@ -223,7 +260,10 @@ int ggml_npu_ov_compile_matmul(int32_t M, int32_t K, int32_t N, uint8_t** blob, 
 int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bits, int32_t group,
                                      const uint8_t* weight, size_t weight_len,
                                      const uint8_t* scales, size_t scales_len,
+                                     const uint8_t* zeros, size_t zeros_len,
                                      const char* cache_key, uint8_t** blob, size_t* len) {
+    (void)weight_len;
+    (void)scales_len;
     if (!blob || !len || M <= 0 || K <= 0 || N <= 0 || !weight) {
         return -1;
     }
@@ -248,7 +288,7 @@ int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bi
         auto a = std::make_shared<v0::Parameter>(ov::element::f32, ov::Shape{(size_t)M, (size_t)K});
         auto a16 = std::make_shared<v0::Convert>(a, ov::element::f16);
 
-        auto w = make_weight(bits, group, N, K, weight, scales);
+        auto w = make_weight(bits, group, N, K, weight, scales, (zeros && zeros_len) ? zeros : nullptr);
         if (!w) {
             return -1;
         }
@@ -366,7 +406,8 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
                 case NPU_SG_MATMUL: {
                     if (!value(nd.a, a) || nd.const_idx < 0 || nd.const_idx >= n_consts) return -1;
                     const npu_sg_const& c = consts[(size_t)nd.const_idx];
-                    auto w = make_weight(c.bits, c.group, c.n, c.k, c.weight, c.scales);
+                    auto w = make_weight(c.bits, c.group, c.n, c.k, c.weight, c.scales,
+                                         (c.zeros && c.zeros_len) ? c.zeros : nullptr);
                     if (!w) return -1;
                     node_val[(size_t)j] =
                         std::make_shared<v0::MatMul>(a, w, /*transpose_a=*/false, /*transpose_b=*/true);

@@ -23,7 +23,12 @@ pub fn run(m: i64, k: i64, n: i64, inputs: &[Operand], output: &Operand) -> bool
         return false;
     };
     let Some(blob) = compile::get_or_compile_const(weight, m, k, n) else {
+        super::super::profile::note(&alloc::format!("[npu] matmul run FAIL: compile None (m={m} k={k} n={n})\n"));
         return false;
     };
-    session::run(blob, &[activation], &[output])
+    let ok = session::run(blob, &[activation], &[output]);
+    if !ok {
+        super::super::profile::note(&alloc::format!("[npu] matmul run FAIL: session::run false (m={m} k={k} n={n})\n"));
+    }
+    ok
 }

@@ -8,10 +8,12 @@
 //! Two caches, both lock-free:
 //! - **[`GRAPHS`]** — one Level Zero graph per distinct blob (keyed by the blob's leaked address).
 //!   `pfnCreate` re-parses the blob and `pfnAppendGraphInitialize` runs once per blob.
-//! - **[`LISTS`]** — one recorded execute command list per program *instance*, keyed by
-//!   `(output pointer, blob)`. The output tensor's address uniquely identifies the instance (each
-//!   node writes its own dst), and its input/output addresses are stable across tokens, so the
-//!   recorded list is replayed verbatim; a dispatch is just execute + sync.
+//! - **[`LISTS`]** — one recorded execute command list per program *instance*, keyed by a hash of
+//!   its **full binding set** (the blob plus every operand address). The list bakes those pointers
+//!   in at record time and is replayed verbatim, so the key must be the exact set it was recorded
+//!   with — keying on only the output address aliases distinct instances that ggml's gallocr landed
+//!   on a recycled address (a stale binding → NPU MMU fault). Addresses are stable across tokens, so
+//!   the common case is still a hit + verbatim replay; a shifted operand simply re-records.
 //!
 //! Bindings are the operands' own `tensor->data` pointers when those live in NPU memory (our
 //! buffer type) — bound **zero copy**. A foreign operand (a CPU-produced activation, or an output
@@ -69,7 +71,14 @@ unsafe impl Send for NodeList {}
 unsafe impl Sync for NodeList {}
 
 static GRAPHS: Cache<usize, Option<&'static Graph>> = Cache::new();
-static LISTS: Cache<(usize, usize), Option<&'static NodeList>> = Cache::new();
+static LISTS: Cache<u64, Option<&'static NodeList>> = Cache::new();
+
+/// FNV-1a fold of one 64-bit word (for the binding-set key below).
+fn mix(h: u64, v: u64) -> u64 {
+    let mut h = h ^ v;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h
+}
 
 fn graph(blob: &'static [u8]) -> Option<&'static Graph> {
     GRAPHS.get_or_insert_with(blob.as_ptr() as usize, || unsafe { build_graph(blob) })
@@ -155,10 +164,25 @@ fn node_list(
     if inputs.len() != g.inputs.len() || outs.len() != g.outs.len() || outs.is_empty() {
         return None;
     }
-    // (first output pointer, blob) uniquely identifies this instance: each subgraph writes its own
-    // dst tensors, and a given first output is always produced by the same nodes with the same inputs.
-    let key = (outs[0].ptr as usize, blob_addr);
-    LISTS.get_or_insert_with(key, || unsafe { build_node_list(g, inputs, outs) })
+    // Key by the FULL binding set (blob + every operand address), NOT just (first output, blob).
+    // The recorded execute list bakes each operand pointer in at record time and is replayed
+    // verbatim, so the key must identify the exact set of pointers it was recorded with. Keying on
+    // only the output aliases distinct instances: ggml's gallocr recycles one address across
+    // non-overlapping tensors, and weightless glue subgraphs (norm×weight, residual-add, silu) share
+    // ONE blob across every layer (no baked weight to distinguish them) — so two different instances
+    // can collide on (output_ptr, blob) and the second would replay the first's now-stale/foreign
+    // input bindings. The NPU then reads an unmapped address → MMU translation fault → device hang.
+    // Folding all operand pointers makes each distinct binding its own list, and self-heals if an
+    // operand's address shifts across tokens (new key → re-record against the live pointer).
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    h = mix(h, blob_addr as u64);
+    for op in inputs {
+        h = mix(h, op.ptr as u64);
+    }
+    for op in outs {
+        h = mix(h, op.ptr as u64);
+    }
+    LISTS.get_or_insert_with(h, || unsafe { build_node_list(g, inputs, outs) })
 }
 
 /// Bind one operand: its own NPU pointer directly when owned (zero copy), else a fresh bounce

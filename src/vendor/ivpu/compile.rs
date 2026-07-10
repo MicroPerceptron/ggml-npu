@@ -1,7 +1,7 @@
 //! Per-weight Constant-blob compilation + cache for the Intel NPU.
 //!
 //! The OpenVINO compile shim (`libggml_npu_ovc.so`) is `dlopen`'d on demand and, given a weight
-//! re-quantized to low-bit form ([`super::weights`]), bakes it as a compile-time `Constant` and
+//! re-quantized to low-bit form ([`crate::ops::requant`]), bakes it as a compile-time `Constant` and
 //! compiles a native NPU blob (the fused decompress-matmul). Blobs are cached two ways:
 //! - **in memory** by `(weight pointer, M)` — so a weight compiles at most once per process per M
 //!   (decode M=1 and any prefill M each get their own blob); reads are the lock-free [`super::cache`].
@@ -20,7 +20,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::cache::Cache;
-use super::weights::{self, Requant};
+use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
 use crate::ops::Operand;
 
@@ -32,13 +32,15 @@ extern "C" {
 const RTLD_NOW: c_int = 2;
 
 // int ggml_npu_ov_compile_matmul_const(M, K, N, bits, group, weight, weight_len,
-//                                      scales, scales_len, cache_key, &blob, &len)
+//                                      scales, scales_len, zeros, zeros_len, cache_key, &blob, &len)
 type CompileConst = unsafe extern "C" fn(
     i32,
     i32,
     i32,
     i32,
     i32,
+    *const u8,
+    usize,
     *const u8,
     usize,
     *const u8,
@@ -88,6 +90,8 @@ struct SgConstAbi {
     weight_len: usize,
     scales: *const u8,
     scales_len: usize,
+    zeros: *const u8,
+    zeros_len: usize,
 }
 
 struct Shim {
@@ -176,7 +180,7 @@ pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
         && k <= i32::MAX as i64
         && n <= i32::MAX as i64
         && shim().is_some()
-        && weights::can_requant(weight, k as usize)
+        && requant::can_requant(weight, k as usize)
 }
 
 /// Get the cached Constant blob for `weight` at shape `(M, K, N)`, re-quantizing + compiling (or
@@ -207,9 +211,42 @@ fn forced_bits() -> Option<i32> {
     }
 }
 
+/// Vendor policy: pick the re-quant width for `weight`. `GGML_NPU_BITS` overrides; else int4 for a
+/// ≤5-bpw quantized source (Q4_*), int8 for ≥5-bpw (Q6_K/Q8_0), f16 for an f32 source. The NPU keeps
+/// low-bit weights compressed (and fuses the dequant) only via the asymmetric-unsigned canonical
+/// form, which [`compile_const`]/[`compile_subgraph`] always request (`asymmetric = true`).
+fn choose_bits(weight: &Operand, force: Option<i32>) -> i32 {
+    if let Some(b) = force {
+        return b;
+    }
+    let traits = unsafe { crate::ffi::ggml_get_type_traits(weight.dtype) };
+    if traits.is_null() {
+        return 8;
+    }
+    let tr = unsafe { &*traits };
+    if !tr.is_quantized {
+        return 16;
+    }
+    let bpw = if tr.blck_size > 0 {
+        (tr.type_size as f32) * 8.0 / (tr.blck_size as f32)
+    } else {
+        8.0
+    };
+    if bpw <= 5.0 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Asymmetric (canonical, kept-compressed) unless `GGML_NPU_SYM` is set (a debug toggle).
+fn asymmetric() -> bool {
+    unsafe { getenv(c"GGML_NPU_SYM".as_ptr()).is_null() }
+}
+
 fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     let s = shim()?;
-    let rq = weights::requant(weight, k as usize, n as usize, forced_bits())?;
+    let rq = requant::requant(weight, k as usize, n as usize, choose_bits(weight, forced_bits()), asymmetric())?;
     let key = cache_key(&rq, m, k, n);
 
     let mut blob: *mut u8 = ptr::null_mut();
@@ -225,6 +262,8 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
             rq.weight.len(),
             rq.scales.as_ptr(),
             rq.scales.len(),
+            rq.zeros.as_ptr(),
+            rq.zeros.len(),
             key.as_ptr(),
             &mut blob,
             &mut len,
@@ -259,16 +298,22 @@ fn cache_key(rq: &Requant, m: i64, k: i64, n: i64) -> CString {
     }
     h = fnv1a(h, &rq.weight);
     h = fnv1a(h, &rq.scales);
+    h = fnv1a(h, &rq.zeros);
     let s = alloc::format!("{h:016x}-m{m}-k{k}-n{n}-b{}", rq.bits);
     CString::new(s).unwrap_or_else(|_| CString::new("badkey").unwrap())
 }
 
 // ---------------------------------------------------------------------------
 // Fused subgraph: re-quantize every baked weight, serialize the op-DAG to the flat ABI, and
-// compile it as one blob (disk-cached in the shim). Keyed in memory by `(output pointer, M)` — the
-// output tensor identifies this subgraph instance, and its addresses are stable across tokens.
+// compile it as one blob (disk-cached in the shim). Keyed in memory by a cheap **structural
+// signature** ([`sg_signature`]) — NOT the output pointer. ggml's graph allocator recycles buffers
+// across non-overlapping tensors, so one output address can belong to two structurally-different
+// subgraphs within a single graph; keying on it aliased them (a 2-input blob served to a 4-input
+// subgraph → arg-count mismatch → dispatch fail). The signature (M, input shapes, node DAG, const
+// weight pointers + shapes, output selection) identifies the compiled blob exactly, is stable
+// across tokens (so the blob is reused, not recompiled), and needs no re-quantization to compute.
 // ---------------------------------------------------------------------------
-static SG_CACHE: Cache<(usize, i64), Option<&'static [u8]>> = Cache::new();
+static SG_CACHE: Cache<u64, Option<&'static [u8]>> = Cache::new();
 
 pub(super) fn get_or_compile_subgraph(sg: &Subgraph) -> Option<&'static [u8]> {
     if sg.m <= 0 || sg.inputs.is_empty() || sg.nodes.is_empty() || sg.outputs.is_empty() || sg.outs.is_empty() {
@@ -277,20 +322,70 @@ pub(super) fn get_or_compile_subgraph(sg: &Subgraph) -> Option<&'static [u8]> {
     if sg.outputs.iter().any(|&o| o as usize >= sg.nodes.len()) {
         return None;
     }
-    SG_CACHE.get_or_insert_with((sg.outs[0].ptr as usize, sg.m), || {
+    SG_CACHE.get_or_insert_with(sg_signature(sg), || {
         compile_subgraph(sg).map(|v| &*Vec::leak(v))
     })
+}
+
+/// Cheap, allocation-free structural signature that uniquely identifies a subgraph's **compiled
+/// blob**: fold M, each input's element count, the node DAG (op + operand refs + baked-weight index
+/// + `out_n`), each baked constant's **weight pointer** (a stable model-leaf address = a fixed
+/// weight) and shape, and the output-node selection into a 64-bit FNV-1a. No weight bytes, no
+/// re-quant — just identity. Two subgraphs with the same signature compile to byte-identical blobs,
+/// so sharing one is correct; distinct structure/weights/shapes diverge. Used as the in-memory
+/// [`SG_CACHE`] key (the disk cache still keys on the full content hash via [`subgraph_cache_key`]).
+fn sg_signature(sg: &Subgraph) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    h = fnv1a(h, &sg.m.to_le_bytes());
+    h = fnv1a(h, &(sg.inputs.len() as u64).to_le_bytes());
+    for inp in &sg.inputs {
+        h = fnv1a(h, &(inp.elems as u64).to_le_bytes());
+    }
+    let enc = |r: Ref| -> u32 {
+        match r {
+            Ref::Input(i) => i,
+            Ref::Node(j) => 0x8000_0000 | j,
+        }
+    };
+    for nd in &sg.nodes {
+        let op: u8 = match nd.op {
+            SgOp::MatMul { n } => {
+                h = fnv1a(h, &n.to_le_bytes());
+                1
+            }
+            SgOp::Mul => 2,
+            SgOp::Silu => 3,
+            SgOp::Add => 4,
+            SgOp::RmsNorm { eps } => {
+                h = fnv1a(h, &eps.to_bits().to_le_bytes());
+                5
+            }
+        };
+        h = fnv1a(h, &[op]);
+        h = fnv1a(h, &enc(nd.a).to_le_bytes());
+        h = fnv1a(h, &nd.b.map(enc).unwrap_or(u32::MAX).to_le_bytes());
+        h = fnv1a(h, &nd.weight.map(|w| w as u32).unwrap_or(u32::MAX).to_le_bytes());
+    }
+    for c in &sg.consts {
+        h = fnv1a(h, &(c.weight.ptr as usize as u64).to_le_bytes());
+        h = fnv1a(h, &c.k.to_le_bytes());
+        h = fnv1a(h, &c.n.to_le_bytes());
+    }
+    for &o in &sg.outputs {
+        h = fnv1a(h, &(o as u64).to_le_bytes());
+    }
+    h
 }
 
 fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
     let s = shim()?;
     let compile = s.compile_subgraph?;
-    let bits = forced_bits();
+    let force = forced_bits();
 
     // Re-quantize every baked weight (bytes must outlive the shim call → held in `requants`).
     let mut requants: Vec<Requant> = Vec::with_capacity(sg.consts.len());
     for c in &sg.consts {
-        requants.push(weights::requant(&c.weight, c.k as usize, c.n as usize, bits)?);
+        requants.push(requant::requant(&c.weight, c.k as usize, c.n as usize, choose_bits(&c.weight, force), asymmetric())?);
     }
     let consts: Vec<SgConstAbi> = requants
         .iter()
@@ -304,6 +399,8 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
             weight_len: rq.weight.len(),
             scales: rq.scales.as_ptr(),
             scales_len: rq.scales.len(),
+            zeros: rq.zeros.as_ptr(),
+            zeros_len: rq.zeros.len(),
         })
         .collect();
 
@@ -391,6 +488,7 @@ fn subgraph_cache_key(
         h = fnv1a(h, &[rq.bits as u8, rq.group as u8]);
         h = fnv1a(h, &rq.weight);
         h = fnv1a(h, &rq.scales);
+        h = fnv1a(h, &rq.zeros);
     }
     let s = alloc::format!("sg-{h:016x}-m{}-n{}-o{}", sg.m, sg.nodes.len(), out_nodes.len());
     CString::new(s).unwrap_or_else(|_| CString::new("badkey").unwrap())

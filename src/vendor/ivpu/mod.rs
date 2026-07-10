@@ -11,7 +11,6 @@ mod graph;
 mod lower;
 mod profile;
 mod session;
-mod weights;
 mod ze;
 
 use alloc::vec::Vec;

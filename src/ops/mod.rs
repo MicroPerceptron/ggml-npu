@@ -4,6 +4,7 @@
 //! [`crate::vendor`].
 
 pub mod matmul;
+pub mod requant;
 pub mod subgraph;
 
 use core::ffi::c_void;
