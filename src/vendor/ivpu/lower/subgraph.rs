@@ -1,7 +1,8 @@
 //! Fused-subgraph lowering for the Intel NPU: compile the recognized op-DAG into one blob (weights
 //! baked as `Constant`s) and dispatch it as a single program — one graph, one recorded execute
-//! list, one submit + sync — instead of a dispatch per node. Compilation is cached per subgraph
-//! instance (see [`super::super::compile`]).
+//! list, one submit + sync — instead of a dispatch per node. The built graph is cached per subgraph
+//! signature in [`super::super::session`]; the [`super::super::compile`] blob it's built from is
+//! transient (dropped after the graph is built).
 
 use alloc::vec::Vec;
 
@@ -10,23 +11,16 @@ use crate::ops::subgraph::Subgraph;
 use crate::ops::Operand;
 
 pub fn run(sg: &Subgraph) -> bool {
-    let Some(blob) = compile::get_or_compile_subgraph(sg) else {
-        super::super::profile::note(&alloc::format!(
-            "[npu] subgraph run FAIL: compile None (m={} inputs={} consts={} nodes={} outs={})\n",
-            sg.m,
-            sg.inputs.len(),
-            sg.consts.len(),
-            sg.nodes.len(),
-            sg.outs.len(),
-        ));
-        return false;
-    };
+    // Key the program by its structural signature (stable across tokens; shared by weightless glue
+    // subgraphs across layers). On a cold miss the closure compiles → builds the graph → drops the
+    // transient blob; steady state is a pure graph-cache hit.
+    let sig = compile::sg_signature(sg);
     let inputs: Vec<&Operand> = sg.inputs.iter().collect();
     let outs: Vec<&Operand> = sg.outs.iter().collect();
-    let ok = session::run(blob, &inputs, &outs);
+    let ok = session::run_subgraph(sig, &inputs, &outs, || compile::compile_subgraph_blob(sg));
     if !ok {
         super::super::profile::note(&alloc::format!(
-            "[npu] subgraph run FAIL: session::run false (m={} inputs={} consts={} nodes={} outs={})\n",
+            "[npu] subgraph run FAIL (m={} inputs={} consts={} nodes={} outs={})\n",
             sg.m,
             sg.inputs.len(),
             sg.consts.len(),

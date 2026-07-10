@@ -6,14 +6,20 @@
 //! leaves the subgraph (usually one — e.g. an FFN `down` — but several for a fan-out like Q/K/V).
 //!
 //! Two caches, both lock-free:
-//! - **[`GRAPHS`]** — one Level Zero graph per distinct blob (keyed by the blob's leaked address).
-//!   `pfnCreate` re-parses the blob and `pfnAppendGraphInitialize` runs once per blob.
+//! - **[`CONST_GRAPHS`] / [`SG_GRAPHS`]** — one Level Zero graph per distinct *program*, keyed by
+//!   the same semantic identity that names the compiled artifact: `(weight ptr, M)` for a single
+//!   baked matmul, the structural [`sg_signature`](super::compile::sg_signature) for a fused
+//!   subgraph. The native blob is a **transient** compile artifact: [`build_graph`] parses it into
+//!   the driver-owned graph (`pfnCreate` then `pfnAppendGraphInitialize`, once), after which the
+//!   blob bytes are **freed** — only the graph is kept resident, so a program's weights are never
+//!   also held as a second, redundant copy of blob bytes in RAM.
 //! - **[`LISTS`]** — one recorded execute command list per program *instance*, keyed by a hash of
-//!   its **full binding set** (the blob plus every operand address). The list bakes those pointers
-//!   in at record time and is replayed verbatim, so the key must be the exact set it was recorded
-//!   with — keying on only the output address aliases distinct instances that ggml's gallocr landed
-//!   on a recycled address (a stale binding → NPU MMU fault). Addresses are stable across tokens, so
-//!   the common case is still a hit + verbatim replay; a shifted operand simply re-records.
+//!   its **full binding set** (the program's graph identity plus every operand address). The list
+//!   bakes those pointers in at record time and is replayed verbatim, so the key must be the exact
+//!   set it was recorded with — keying on only the output address aliases distinct instances that
+//!   ggml's gallocr landed on a recycled address (a stale binding → NPU MMU fault). Addresses are
+//!   stable across tokens, so the common case is still a hit + verbatim replay; a shifted operand
+//!   simply re-records.
 //!
 //! Bindings are the operands' own `tensor->data` pointers when those live in NPU memory (our
 //! buffer type) — bound **zero copy**. A foreign operand (a CPU-produced activation, or an output
@@ -72,7 +78,13 @@ struct NodeList {
 unsafe impl Send for NodeList {}
 unsafe impl Sync for NodeList {}
 
-static GRAPHS: Cache<usize, Option<&'static Graph>> = Cache::new();
+/// One built graph per distinct program, keyed by the artifact's semantic identity — so the
+/// transient compile blob is dropped after [`build_graph`] rather than kept resident. `(weight
+/// ptr, M)` for a single baked matmul; the structural signature for a fused subgraph. Model-leaf
+/// weight pointers are stable (never recycled by gallocr, unlike activation buffers), so these keys
+/// are safe from the address-reuse aliasing that [`LISTS`] guards against.
+static CONST_GRAPHS: Cache<(usize, i64), Option<&'static Graph>> = Cache::new();
+static SG_GRAPHS: Cache<u64, Option<&'static Graph>> = Cache::new();
 static LISTS: Cache<u64, Option<&'static NodeList>> = Cache::new();
 
 /// FNV-1a fold of one 64-bit word (for the binding-set key below).
@@ -82,8 +94,13 @@ fn mix(h: u64, v: u64) -> u64 {
     h
 }
 
-fn graph(blob: &'static [u8]) -> Option<&'static Graph> {
-    GRAPHS.get_or_insert_with(blob.as_ptr() as usize, || unsafe { build_graph(blob) })
+/// Build a program's graph on a cache miss: run the caller's `compile` to get a **transient** native
+/// blob, parse it into the driver-owned graph via [`build_graph`], and drop the blob (freed at the
+/// end of this call — only the graph is kept). `None` if compilation or graph creation failed
+/// (cached by the caller as `None`, not retried).
+fn build_from(compile: impl FnOnce() -> Option<Vec<u8>>) -> Option<&'static Graph> {
+    let blob = compile()?;
+    unsafe { build_graph(&blob) }
 }
 
 unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
@@ -159,25 +176,27 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
 
 fn node_list(
     g: &'static Graph,
-    blob_addr: usize,
+    program_addr: usize,
     inputs: &[&Operand],
     outs: &[&Operand],
 ) -> Option<&'static NodeList> {
     if inputs.len() != g.inputs.len() || outs.len() != g.outs.len() || outs.is_empty() {
         return None;
     }
-    // Key by the FULL binding set (blob + every operand address), NOT just (first output, blob).
-    // The recorded execute list bakes each operand pointer in at record time and is replayed
-    // verbatim, so the key must identify the exact set of pointers it was recorded with. Keying on
-    // only the output aliases distinct instances: ggml's gallocr recycles one address across
-    // non-overlapping tensors, and weightless glue subgraphs (norm×weight, residual-add, silu) share
-    // ONE blob across every layer (no baked weight to distinguish them) — so two different instances
-    // can collide on (output_ptr, blob) and the second would replay the first's now-stale/foreign
-    // input bindings. The NPU then reads an unmapped address → MMU translation fault → device hang.
-    // Folding all operand pointers makes each distinct binding its own list, and self-heals if an
-    // operand's address shifts across tokens (new key → re-record against the live pointer).
+    // Key by the FULL binding set (program identity + every operand address), NOT just (first
+    // output, program). The recorded execute list bakes each operand pointer in at record time and
+    // is replayed verbatim, so the key must identify the exact set of pointers it was recorded with.
+    // Keying on only the output aliases distinct instances: ggml's gallocr recycles one address
+    // across non-overlapping tensors, and weightless glue subgraphs (norm×weight, residual-add,
+    // silu) share ONE program/graph across every layer (no baked weight to distinguish them) — so
+    // two different instances can collide on (output_ptr, program) and the second would replay the
+    // first's now-stale/foreign input bindings. The NPU then reads an unmapped address → MMU
+    // translation fault → device hang. Folding all operand pointers makes each distinct binding its
+    // own list, and self-heals if an operand's address shifts across tokens (new key → re-record
+    // against the live pointer). The program address is the built graph's own (stable, leaked)
+    // address — the same discriminator role the transient blob's address used to play.
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    h = mix(h, blob_addr as u64);
+    h = mix(h, program_addr as u64);
     for op in inputs {
         h = mix(h, op.ptr as u64);
     }
@@ -246,16 +265,46 @@ unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], outs: &[&Operand]) -> 
     Some(Box::leak(Box::new(NodeList { exec, inputs: binds, outs: out_binds })))
 }
 
-/// Run the program baked into `blob` (a matmul or a fused subgraph): reuse (or build) its graph +
-/// this instance's recorded list, stage any foreign inputs, replay the list, wait, and copy back a
-/// foreign output. `inputs` must match the blob's input arg order; NPU-resident operands are bound
-/// directly (no copy), foreign ones staged through bounces.
-pub(super) fn run(blob: &'static [u8], inputs: &[&Operand], outs: &[&Operand]) -> bool {
-    let Some(g) = graph(blob) else {
-        profile::note("[npu] run FAIL: graph(blob) None\n");
+/// Run a single **baked-Constant matmul** program: reuse (or build) its graph — keyed by the weight
+/// identity + M, so its transient blob is freed after [`build_graph`] — then dispatch this instance.
+/// `compile` produces the native blob on a cold miss (see [`super::compile::compile_const_blob`]).
+pub(super) fn run_const(
+    weight_ptr: usize,
+    m: i64,
+    inputs: &[&Operand],
+    outs: &[&Operand],
+    compile: impl FnOnce() -> Option<Vec<u8>>,
+) -> bool {
+    let Some(g) = CONST_GRAPHS.get_or_insert_with((weight_ptr, m), || build_from(compile)) else {
+        profile::note("[npu] run FAIL: const graph build None\n");
         return false;
     };
-    let Some(node) = node_list(g, blob.as_ptr() as usize, inputs, outs) else {
+    dispatch(g, inputs, outs)
+}
+
+/// Run a **fused subgraph** program: reuse (or build) its graph — keyed by the structural
+/// [`sg_signature`](super::compile::sg_signature), so weightless glue subgraphs share one graph
+/// across layers and the transient blob is freed after build — then dispatch this instance.
+pub(super) fn run_subgraph(
+    sig: u64,
+    inputs: &[&Operand],
+    outs: &[&Operand],
+    compile: impl FnOnce() -> Option<Vec<u8>>,
+) -> bool {
+    let Some(g) = SG_GRAPHS.get_or_insert_with(sig, || build_from(compile)) else {
+        profile::note("[npu] run FAIL: subgraph graph build None\n");
+        return false;
+    };
+    dispatch(g, inputs, outs)
+}
+
+/// Dispatch one instance of an already-built program `g`: reuse (or record) this instance's execute
+/// list, stage any foreign inputs, replay the list, wait, and copy back a foreign output. `inputs`
+/// must match the program's input arg order; NPU-resident operands are bound directly (no copy),
+/// foreign ones staged through bounces. The `node_list` key uses the graph's own (stable, leaked)
+/// address as the per-program discriminator, replacing the transient blob's address.
+fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
+    let Some(node) = node_list(g, g as *const Graph as usize, inputs, outs) else {
         profile::note(&alloc::format!(
             "[npu] run FAIL: node_list None — inputs {} (g.inputs {}) outs {} (g.outs {})\n",
             inputs.len(),

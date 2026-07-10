@@ -1,12 +1,16 @@
-//! Per-weight Constant-blob compilation + cache for the Intel NPU.
+//! Constant-blob compilation for the Intel NPU: shape + weights → a native NPU program blob.
 //!
 //! The OpenVINO compile shim (`libggml_npu_ovc.so`) is `dlopen`'d on demand and, given a weight
 //! re-quantized to low-bit form ([`crate::ops::requant`]), bakes it as a compile-time `Constant` and
-//! compiles a native NPU blob (the fused decompress-matmul). Blobs are cached two ways:
-//! - **in memory** by `(weight pointer, M)` — so a weight compiles at most once per process per M
-//!   (decode M=1 and any prefill M each get their own blob); reads are the lock-free [`super::cache`].
+//! compiles a native NPU blob (the fused decompress-matmul). Each blob is a **transient** artifact:
+//! the caller ([`super::session`]) parses it into a driver-owned graph once and then drops it,
+//! caching *that graph* — so a program's weights are not also kept resident as blob bytes (the
+//! double-keep this avoids). Cold-compile cost is amortized two ways:
 //! - **on disk** by a content hash — managed inside the shim (C++) so this core stays `no_std` and
 //!   file-I/O-free; a warm process reloads a ~few-ms blob instead of recompiling (~100 ms).
+//! - **in memory** by the built graph (in [`super::session`], keyed by `(weight pointer, M)` for a
+//!   single matmul or the structural [`sg_signature`] for a subgraph) — so a program compiles at
+//!   most once per process and steady-state decode is a pure graph-cache hit.
 //!
 //! `no_std`: the shim, `dlopen`, and `getenv` resolve from the host. A compile failure is cached
 //! (as `None`) and not retried.
@@ -19,7 +23,6 @@ use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use super::cache::Cache;
 use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
 use crate::ops::Operand;
@@ -163,12 +166,8 @@ fn shim() -> Option<&'static Shim> {
     }
 }
 
-/// `None` = compiled and failed (cached, not retried); `Some` = the leaked native blob.
-/// Key = `(weight data pointer, M)`: a weight's blob is specific to it *and* the activation rows.
-static CACHE: Cache<(usize, i64), Option<&'static [u8]>> = Cache::new();
-
 /// Cheap feasibility check (no compile): is the shim present and the weight re-quantizable at this
-/// shape? A `true` means [`get_or_compile_const`] will (barring a rare OpenVINO failure) succeed, so
+/// shape? A `true` means [`compile_const_blob`] will (barring a rare OpenVINO failure) succeed, so
 /// `can_lower` can claim the matmul and its blob compiles **lazily in `run`** — avoiding a wasted
 /// standalone compile for a matmul that then fuses into an FFN subgraph (the common case). Same
 /// contract as the fused-subgraph path, which also compiles lazily at `graph_compute`.
@@ -183,15 +182,16 @@ pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
         && requant::can_requant(weight, k as usize)
 }
 
-/// Get the cached Constant blob for `weight` at shape `(M, K, N)`, re-quantizing + compiling (or
-/// disk-loading) on a miss. `None` if the shim/NPU is absent or the weight can't take this path.
-pub(super) fn get_or_compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<&'static [u8]> {
+/// Compile the Constant blob for `weight` at shape `(M, K, N)` — re-quantize + compile (or
+/// disk-load) — as a **transient** `Vec<u8>` the caller parses into a graph and then drops. `None`
+/// if the shim/NPU is absent or the weight can't take this path. Called once per `(weight, M)` on a
+/// [`session::run_const`](super::session::run_const) graph-cache miss; the built graph is what stays
+/// resident, so the blob is never itself cached (no double-keep of every program's weights).
+pub(super) fn compile_const_blob(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     if m <= 0 || k <= 0 || n <= 0 || m > i32::MAX as i64 || k > i32::MAX as i64 || n > i32::MAX as i64 {
         return None;
     }
-    CACHE.get_or_insert_with((weight.ptr as usize, m), || {
-        compile_const(weight, m, k, n).map(|v| &*Vec::leak(v))
-    })
+    compile_const(weight, m, k, n)
 }
 
 /// Optional weight-width override from `GGML_NPU_BITS` (`"4"`, `"8"`, or `"16"`); unset/other →
@@ -304,37 +304,40 @@ fn cache_key(rq: &Requant, m: i64, k: i64, n: i64) -> CString {
 }
 
 // ---------------------------------------------------------------------------
-// Fused subgraph: re-quantize every baked weight, serialize the op-DAG to the flat ABI, and
-// compile it as one blob (disk-cached in the shim). Keyed in memory by a cheap **structural
-// signature** ([`sg_signature`]) — NOT the output pointer. ggml's graph allocator recycles buffers
+// Fused subgraph: re-quantize every baked weight, serialize the op-DAG to the flat ABI, and compile
+// it as one transient blob (disk-cached in the shim). The built graph is cached in memory by the
+// cheap **structural signature** ([`sg_signature`]) — NOT the output pointer — inside
+// [`session::run_subgraph`](super::session::run_subgraph): ggml's graph allocator recycles buffers
 // across non-overlapping tensors, so one output address can belong to two structurally-different
-// subgraphs within a single graph; keying on it aliased them (a 2-input blob served to a 4-input
+// subgraphs within a single graph; keying on it aliased them (a 2-input program served to a 4-input
 // subgraph → arg-count mismatch → dispatch fail). The signature (M, input shapes, node DAG, const
-// weight pointers + shapes, output selection) identifies the compiled blob exactly, is stable
-// across tokens (so the blob is reused, not recompiled), and needs no re-quantization to compute.
+// weight pointers + shapes, output selection) identifies the compiled program exactly, is stable
+// across tokens (so the graph is reused, not recompiled), and needs no re-quantization to compute.
 // ---------------------------------------------------------------------------
-static SG_CACHE: Cache<u64, Option<&'static [u8]>> = Cache::new();
 
-pub(super) fn get_or_compile_subgraph(sg: &Subgraph) -> Option<&'static [u8]> {
+/// Compile a recognized subgraph into one **transient** native blob (weights baked as Constants),
+/// which the caller parses into a graph and then drops. `None` for a malformed subgraph or a
+/// shim/requant failure. Called once per distinct [`sg_signature`] on a
+/// [`session::run_subgraph`](super::session::run_subgraph) graph-cache miss.
+pub(super) fn compile_subgraph_blob(sg: &Subgraph) -> Option<Vec<u8>> {
     if sg.m <= 0 || sg.inputs.is_empty() || sg.nodes.is_empty() || sg.outputs.is_empty() || sg.outs.is_empty() {
         return None;
     }
     if sg.outputs.iter().any(|&o| o as usize >= sg.nodes.len()) {
         return None;
     }
-    SG_CACHE.get_or_insert_with(sg_signature(sg), || {
-        compile_subgraph(sg).map(|v| &*Vec::leak(v))
-    })
+    compile_subgraph(sg)
 }
 
 /// Cheap, allocation-free structural signature that uniquely identifies a subgraph's **compiled
-/// blob**: fold M, each input's element count, the node DAG (op + operand refs + baked-weight index
-/// + `out_n`), each baked constant's **weight pointer** (a stable model-leaf address = a fixed
+/// blob**: fold M, each input's element count, the node DAG (op, operand refs, baked-weight index,
+/// `out_n`), each baked constant's **weight pointer** (a stable model-leaf address = a fixed
 /// weight) and shape, and the output-node selection into a 64-bit FNV-1a. No weight bytes, no
 /// re-quant — just identity. Two subgraphs with the same signature compile to byte-identical blobs,
 /// so sharing one is correct; distinct structure/weights/shapes diverge. Used as the in-memory
-/// [`SG_CACHE`] key (the disk cache still keys on the full content hash via [`subgraph_cache_key`]).
-fn sg_signature(sg: &Subgraph) -> u64 {
+/// graph-cache key in [`session::run_subgraph`](super::session::run_subgraph) (the disk cache still
+/// keys on the full content hash via [`subgraph_cache_key`]).
+pub(super) fn sg_signature(sg: &Subgraph) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     h = fnv1a(h, &sg.m.to_le_bytes());
     h = fnv1a(h, &(sg.inputs.len() as u64).to_le_bytes());
