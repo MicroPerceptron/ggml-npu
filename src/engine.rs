@@ -15,7 +15,12 @@ pub unsafe fn supports(op: *const ggml_tensor) -> bool {
         return false;
     };
     if let Some(matched) = ops::match_node(op) {
-        return ops::can_lower(matched, op, v);
+        if ops::can_lower(matched, op, v) {
+            return true;
+        }
+    }
+    if v.can_lower_graph_node(op) {
+        return true;
     }
     // Claim FFN glue (silu/mul) next to claimable matmuls, so the scheduler places the whole FFN on
     // us as one split for `compute` to fuse. A glue op has no standalone artifact to compile here;
@@ -27,9 +32,15 @@ pub unsafe fn supports(op: *const ggml_tensor) -> bool {
 /// one fused program** (one submit, intra-graph fusion + pipelining); if it isn't a recognized
 /// subgraph, fall back to dispatching each recognized node on its own.
 pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
+    crate::trace::split(cgraph);
     let Some(v) = vendor::present() else {
         return true; // no NPU present; nothing was placed on us
     };
+    if let Some(graph) = crate::graph_ir::capture(cgraph) {
+        if v.can_lower_graph(&graph) {
+            return v.run_graph(&graph);
+        }
+    }
     if let Some(sg) = ops::subgraph::recognize(cgraph) {
         // A recognized subgraph spans ops the per-node path can't run on its own (e.g. silu/mul),
         // so it must run as one program or fail loudly — never fall through to a partial dispatch.
@@ -57,4 +68,8 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
         // else: a node not assigned to us for compute (e.g. a view); skip.
     }
     true
+}
+
+pub fn synchronize() -> bool {
+    vendor::present().is_none_or(|v| v.synchronize())
 }

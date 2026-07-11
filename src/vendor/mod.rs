@@ -22,6 +22,8 @@ use core::ffi::c_void;
 
 use crate::ops::subgraph::Subgraph;
 use crate::ops::{Op, Operand};
+use crate::graph_ir::GraphIr;
+use crate::ffi::ggml_tensor;
 
 /// A discovered NPU device — the agnostic view used for the ggml device description.
 pub struct DeviceInfo {
@@ -46,6 +48,27 @@ pub trait Vendor: Sync {
     /// Run a recognized fused subgraph as **one** compiled program (weights baked, single submit).
     /// `false` if this vendor can't lower it (caller then dispatches the split node by node).
     fn run_subgraph(&self, sg: &Subgraph) -> bool;
+
+    /// Whether this vendor can compile the complete captured scheduler split. The default keeps
+    /// existing per-op vendors working while Graph IR v2 lowerings are brought up incrementally.
+    fn can_lower_graph(&self, _graph: &GraphIr) -> bool {
+        false
+    }
+
+    /// Compile/cache and execute a complete Graph IR split. Called only after
+    /// [`Vendor::can_lower_graph`] succeeds.
+    fn run_graph(&self, _graph: &GraphIr) -> bool {
+        false
+    }
+
+    /// Cheap per-node scheduler probe used to form candidate Graph IR splits.
+    fn can_lower_graph_node(&self, _node: *const ggml_tensor) -> bool {
+        false
+    }
+
+    fn synchronize(&self) -> bool {
+        true
+    }
 
     /// Allocate `size` bytes of NPU-mapped host memory for the backend's buffer type — memory
     /// whose pointer can be bound as a graph argument with **no copy**. Null on failure (the

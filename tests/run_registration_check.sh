@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 gate: compile the self-contained loader harness and run it against the
+# Registration gate: compile the self-contained loader harness and run it against the
 # built cdylib. Mimics ggml's dynamic-backend loader without building llama.cpp.
 #
 # Usage: ./tests/run_registration_check.sh [path/to/libggml_npu.so]

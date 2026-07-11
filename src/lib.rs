@@ -1,8 +1,8 @@
-//! ggml-npu — a universal NPU backend for ggml. **Phase 0 skeleton, `no_std`.**
+//! ggml-npu — an experimental universal NPU backend for ggml, `no_std`.
 //!
-//! Registers as a dynamically-loaded ggml `ACCEL` backend, claims **no** operations
-//! (`supports_op == false`) so the scheduler runs the whole model on CPU, and stands up
-//! the vendor-agnostic [`hal::NpuHal`] seam. No NPU is touched.
+//! Registers as a dynamically-loaded ggml `ACCEL` backend. The active Intel implementation
+//! recognizes constant-weight matmuls and fused subgraphs, compiles them through OpenVINO, and
+//! submits native graphs through Level Zero. Unsupported work remains on other ggml backends.
 //!
 //! `no_std` by design: a ggml backend is always `dlopen`'d into a full libc host, so the
 //! allocator and `abort` resolve from the host at load time (`RTLD_NOW`). There is no
@@ -21,6 +21,7 @@ extern crate std;
 
 use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::ffi::{c_int, c_void};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 
@@ -38,8 +39,11 @@ pub(crate) mod ffi {
 
 mod backend;
 mod engine;
+mod graph_ir;
 mod hal;
 mod ops;
+mod policy;
+mod trace;
 mod vendor;
 
 // ---------------------------------------------------------------------------
@@ -49,6 +53,7 @@ extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
     fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> c_int;
+    #[cfg(not(test))]
     fn abort() -> !;
 }
 
@@ -103,6 +108,7 @@ unsafe impl Allocator for HostAlloc {
 #[global_allocator]
 static HOST_ALLOC: HostAlloc = HostAlloc;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn on_panic(_info: &PanicInfo) -> ! {
     // no_std: no unwinding. Abort rather than let a panic cross the C ABI.
@@ -115,9 +121,11 @@ fn on_panic(_info: &PanicInfo) -> ! {
 // panic aborts in `on_panic` first). A leaner alternative is `-Zbuild-std` with
 // `panic_immediate_abort`, but that would force an explicit `--target` on every build.
 #[no_mangle]
+#[cfg(not(test))]
 extern "C" fn rust_eh_personality() {}
 
 #[no_mangle]
+#[cfg(not(test))]
 extern "C" fn _Unwind_Resume() -> ! {
     unsafe { abort() }
 }

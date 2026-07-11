@@ -8,18 +8,29 @@
 // Build: shim/build.sh  ->  libggml_npu_ovc.so
 #include <openvino/openvino.hpp>
 #include <openvino/op/add.hpp>
+#include <openvino/op/broadcast.hpp>
+#include <openvino/op/clamp.hpp>
+#include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
 #include <openvino/op/divide.hpp>
+#include <openvino/op/group_conv.hpp>
+#include <openvino/op/gather.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/reduce_mean.hpp>
+#include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
 #include <openvino/op/sigmoid.hpp>
+#include <openvino/op/slice.hpp>
+#include <openvino/op/softmax.hpp>
 #include <openvino/op/subtract.hpp>
 #include <openvino/op/sqrt.hpp>
+#include <openvino/op/transpose.hpp>
+#include <openvino/op/topk.hpp>
+#include <openvino/op/unsqueeze.hpp>
 
 #include <sys/stat.h>
 
@@ -195,6 +206,40 @@ struct npu_sg_const {
     size_t scales_len;
     const uint8_t* zeros;  // per-group zero-points (asymmetric); null/empty → symmetric
     size_t zeros_len;
+};
+
+// Graph IR v2 wire ABI. Opcodes are backend-owned (not ggml enum values), allowing the Rust
+// capture layer and this independent Intel lowerer to evolve without including ggml headers.
+enum npu_ir_op {
+    NPU_IR_MATMUL = 1, NPU_IR_MUL = 2, NPU_IR_ADD = 3, NPU_IR_RMSNORM = 4,
+    NPU_IR_SILU = 5, NPU_IR_RESHAPE = 6, NPU_IR_VIEW = 7, NPU_IR_CONT = 8,
+    NPU_IR_TRANSPOSE = 9, NPU_IR_CONCAT = 10, NPU_IR_COPY = 11, NPU_IR_SSM_CONV = 12,
+    NPU_IR_SOFTMAX = 14, NPU_IR_GET_ROWS = 15, NPU_IR_ARGSORT = 16, NPU_IR_MATMUL_ID = 17,
+    NPU_IR_DIV = 18, NPU_IR_SCALE = 19, NPU_IR_CLAMP = 20,
+    NPU_IR_PERMUTE = 21, NPU_IR_SWIGLU = 23, NPU_IR_SIGMOID = 24, NPU_IR_SUM_ROWS = 25,
+};
+enum npu_ir_role { NPU_IR_INPUT = 0, NPU_IR_CONSTANT = 1, NPU_IR_STATE = 2,
+                   NPU_IR_INTERMEDIATE = 3, NPU_IR_OUTPUT = 4 };
+static constexpr int NPU_IR_MAX_INPUTS = 16;
+static constexpr int NPU_IR_PARAM_BYTES = 64;
+
+struct npu_ir_tensor {
+    int32_t role, dtype;
+    int64_t ne[4];
+    int32_t bits, group;
+    const uint8_t* weight;
+    size_t weight_len;
+    const uint8_t* scales;
+    size_t scales_len;
+    const uint8_t* zeros;
+    size_t zeros_len;
+};
+
+struct npu_ir_node {
+    int32_t op, n_inputs;
+    int32_t inputs[NPU_IR_MAX_INPUTS];
+    int32_t output;
+    uint8_t params[NPU_IR_PARAM_BYTES];
 };
 
 extern "C" {
@@ -476,6 +521,301 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
         }
         return 0;
     } catch (const std::exception&) {
+        return -3;
+    } catch (...) {
+        return -4;
+    }
+}
+
+// Compile one Graph IR v2 scheduler split. The initial lowerer intentionally covers the dense and
+// LFM ShortConv building blocks; unsupported opcodes fail capability probing in Rust and remain on
+// CPU/GPU. Runtime tensors are f32 graph arguments with an f16 interior. Constants arrive already
+// requantized and use the same fused low-bit decompression form as the mature matmul path.
+int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* tensors,
+                              int32_t n_nodes, const struct npu_ir_node* nodes,
+                              int32_t n_inputs, const uint32_t* input_ids,
+                              int32_t n_outputs, const uint32_t* output_ids,
+                              const char* cache_key, uint8_t** blob, size_t* len) {
+    if (!blob || !len || n_tensors <= 0 || !tensors || n_nodes <= 0 || !nodes ||
+        n_inputs <= 0 || !input_ids || n_outputs <= 0 || !output_ids) {
+        return -1;
+    }
+    *blob = nullptr;
+    *len = 0;
+
+    std::string path;
+    if (cache_key && *cache_key) {
+        std::string dir = cache_dir();
+        if (!dir.empty()) {
+            path = dir + "/" + cache_key + ".blob";
+            if (read_blob(path, blob, len)) return 0;
+        }
+    }
+
+    try {
+        namespace v0 = ov::op::v0;
+        namespace v1 = ov::op::v1;
+        auto ov_shape = [&](int32_t id) -> ov::Shape {
+            const auto& t = tensors[id];
+            return {(size_t)t.ne[3], (size_t)t.ne[2], (size_t)t.ne[1], (size_t)t.ne[0]};
+        };
+        auto shape_i64 = [&](int32_t id) -> std::vector<int64_t> {
+            const auto& t = tensors[id];
+            return {t.ne[3], t.ne[2], t.ne[1], t.ne[0]};
+        };
+        auto elements = [&](int32_t id) -> int64_t {
+            const auto& t = tensors[id];
+            return t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+        };
+
+        std::vector<ov::Output<ov::Node>> values((size_t)n_tensors);
+        ov::ParameterVector params;
+        params.reserve((size_t)n_inputs);
+        for (int i = 0; i < n_inputs; ++i) {
+            const int32_t id = (int32_t)input_ids[i];
+            if (id < 0 || id >= n_tensors || tensors[id].role == NPU_IR_CONSTANT) return -1;
+            const auto et = tensors[id].dtype == 1 ? ov::element::i32 :
+                            tensors[id].dtype == 2 ? ov::element::i64 : ov::element::f32;
+            auto p = std::make_shared<v0::Parameter>(et, ov_shape(id));
+            params.push_back(p);
+            values[(size_t)id] = et == ov::element::f32
+                ? ov::Output<ov::Node>(std::make_shared<v0::Convert>(p, ov::element::f16))
+                : ov::Output<ov::Node>(p);
+        }
+        for (int32_t id = 0; id < n_tensors; ++id) {
+            const auto& t = tensors[id];
+            if (t.role != NPU_IR_CONSTANT) continue;
+            if (!t.weight || t.ne[0] <= 0) return -1;
+            const int64_t K = t.ne[0];
+            const int64_t N = t.ne[1] * t.ne[2] * t.ne[3];
+            auto w = make_weight(t.bits, t.group, N, K, t.weight, t.scales,
+                                 (t.zeros && t.zeros_len) ? t.zeros : nullptr);
+            if (!w) return -1;
+            values[(size_t)id] = reshape_to(w, shape_i64(id));
+        }
+
+        auto get = [&](int32_t id, ov::Output<ov::Node>& out) -> bool {
+            if (id < 0 || id >= n_tensors || !values[(size_t)id].get_node()) return false;
+            out = values[(size_t)id];
+            return true;
+        };
+
+        for (int32_t j = 0; j < n_nodes; ++j) {
+            const auto& nd = nodes[j];
+            if (nd.output < 0 || nd.output >= n_tensors || nd.n_inputs < 1 ||
+                nd.n_inputs > NPU_IR_MAX_INPUTS) return -1;
+            ov::Output<ov::Node> a, b, result;
+            if (!get(nd.inputs[0], a)) return -1;
+            if (nd.n_inputs > 1 && !get(nd.inputs[1], b)) return -1;
+
+            switch (nd.op) {
+                case NPU_IR_MATMUL:
+                    if (nd.n_inputs != 2) return -1;
+                    result = std::make_shared<v0::MatMul>(b, a, false, true);
+                    break;
+                case NPU_IR_MUL:
+                    if (nd.n_inputs != 2) return -1;
+                    result = std::make_shared<v1::Multiply>(a, b);
+                    break;
+                case NPU_IR_ADD:
+                    if (nd.n_inputs != 2) return -1;
+                    result = std::make_shared<v1::Add>(a, b);
+                    break;
+                case NPU_IR_RMSNORM: {
+                    float eps = 0.0f;
+                    std::memcpy(&eps, nd.params, sizeof(eps));
+                    auto x2 = std::make_shared<v1::Multiply>(a, a);
+                    auto axis = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{3});
+                    auto mean = std::make_shared<v1::ReduceMean>(x2, axis, true);
+                    auto epsc = v0::Constant::create(ov::element::f16, {1},
+                                                     std::vector<ov::float16>{ov::float16(eps)});
+                    result = std::make_shared<v1::Divide>(
+                        a, std::make_shared<v0::Sqrt>(std::make_shared<v1::Add>(mean, epsc)));
+                    break;
+                }
+                case NPU_IR_SILU:
+                    result = std::make_shared<v1::Multiply>(a, std::make_shared<v0::Sigmoid>(a));
+                    break;
+                case NPU_IR_RESHAPE:
+                case NPU_IR_CONT:
+                case NPU_IR_COPY:
+                    result = reshape_to(a.get_node_shared_ptr(), shape_i64(nd.output));
+                    break;
+                case NPU_IR_VIEW: {
+                    uint64_t byte_offset = 0;
+                    std::memcpy(&byte_offset, nd.params, sizeof(byte_offset));
+                    const int64_t begin = (int64_t)(byte_offset / 4); // LFM activation/state views are f32.
+                    const int64_t end = begin + elements(nd.output);
+                    auto flat = reshape_to(a.get_node_shared_ptr(), {-1});
+                    auto starts = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{begin});
+                    auto stops = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{end});
+                    auto steps = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{1});
+                    auto axes = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{0});
+                    result = std::make_shared<ov::op::v8::Slice>(flat, starts, stops, steps, axes);
+                    break;
+                }
+                case NPU_IR_TRANSPOSE: {
+                    auto order = v0::Constant::create(ov::element::i64, {4},
+                                                      std::vector<int64_t>{0, 1, 3, 2});
+                    result = std::make_shared<v1::Transpose>(a, order);
+                    break;
+                }
+                case NPU_IR_PERMUTE: {
+                    int32_t axes[4] = {0, 1, 2, 3};
+                    std::memcpy(axes, nd.params, sizeof(axes));
+                    std::vector<int64_t> ov_axes(4);
+                    for (int i = 0; i < 4; ++i) {
+                        if (axes[3 - i] < 0 || axes[3 - i] > 3) return -1;
+                        ov_axes[(size_t)i] = 3 - axes[3 - i];
+                    }
+                    auto order = v0::Constant::create(ov::element::i64, {4}, ov_axes);
+                    result = std::make_shared<v1::Transpose>(a, order);
+                    break;
+                }
+                case NPU_IR_CONCAT: {
+                    if (nd.n_inputs != 2) return -1;
+                    int32_t ggml_axis = 0;
+                    std::memcpy(&ggml_axis, nd.params, sizeof(ggml_axis));
+                    if (ggml_axis < 0 || ggml_axis > 3) return -1;
+                    result = std::make_shared<v0::Concat>(ov::OutputVector{a, b}, 3 - ggml_axis);
+                    break;
+                }
+                case NPU_IR_SSM_CONV: {
+                    if (nd.n_inputs != 2) return -1;
+                    const auto& sx = tensors[nd.inputs[0]];
+                    const int64_t n_s = sx.ne[2], d_inner = sx.ne[1], ncs = sx.ne[0];
+                    const int64_t d_conv = tensors[nd.inputs[1]].ne[0];
+                    const int64_t n_t = ncs - d_conv + 1;
+                    if (n_s <= 0 || d_inner <= 0 || n_t <= 0) return -1;
+                    auto sx3 = reshape_to(a.get_node_shared_ptr(), {n_s, d_inner, ncs});
+                    auto kernel = reshape_to(b.get_node_shared_ptr(), {d_inner, 1, 1, d_conv});
+                    auto conv = std::make_shared<v1::GroupConvolution>(
+                        sx3, kernel, ov::Strides{1}, ov::CoordinateDiff{0}, ov::CoordinateDiff{0}, ov::Strides{1});
+                    auto order = v0::Constant::create(ov::element::i64, {3},
+                                                      std::vector<int64_t>{0, 2, 1});
+                    result = std::make_shared<v1::Transpose>(conv, order);
+                    break;
+                }
+                case NPU_IR_GET_ROWS: {
+                    if (nd.n_inputs != 2) return -1;
+                    if (b.get_element_type() != ov::element::i32 && b.get_element_type() != ov::element::i64) {
+                        b = std::make_shared<v0::Convert>(b, ov::element::i32);
+                    }
+                    auto axis = v0::Constant::create(ov::element::i32, {}, std::vector<int32_t>{2});
+                    result = std::make_shared<ov::op::v8::Gather>(a, b, axis);
+                    break;
+                }
+                case NPU_IR_SCALE: {
+                    float scale = 0.0f;
+                    std::memcpy(&scale, nd.params, sizeof(scale));
+                    auto c = v0::Constant::create(ov::element::f16, {},
+                                                  std::vector<ov::float16>{ov::float16(scale)});
+                    result = std::make_shared<v1::Multiply>(a, c);
+                    break;
+                }
+                case NPU_IR_DIV:
+                    if (nd.n_inputs != 2) return -1;
+                    result = std::make_shared<v1::Divide>(a, b);
+                    break;
+                case NPU_IR_CLAMP: {
+                    float lo = 0.0f, hi = 0.0f;
+                    std::memcpy(&lo, nd.params, sizeof(lo));
+                    std::memcpy(&hi, nd.params + sizeof(lo), sizeof(hi));
+                    result = std::make_shared<v0::Clamp>(a, lo, hi);
+                    break;
+                }
+                case NPU_IR_SIGMOID:
+                    result = std::make_shared<v0::Sigmoid>(a);
+                    break;
+                case NPU_IR_SOFTMAX: {
+                    float scale = 1.0f;
+                    std::memcpy(&scale, nd.params, sizeof(scale));
+                    ov::Output<ov::Node> logits = a;
+                    if (scale != 1.0f) {
+                        auto c = v0::Constant::create(
+                            ov::element::f16, {}, std::vector<ov::float16>{ov::float16(scale)});
+                        logits = std::make_shared<v1::Multiply>(logits, c);
+                    }
+                    if (nd.n_inputs > 1) {
+                        logits = std::make_shared<v1::Add>(logits, b);
+                    }
+                    result = std::make_shared<ov::op::v8::Softmax>(logits, 3);
+                    break;
+                }
+                case NPU_IR_SUM_ROWS: {
+                    auto axis = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{3});
+                    result = std::make_shared<v1::ReduceSum>(a, axis, true);
+                    break;
+                }
+                case NPU_IR_ARGSORT: {
+                    const int64_t k_value = tensors[nd.output].ne[0];
+                    auto k = v0::Constant::create(ov::element::i64, {}, std::vector<int64_t>{k_value});
+                    auto topk = std::make_shared<ov::op::v3::TopK>(
+                        a, k, 3, ov::op::v3::TopK::Mode::MAX, ov::op::v3::TopK::SortType::SORT_VALUES,
+                        ov::element::i32);
+                    result = topk->output(1);
+                    break;
+                }
+                case NPU_IR_MATMUL_ID: {
+                    if (nd.n_inputs != 3) return -1;
+                    ov::Output<ov::Node> ids;
+                    if (!get(nd.inputs[2], ids)) return -1;
+                    if (ids.get_element_type() != ov::element::i32 && ids.get_element_type() != ov::element::i64) {
+                        ids = std::make_shared<v0::Convert>(ids, ov::element::i32);
+                    }
+                    const auto& wt = tensors[nd.inputs[0]];
+                    const auto& it = tensors[nd.inputs[2]];
+                    const int64_t K = wt.ne[0], N = wt.ne[1], E = wt.ne[2];
+                    const int64_t U = it.ne[0], T = it.ne[1];
+                    if (K <= 0 || N <= 0 || E <= 0 || U <= 0 || T <= 0) return -1;
+                    auto weights3 = reshape_to(a.get_node_shared_ptr(), {E, N, K});
+                    auto ids2 = reshape_to(ids.get_node_shared_ptr(), {T, U});
+                    auto axis = v0::Constant::create(ov::element::i32, {}, std::vector<int32_t>{0});
+                    auto selected = std::make_shared<ov::op::v8::Gather>(weights3, ids2, axis);
+                    auto acts3 = reshape_to(b.get_node_shared_ptr(), {T, tensors[nd.inputs[1]].ne[1], K});
+                    if (tensors[nd.inputs[1]].ne[1] == 1 && U > 1) {
+                        auto shape = v0::Constant::create(ov::element::i64, {3},
+                                                          std::vector<int64_t>{T, U, K});
+                        acts3 = std::make_shared<ov::op::v3::Broadcast>(acts3, shape);
+                    }
+                    auto axis2 = v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{2});
+                    auto acts4 = std::make_shared<v0::Unsqueeze>(acts3, axis2);
+                    result = std::make_shared<v0::MatMul>(acts4, selected, false, true);
+                    break;
+                }
+                case NPU_IR_SWIGLU:
+                    if (nd.n_inputs != 2) return -1;
+                    result = std::make_shared<v1::Multiply>(
+                        std::make_shared<v1::Multiply>(a, std::make_shared<v0::Sigmoid>(a)), b);
+                    break;
+                default:
+                    return -1;
+            }
+            values[(size_t)nd.output] = reshape_to(result.get_node_shared_ptr(), shape_i64(nd.output));
+        }
+
+        ov::ResultVector results;
+        results.reserve((size_t)n_outputs);
+        for (int i = 0; i < n_outputs; ++i) {
+            const int32_t id = (int32_t)output_ids[i];
+            if (id < 0 || id >= n_tensors || !values[(size_t)id].get_node()) return -1;
+            auto out = std::make_shared<v0::Convert>(values[(size_t)id], ov::element::f32);
+            results.push_back(std::make_shared<v0::Result>(out));
+        }
+        auto model = std::make_shared<ov::Model>(results, params);
+        auto compiled = core().compile_model(model, "NPU");
+        std::ostringstream os(std::ios::binary);
+        compiled.export_model(os);
+        const std::string native = os.str();
+        uint8_t* buf = static_cast<uint8_t*>(std::malloc(native.size()));
+        if (!buf) return -2;
+        std::memcpy(buf, native.data(), native.size());
+        *blob = buf;
+        *len = native.size();
+        if (!path.empty()) write_blob(path, native.data(), native.size());
+        return 0;
+    } catch (const std::exception& e) {
+        if (std::getenv("GGML_NPU_DEBUG")) std::fprintf(stderr, "[ir2] %s\n", e.what());
         return -3;
     } catch (...) {
         return -4;

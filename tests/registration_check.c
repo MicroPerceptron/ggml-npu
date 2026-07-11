@@ -1,8 +1,8 @@
-/* registration_check.c — Phase 0 verification for the ggml-npu backend.
+/* registration_check.c — dynamic registration smoke test for the ggml-npu backend.
  *
  * Mimics ggml's dynamic-backend loader (dlopen + ggml_backend_init + api_version
  * check) WITHOUT building all of llama.cpp, then walks the four vtables to confirm
- * the backend registers as an ACCEL device and claims no ops (supports_op == false).
+ * the backend registers as an ACCEL device and safely rejects a null operation probe.
  *
  * Build (needs the llama.cpp headers; -rdynamic so our stub ggml symbol is visible
  * to the dlopened .so under RTLD_NOW, exactly as a real host exports ggml's symbols):
@@ -34,6 +34,11 @@ int ggml_graph_n_nodes(struct ggml_cgraph * g) { (void) g; return 0; }
 struct ggml_tensor * ggml_graph_node(struct ggml_cgraph * g, int i) { (void) g; (void) i; return NULL; }
 bool ggml_is_contiguous(const struct ggml_tensor * t) { (void) t; return true; }
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t b) { (void) b; return false; }
+/* Only needed to satisfy RTLD_NOW. The null-op smoke test never dereferences this result. */
+const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
+    (void) type;
+    return NULL;
+}
 
 typedef ggml_backend_reg_t (*init_fn)(void);
 typedef int (*score_fn)(void);
@@ -70,7 +75,7 @@ int main(int argc, char ** argv) {
         passed = passed && c_;                                      \
     } while (0)
 
-    printf("ggml-npu Phase 0 registration check: %s\n\n", path);
+    printf("ggml-npu registration smoke test: %s\n\n", path);
 
     printf("api_version   = %d\n", reg->api_version);
     printf("registry name = %s\n", reg->iface.get_name(reg));
@@ -102,6 +107,6 @@ int main(int argc, char ** argv) {
         CHECK(buft->iface.get_alignment(buft) >= 1, "buffer type reports sane alignment");
     }
 
-    printf("\n%s\n", passed ? "PHASE 0 PASS" : "PHASE 0 FAIL");
+    printf("\n%s\n", passed ? "REGISTRATION PASS" : "REGISTRATION FAIL");
     return passed ? 0 : 1;
 }

@@ -1,0 +1,6 @@
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| lfm2moe 8B.A1B Q4_K - Medium   |   4.79 GiB |     8.47 B | Vulkan,NPU |  23 |             pp8 |        105.02 ± 6.88 |
+| lfm2moe 8B.A1B Q4_K - Medium   |   4.79 GiB |     8.47 B | Vulkan,NPU |  23 |            tg32 |         33.60 ± 3.60 |
+
+build: f36e5c348 (9891)

@@ -1,0 +1,12 @@
+family,representative_architecture,graph_pattern,policy,status
+LFM,LFM2 dense,ShortConv recurrent block,NPU candidate,implemented-unvalidated
+LFM,LFM2.5-8B-A1B,sparse top-4 MoE,opt-in spike,implemented-unvalidated
+LFM,LFM2.5-8B-A1B,GQA attention,NPU QKV plus GPU attention,partial
+Llama,Llama 3,dense SwiGLU block,NPU candidate,implemented
+Llama,Llama 3,GQA attention,GPU default,QKV-only
+Qwen,Qwen2/3,dense SwiGLU block,NPU candidate,implemented
+Qwen,Qwen2/3 MoE,indexed expert block,opt-in spike,implemented-unvalidated
+Mistral,Mistral/Mixtral,dense or indexed expert block,measured placement,partial
+Gemma,Gemma 2/3,gated dense block,NPU candidate,partial
+Phi,Phi 3/4,dense block,NPU candidate,partial
+Hybrid,Mamba/Jamba,state-space convolution,corpus fallback,partial

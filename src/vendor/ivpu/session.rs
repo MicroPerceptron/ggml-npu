@@ -32,6 +32,7 @@ use core::cmp::min;
 use core::ffi::c_void;
 use core::mem;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::Cache;
 use super::profile;
@@ -83,15 +84,44 @@ unsafe impl Sync for NodeList {}
 /// ptr, M)` for a single baked matmul; the structural signature for a fused subgraph. Model-leaf
 /// weight pointers are stable (never recycled by gallocr, unlike activation buffers), so these keys
 /// are safe from the address-reuse aliasing that [`LISTS`] guards against.
-static CONST_GRAPHS: Cache<(usize, i64), Option<&'static Graph>> = Cache::new();
-static SG_GRAPHS: Cache<u64, Option<&'static Graph>> = Cache::new();
-static LISTS: Cache<u64, Option<&'static NodeList>> = Cache::new();
+static CONST_GRAPHS: Cache<(u64, usize, i64), Option<&'static Graph>> = Cache::new(256);
+static SG_GRAPHS: Cache<(u64, u64), Option<&'static Graph>> = Cache::new(256);
 
-/// FNV-1a fold of one 64-bit word (for the binding-set key below).
-fn mix(h: u64, v: u64) -> u64 {
-    let mut h = h ^ v;
-    h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    h
+const MAX_INPUT_BINDINGS: usize = 64;
+const MAX_OUTPUT_BINDINGS: usize = 8;
+
+/// Exact recorded-command-list identity. A hash alone is unsafe here: a collision can replay a
+/// command list containing unrelated pointers and fault the NPU MMU. Fixed arrays keep the key
+/// `Copy` for the lock-free cache while covering the graph recognizer's explicit limits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BindingKey {
+    program: usize,
+    generation: u64,
+    n_inputs: u8,
+    n_outputs: u8,
+    inputs: [usize; MAX_INPUT_BINDINGS],
+    outputs: [usize; MAX_OUTPUT_BINDINGS],
+}
+
+static LISTS: Cache<BindingKey, Option<&'static NodeList>> = Cache::new(2048);
+static PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
+}
+
+pub(super) fn async_enabled() -> bool {
+    !unsafe { getenv(c"GGML_NPU_ASYNC".as_ptr()) }.is_null()
+}
+
+pub(super) fn synchronize() -> bool {
+    if !PENDING.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
+        return false;
+    };
+    unsafe { (l.cmd_queue_sync)(rt.queue, u64::MAX) == ZE_RESULT_SUCCESS }
 }
 
 /// Build a program's graph on a cache miss: run the caller's `compile` to get a **transient** native
@@ -111,6 +141,7 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
     let pfn_props = (*g).pfnGetProperties?;
     let pfn_arg = (*g).pfnGetArgumentProperties?;
     let pfn_init = (*g).pfnAppendGraphInitialize?;
+    let pfn_destroy = (*g).pfnDestroy;
 
     let mut gd: ze_graph_desc_t = mem::zeroed();
     gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC;
@@ -125,6 +156,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
     let mut gp: ze_graph_properties_t = mem::zeroed();
     gp.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES;
     if pfn_props(handle, &mut gp) != ZE_RESULT_SUCCESS {
+        if let Some(destroy) = pfn_destroy {
+            destroy(handle);
+        }
         return None;
     }
 
@@ -135,6 +169,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         let mut ap: ze_graph_argument_properties_t = mem::zeroed();
         ap.stype = ZE_STRUCTURE_TYPE_GRAPH_ARGUMENT_PROPERTIES;
         if pfn_arg(handle, i, &mut ap) != ZE_RESULT_SUCCESS {
+            if let Some(destroy) = pfn_destroy {
+                destroy(handle);
+            }
             return None;
         }
         let mut elems = 1usize;
@@ -151,6 +188,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         }
     }
     if inputs.is_empty() || outs.is_empty() {
+        if let Some(destroy) = pfn_destroy {
+            destroy(handle);
+        }
         return None;
     }
 
@@ -160,6 +200,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
     ld.commandQueueGroupOrdinal = 0;
     let mut init_list: ze_command_list_handle_t = ptr::null_mut();
     if (l.cmd_list_create)(rt.context, rt.device, &ld, &mut init_list) != ZE_RESULT_SUCCESS {
+        if let Some(destroy) = pfn_destroy {
+            destroy(handle);
+        }
         return None;
     }
     let ok = pfn_init(init_list, handle, ptr::null_mut(), 0, ptr::null_mut()) == ZE_RESULT_SUCCESS
@@ -168,6 +211,9 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         && (l.cmd_queue_sync)(rt.queue, u64::MAX) == ZE_RESULT_SUCCESS;
     (l.cmd_list_destroy)(init_list);
     if !ok {
+        if let Some(destroy) = pfn_destroy {
+            destroy(handle);
+        }
         return None;
     }
 
@@ -183,6 +229,9 @@ fn node_list(
     if inputs.len() != g.inputs.len() || outs.len() != g.outs.len() || outs.is_empty() {
         return None;
     }
+    if inputs.len() > MAX_INPUT_BINDINGS || outs.len() > MAX_OUTPUT_BINDINGS {
+        return None;
+    }
     // Key by the FULL binding set (program identity + every operand address), NOT just (first
     // output, program). The recorded execute list bakes each operand pointer in at record time and
     // is replayed verbatim, so the key must identify the exact set of pointers it was recorded with.
@@ -195,15 +244,21 @@ fn node_list(
     // own list, and self-heals if an operand's address shifts across tokens (new key → re-record
     // against the live pointer). The program address is the built graph's own (stable, leaked)
     // address — the same discriminator role the transient blob's address used to play.
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    h = mix(h, program_addr as u64);
-    for op in inputs {
-        h = mix(h, op.ptr as u64);
+    let mut key = BindingKey {
+        program: program_addr,
+        generation: crate::backend::buffer_generation(),
+        n_inputs: inputs.len() as u8,
+        n_outputs: outs.len() as u8,
+        inputs: [0; MAX_INPUT_BINDINGS],
+        outputs: [0; MAX_OUTPUT_BINDINGS],
+    };
+    for (dst, op) in key.inputs.iter_mut().zip(inputs) {
+        *dst = op.ptr as usize;
     }
-    for op in outs {
-        h = mix(h, op.ptr as u64);
+    for (dst, op) in key.outputs.iter_mut().zip(outs) {
+        *dst = op.ptr as usize;
     }
-    LISTS.get_or_insert_with(h, || unsafe { build_node_list(g, inputs, outs) })
+    LISTS.try_get_or_insert_with(key, || unsafe { build_node_list(g, inputs, outs) })?
 }
 
 /// Bind one operand: its own NPU pointer directly when owned (zero copy), else a fresh bounce
@@ -260,6 +315,7 @@ unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], outs: &[&Operand]) -> 
     if pfn_exec(exec, g.handle, ptr::null_mut(), ptr::null_mut(), 0, ptr::null_mut()) != ZE_RESULT_SUCCESS
         || (l.cmd_list_close)(exec) != ZE_RESULT_SUCCESS
     {
+        (l.cmd_list_destroy)(exec);
         return None;
     }
     Some(Box::leak(Box::new(NodeList { exec, inputs: binds, outs: out_binds })))
@@ -275,7 +331,8 @@ pub(super) fn run_const(
     outs: &[&Operand],
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
-    let Some(g) = CONST_GRAPHS.get_or_insert_with((weight_ptr, m), || build_from(compile)) else {
+    let key = (crate::backend::buffer_generation(), weight_ptr, m);
+    let Some(g) = CONST_GRAPHS.try_get_or_insert_with(key, || build_from(compile)).flatten() else {
         profile::note("[npu] run FAIL: const graph build None\n");
         return false;
     };
@@ -291,7 +348,8 @@ pub(super) fn run_subgraph(
     outs: &[&Operand],
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
-    let Some(g) = SG_GRAPHS.get_or_insert_with(sig, || build_from(compile)) else {
+    let key = (crate::backend::buffer_generation(), sig);
+    let Some(g) = SG_GRAPHS.try_get_or_insert_with(key, || build_from(compile)).flatten() else {
         profile::note("[npu] run FAIL: subgraph graph build None\n");
         return false;
     };
@@ -319,6 +377,12 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
     };
     let prof = profile::enabled();
     unsafe {
+        let has_bounce = node.inputs.iter().chain(node.outs.iter()).any(|b| b.bounce.is_some());
+        // A host-visible staging buffer cannot be overwritten/read while an earlier submission is
+        // in flight. Direct NPU-owned bindings can remain queued in order without this barrier.
+        if has_bounce && !synchronize() {
+            return false;
+        }
         let t0 = if prof { profile::now_ns() } else { 0 };
         // Stage foreign inputs (owned inputs are already bound to their own memory).
         let mut bytes_in = 0u64;
@@ -337,6 +401,13 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
             return false;
         }
         let tmid = if prof { profile::now_ns() } else { 0 };
+        if async_enabled() && !has_bounce {
+            PENDING.store(true, Ordering::Release);
+            if prof {
+                profile::note("[npu] async queued (device/copy timing deferred to synchronize)\n");
+            }
+            return true;
+        }
         if (l.cmd_queue_sync)(rt.queue, u64::MAX) != ZE_RESULT_SUCCESS {
             profile::note("[npu] run FAIL: cmd_queue_sync\n");
             return false;

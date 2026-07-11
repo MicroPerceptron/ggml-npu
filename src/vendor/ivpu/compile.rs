@@ -17,12 +17,14 @@
 
 use alloc::boxed::Box;
 use alloc::ffi::CString;
+use alloc::vec;
 use alloc::vec::Vec;
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_void, CStr};
 use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::graph_ir::{Dim, GraphIr, TensorRole, OP_PARAM_BYTES};
 use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
 use crate::ops::Operand;
@@ -70,6 +72,19 @@ type CompileSubgraph = unsafe extern "C" fn(
     *mut *mut u8,
     *mut usize,
 ) -> c_int;
+type CompileGraph = unsafe extern "C" fn(
+    i32,
+    *const IrTensorAbi,
+    i32,
+    *const IrNodeAbi,
+    i32,
+    *const u32,
+    i32,
+    *const u32,
+    *const c_char,
+    *mut *mut u8,
+    *mut usize,
+) -> c_int;
 
 /// Flat op-DAG node matching the C `npu_sg_node`. `a`/`b` are value refs (`< n_inputs` = input,
 /// else node `ref - n_inputs`; `-1` = unused); `const_idx` = baked weight or `-1`.
@@ -97,9 +112,36 @@ struct SgConstAbi {
     zeros_len: usize,
 }
 
+const IR_MAX_INPUTS: usize = 16;
+
+#[repr(C)]
+struct IrTensorAbi {
+    role: i32,
+    dtype: i32,
+    ne: [i64; 4],
+    bits: i32,
+    group: i32,
+    weight: *const u8,
+    weight_len: usize,
+    scales: *const u8,
+    scales_len: usize,
+    zeros: *const u8,
+    zeros_len: usize,
+}
+
+#[repr(C)]
+struct IrNodeAbi {
+    op: i32,
+    n_inputs: i32,
+    inputs: [i32; IR_MAX_INPUTS],
+    output: i32,
+    params: [u8; OP_PARAM_BYTES],
+}
+
 struct Shim {
     compile_const: CompileConst,
     compile_subgraph: Option<CompileSubgraph>,
+    compile_graph: Option<CompileGraph>,
     free: FreeBlob,
 }
 
@@ -129,9 +171,16 @@ unsafe fn load_shim() -> Option<Shim> {
     } else {
         Some(mem::transmute::<*mut c_void, CompileSubgraph>(sg))
     };
+    let ir = dlsym(h, c"ggml_npu_ov_compile_graph".as_ptr());
+    let compile_graph = if ir.is_null() {
+        None
+    } else {
+        Some(mem::transmute::<*mut c_void, CompileGraph>(ir))
+    };
     Some(Shim {
         compile_const: mem::transmute::<*mut c_void, CompileConst>(compile_const),
         compile_subgraph,
+        compile_graph,
         free: mem::transmute::<*mut c_void, FreeBlob>(free),
     })
 }
@@ -264,6 +313,234 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
             rq.scales.len(),
             rq.zeros.as_ptr(),
             rq.zeros.len(),
+            key.as_ptr(),
+            &mut blob,
+            &mut len,
+        )
+    };
+    if rc != 0 || blob.is_null() || len == 0 {
+        return None;
+    }
+    let out = unsafe { core::slice::from_raw_parts(blob, len) }.to_vec();
+    unsafe { (s.free)(blob) };
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Graph IR v2: one ABI for complete scheduler splits. The first Intel lowering supports the
+// dense/ShortConv building blocks; capability remains conservative as more WireOps are added.
+// ---------------------------------------------------------------------------
+
+pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
+    let Some(s) = shim() else {
+        return false;
+    };
+    if s.compile_graph.is_none() || graph.nodes.is_empty() || graph.outputs.is_empty() {
+        return false;
+    }
+    graph.nodes.iter().all(|node| {
+        let Some(op) = GraphIr::wire_op(node) else {
+            return false;
+        };
+        if matches!(
+            op,
+            crate::graph_ir::WireOp::MatMulId
+                | crate::graph_ir::WireOp::Argsort
+                | crate::graph_ir::WireOp::Sigmoid
+                | crate::graph_ir::WireOp::SumRows
+        ) && !moe_enabled()
+        {
+            return false;
+        }
+        matches!(
+            op,
+            crate::graph_ir::WireOp::MatMul
+                | crate::graph_ir::WireOp::Mul
+                | crate::graph_ir::WireOp::Add
+                | crate::graph_ir::WireOp::RmsNorm
+                | crate::graph_ir::WireOp::Silu
+                | crate::graph_ir::WireOp::Reshape
+                | crate::graph_ir::WireOp::View
+                | crate::graph_ir::WireOp::Cont
+                | crate::graph_ir::WireOp::Transpose
+                | crate::graph_ir::WireOp::Concat
+                | crate::graph_ir::WireOp::Copy
+                | crate::graph_ir::WireOp::SsmConv
+                | crate::graph_ir::WireOp::GetRows
+                | crate::graph_ir::WireOp::Scale
+                | crate::graph_ir::WireOp::Div
+                | crate::graph_ir::WireOp::Clamp
+                | crate::graph_ir::WireOp::Argsort
+                | crate::graph_ir::WireOp::MatMulId
+                | crate::graph_ir::WireOp::Sigmoid
+                | crate::graph_ir::WireOp::SumRows
+                | crate::graph_ir::WireOp::SoftMax
+                | crate::graph_ir::WireOp::Permute
+                | crate::graph_ir::WireOp::Swiglu
+        ) && node.inputs.len() <= IR_MAX_INPUTS
+    })
+}
+
+pub(super) unsafe fn graph_node_feasible(node: *const crate::ffi::ggml_tensor) -> bool {
+    let op = crate::graph_ir::wire_op_for_tensor(node);
+    let moe_only = matches!(
+        op,
+        Some(
+            crate::graph_ir::WireOp::MatMulId
+                | crate::graph_ir::WireOp::Argsort
+                | crate::graph_ir::WireOp::Sigmoid
+                | crate::graph_ir::WireOp::SumRows
+        )
+    );
+    let attention_only = matches!(
+        op,
+        Some(crate::graph_ir::WireOp::SoftMax | crate::graph_ir::WireOp::Permute)
+    ) || (op == Some(crate::graph_ir::WireOp::MatMul)
+        && !node.is_null()
+        && !(*node).src[0].is_null()
+        && (*(*node).src[0]).op != crate::ffi::GGML_OP_NONE);
+    shim().and_then(|s| s.compile_graph).is_some()
+        && op.is_some()
+        && (!moe_only || moe_enabled())
+        && (!attention_only || attention_full())
+}
+
+fn moe_enabled() -> bool {
+    !unsafe { getenv(c"GGML_NPU_MOE".as_ptr()) }.is_null()
+}
+
+fn attention_full() -> bool {
+    let p = unsafe { getenv(c"GGML_NPU_ATTENTION".as_ptr()) };
+    !p.is_null() && unsafe { CStr::from_ptr(p) }.to_bytes() == b"full"
+}
+
+pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
+    if !graph_feasible(graph) {
+        return None;
+    }
+    let s = shim()?;
+    let compile = s.compile_graph?;
+
+    // Materialize constants before building pointer-bearing ABI records so Vec relocation cannot
+    // invalidate pointers during construction.
+    let mut requants: Vec<Requant> = Vec::new();
+    let mut req_index: Vec<Option<usize>> = vec![None; graph.values.len()];
+    for (id, t) in graph.values.iter().enumerate() {
+        if t.role != TensorRole::Constant {
+            continue;
+        }
+        let ne = t.dims.map(|d| match d {
+            Dim::Static(x) => x,
+            Dim::Bounded { max, .. } => max,
+        });
+        if ne.iter().any(|&x| x <= 0) {
+            return None;
+        }
+        let k = ne[0] as usize;
+        let elems = ne.iter().try_fold(1usize, |a, &b| a.checked_mul(b as usize))?;
+        let n = elems.checked_div(k)?;
+        let operand = Operand {
+            ptr: t.data as *mut c_void,
+            elems,
+            dtype: t.dtype,
+            owned: t.owned,
+        };
+        // Tiny convolution kernels are not group-quantizable; preserve them as f16.
+        let bits = if k % 32 == 0 { choose_bits(&operand, forced_bits()) } else { 16 };
+        let rq = requant::requant(&operand, k, n, bits, asymmetric())?;
+        req_index[id] = Some(requants.len());
+        requants.push(rq);
+    }
+
+    let tensors: Vec<IrTensorAbi> = graph
+        .values
+        .iter()
+        .enumerate()
+        .map(|(id, t)| {
+            let ne = t.dims.map(|d| match d {
+                Dim::Static(x) => x,
+                Dim::Bounded { max, .. } => max,
+            });
+            let rq = req_index[id].map(|i| &requants[i]);
+            IrTensorAbi {
+                role: match t.role {
+                    TensorRole::RuntimeInput => 0,
+                    TensorRole::Constant => 1,
+                    TensorRole::MutableState => 2,
+                    TensorRole::Intermediate => 3,
+                    TensorRole::Output => 4,
+                },
+                dtype: if t.dtype == crate::ffi::GGML_TYPE_I32 {
+                    1
+                } else if t.dtype == crate::ffi::GGML_TYPE_I64 {
+                    2
+                } else {
+                    0
+                },
+                ne,
+                bits: rq.map_or(0, |x| x.bits),
+                group: rq.map_or(0, |x| x.group),
+                weight: rq.map_or(ptr::null(), |x| x.weight.as_ptr()),
+                weight_len: rq.map_or(0, |x| x.weight.len()),
+                scales: rq.map_or(ptr::null(), |x| x.scales.as_ptr()),
+                scales_len: rq.map_or(0, |x| x.scales.len()),
+                zeros: rq.map_or(ptr::null(), |x| x.zeros.as_ptr()),
+                zeros_len: rq.map_or(0, |x| x.zeros.len()),
+            }
+        })
+        .collect();
+
+    let nodes: Option<Vec<IrNodeAbi>> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut inputs = [-1i32; IR_MAX_INPUTS];
+            for (dst, &src) in inputs.iter_mut().zip(&node.inputs) {
+                *dst = src as i32;
+            }
+            Some(IrNodeAbi {
+                op: GraphIr::wire_op(node)? as i32,
+                n_inputs: node.inputs.len() as i32,
+                inputs,
+                output: node.output as i32,
+                params: node.op_params,
+            })
+        })
+        .collect();
+    let nodes = nodes?;
+    let runtime_inputs: Vec<u32> = graph
+        .inputs
+        .iter()
+        .copied()
+        .filter(|&id| graph.values[id as usize].role != TensorRole::Constant)
+        .collect();
+
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for node in &nodes {
+        h = fnv1a(h, &node.op.to_le_bytes());
+        h = fnv1a(h, &node.output.to_le_bytes());
+        for &input in node.inputs.iter().take(node.n_inputs as usize) {
+            h = fnv1a(h, &input.to_le_bytes());
+        }
+    }
+    for rq in &requants {
+        h = fnv1a(h, &rq.weight);
+        h = fnv1a(h, &rq.scales);
+        h = fnv1a(h, &rq.zeros);
+    }
+    let key = CString::new(alloc::format!("ir2-{h:016x}-n{}", nodes.len())).ok()?;
+    let mut blob = ptr::null_mut();
+    let mut len = 0usize;
+    let rc = unsafe {
+        compile(
+            tensors.len() as i32,
+            tensors.as_ptr(),
+            nodes.len() as i32,
+            nodes.as_ptr(),
+            runtime_inputs.len() as i32,
+            runtime_inputs.as_ptr(),
+            graph.outputs.len() as i32,
+            graph.outputs.as_ptr(),
             key.as_ptr(),
             &mut blob,
             &mut len,

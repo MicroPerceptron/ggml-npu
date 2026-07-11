@@ -88,6 +88,22 @@ impl Vendor for IvpuVendor {
         lower::subgraph::run(sg)
     }
 
+    fn can_lower_graph(&self, graph: &crate::graph_ir::GraphIr) -> bool {
+        lower::graph::can_lower(graph)
+    }
+
+    fn run_graph(&self, graph: &crate::graph_ir::GraphIr) -> bool {
+        lower::graph::run(graph)
+    }
+
+    fn can_lower_graph_node(&self, node: *const crate::ffi::ggml_tensor) -> bool {
+        unsafe { compile::graph_node_feasible(node) }
+    }
+
+    fn synchronize(&self) -> bool {
+        session::synchronize()
+    }
+
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void {
         ze::alloc_host(size)
     }
