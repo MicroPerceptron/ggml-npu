@@ -36,15 +36,42 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
     let Some(v) = vendor::present() else {
         return true; // no NPU present; nothing was placed on us
     };
-    if let Some(graph) = crate::graph_ir::capture(cgraph) {
-        if v.can_lower_graph(&graph) {
-            return v.run_graph(&graph);
+    let graph = match crate::graph_ir::capture(cgraph) {
+        Some(graph) => {
+            v.debug_note(&alloc::format!(
+                "[npu ir2] captured split: nodes={} inputs={} outputs={}\n",
+                graph.nodes.len(),
+                graph.inputs.len(),
+                graph.outputs.len()
+            ));
+            for (index, node) in graph.nodes.iter().enumerate() {
+                v.debug_note(&alloc::format!(
+                    "[npu ir2] node {index}: ggml_op={} wire={:?} inputs={}\n",
+                    node.op,
+                    crate::graph_ir::GraphIr::wire_op(node),
+                    node.inputs.len()
+                ));
+            }
+            let stateful = graph.nodes.iter().any(|node| node.op == GGML_OP_SSM_CONV);
+            if stateful && v.can_lower_graph(&graph) {
+                return v.run_graph(&graph);
+            }
+            Some(graph)
         }
-    }
+        None => {
+            v.debug_note("[npu ir2] capture failed for assigned split\n");
+            None
+        }
+    };
     if let Some(sg) = ops::subgraph::recognize(cgraph) {
         // A recognized subgraph spans ops the per-node path can't run on its own (e.g. silu/mul),
         // so it must run as one program or fail loudly — never fall through to a partial dispatch.
         return v.run_subgraph(&sg);
+    }
+    if let Some(graph) = graph {
+        if v.can_lower_graph(&graph) {
+            return v.run_graph(&graph);
+        }
     }
     let n = ggml_graph_n_nodes(cgraph);
     for i in 0..n {

@@ -17,12 +17,18 @@ RUN_NPU=1 MODEL=/path/LFM2.5-8B-A1B-Q4_K_M.gguf MODE=npu NGL=20 \
   ./benchmarks/run_lfm_baseline.sh
 RUN_NPU=1 MODEL=/path/LFM2.5-8B-A1B-Q4_K_M.gguf MODE=npu ATTENTION_PLACEMENT=full \
   ./benchmarks/run_lfm_baseline.sh
+RUN_NPU=1 MODEL=/path/LFM2.5-8B-A1B-Q4_K_M.gguf MODE=npu FLASH_ATTENTION=on \
+  ./benchmarks/run_lfm_baseline.sh
 ```
 
 Use the Vulkan run for all-GPU attention, the default NPU run for NPU constant-weight/QKV
 projections plus GPU attention, and `ATTENTION_PLACEMENT=full` for the experimental runtime
 KQ/softmax/KQV path. Compare trace transfer boundaries and profile synchronization time, not only
 aggregate tokens/s.
+
+`FLASH_ATTENTION` accepts `on`, `off`, or `auto` and is recorded in the environment metadata.
+Compare flash-attention modes in separate processes: persistent backend/compiler caches can make a
+comma-separated multi-configuration `llama-bench` run order-dependent.
 
 NPU execution is never enabled implicitly. Review placement and keep a reboot path available.
 Commit representative result directories when changing lowering, quantization, cache, or scheduling

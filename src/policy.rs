@@ -25,7 +25,10 @@ fn env_u64(name: &'static CStr, default: u64) -> u64 {
         if !b.is_ascii_digit() {
             return default;
         }
-        value = match value.checked_mul(10).and_then(|x| x.checked_add((b - b'0') as u64)) {
+        value = match value
+            .checked_mul(10)
+            .and_then(|x| x.checked_add((b - b'0') as u64))
+        {
             Some(v) => v,
             None => return default,
         };
@@ -33,11 +36,77 @@ fn env_u64(name: &'static CStr, default: u64) -> u64 {
     value
 }
 
+unsafe fn name_contains(t: *const ggml_tensor, needle: &[u8]) -> bool {
+    if t.is_null() || needle.is_empty() {
+        return false;
+    }
+    let name = &(*t).name;
+    name.windows(needle.len())
+        .any(|window| window.iter().zip(needle).all(|(&a, &b)| a as u8 == b))
+}
+
+unsafe fn has_shortconv_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() {
+        return false;
+    }
+    if (*t).op == GGML_OP_SSM_CONV || name_contains(t, b".conv.") {
+        return true;
+    }
+    depth != 0
+        && (*t)
+            .src
+            .iter()
+            .copied()
+            .filter(|src| !src.is_null())
+            .any(|src| has_shortconv_ancestor(src, depth - 1))
+}
+
+unsafe fn is_shortconv_candidate(t: *const ggml_tensor) -> bool {
+    // Explicit architecture boundaries stop ancestry from leaking through the residual stream
+    // into the following FFN/attention block.
+    !name_contains(t, b"ffn")
+        && !name_contains(t, b"self_attn")
+        && !name_contains(t, b"operator_norm")
+        && has_shortconv_ancestor(t, 6)
+}
+
+fn coarse_graph_op(op: ggml_op) -> bool {
+    matches!(
+        op,
+        GGML_OP_MUL_MAT
+            | GGML_OP_SSM_CONV
+            | GGML_OP_MUL
+            | GGML_OP_ADD
+            | GGML_OP_RMS_NORM
+            | GGML_OP_UNARY
+            | GGML_OP_GLU
+            | GGML_OP_RESHAPE
+            | GGML_OP_VIEW
+            | GGML_OP_CONT
+            | GGML_OP_TRANSPOSE
+            | GGML_OP_CONCAT
+            | GGML_OP_PERMUTE
+            | GGML_OP_SOFT_MAX
+    )
+}
+
 pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     if node.is_null() {
         return false;
     }
     let x = &*node;
+    if !getenv(c"GGML_NPU_LFM_SHORTCONV".as_ptr()).is_null()
+        && coarse_graph_op(x.op)
+        && is_shortconv_candidate(node)
+    {
+        return true;
+    }
+    if !getenv(c"GGML_NPU_FORCE_GRAPH".as_ptr()).is_null() {
+        // Pull compute and metadata that can form a profitable contiguous segment, but keep
+        // sequence-index gather/write setup on CPU. Driver initialization for those state-only
+        // graphs is not reliable, and transferring them independently only adds boundaries.
+        return coarse_graph_op(x.op);
+    }
     let min_work = env_u64(c"GGML_NPU_MIN_OFFLOAD_WORK", 4_000_000);
     let work = match x.op {
         GGML_OP_MUL_MAT | GGML_OP_MUL_MAT_ID => {
@@ -49,7 +118,10 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
                 .saturating_mul(x.ne[1].max(0) as u64)
                 .saturating_mul((*a).ne[0].max(0) as u64)
         }
-        GGML_OP_SSM_CONV => x.ne.iter().fold(1u64, |a, &b| a.saturating_mul(b.max(0) as u64)),
+        GGML_OP_SSM_CONV => {
+            x.ne.iter()
+                .fold(1u64, |a, &b| a.saturating_mul(b.max(0) as u64))
+        }
         // Elementwise/state nodes should move only as part of a larger split formed by an
         // expensive anchor; pulling them independently creates synchronization islands.
         _ => return false,

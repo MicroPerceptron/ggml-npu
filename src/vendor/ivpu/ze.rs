@@ -312,7 +312,8 @@ unsafe fn build_runtime() -> Option<Runtime> {
     }
 
     let mut table: *mut c_void = ptr::null_mut();
-    if (l.get_ext_fn_addr)(dev.driver, c"ZE_extension_graph".as_ptr(), &mut table) != ZE_RESULT_SUCCESS
+    if (l.get_ext_fn_addr)(dev.driver, c"ZE_extension_graph".as_ptr(), &mut table)
+        != ZE_RESULT_SUCCESS
         || table.is_null()
     {
         return None;
@@ -349,7 +350,12 @@ pub(super) fn runtime() -> Option<&'static Runtime> {
     match unsafe { build_runtime() } {
         Some(rt) => {
             let boxed = Box::into_raw(Box::new(rt));
-            match RUNTIME.compare_exchange(ptr::null_mut(), boxed, Ordering::AcqRel, Ordering::Acquire) {
+            match RUNTIME.compare_exchange(
+                ptr::null_mut(),
+                boxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => Some(unsafe { &*boxed }),
                 Err(w) => {
                     drop(unsafe { Box::from_raw(boxed) });
@@ -362,7 +368,12 @@ pub(super) fn runtime() -> Option<&'static Runtime> {
             }
         }
         None => {
-            let _ = RUNTIME.compare_exchange(ptr::null_mut(), RT_FAILED, Ordering::AcqRel, Ordering::Acquire);
+            let _ = RUNTIME.compare_exchange(
+                ptr::null_mut(),
+                RT_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             None
         }
     }

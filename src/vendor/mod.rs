@@ -20,10 +20,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
+use crate::ffi::ggml_tensor;
+use crate::graph_ir::GraphIr;
 use crate::ops::subgraph::Subgraph;
 use crate::ops::{Op, Operand};
-use crate::graph_ir::GraphIr;
-use crate::ffi::ggml_tensor;
 
 /// A discovered NPU device — the agnostic view used for the ggml device description.
 pub struct DeviceInfo {
@@ -69,6 +69,8 @@ pub trait Vendor: Sync {
     fn synchronize(&self) -> bool {
         true
     }
+
+    fn debug_note(&self, _message: &str) {}
 
     /// Allocate `size` bytes of NPU-mapped host memory for the backend's buffer type — memory
     /// whose pointer can be bound as a graph argument with **no copy**. Null on failure (the

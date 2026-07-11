@@ -87,7 +87,10 @@ fn memory_limit() -> usize {
         if !b.is_ascii_digit() {
             return 0;
         }
-        value = match value.checked_mul(10).and_then(|x| x.checked_add((b - b'0') as usize)) {
+        value = match value
+            .checked_mul(10)
+            .and_then(|x| x.checked_add((b - b'0') as usize))
+        {
             Some(v) => v,
             None => return 0,
         };
@@ -153,7 +156,10 @@ unsafe extern "C" fn dev_offload_op(_dev: ggml_backend_dev_t, op: *const ggml_te
 }
 
 unsafe extern "C" fn dev_event_new(dev: ggml_backend_dev_t) -> ggml_backend_event_t {
-    Box::into_raw(Box::new(ggml_backend_event { device: dev, context: ptr::null_mut() }))
+    Box::into_raw(Box::new(ggml_backend_event {
+        device: dev,
+        context: ptr::null_mut(),
+    }))
 }
 
 unsafe extern "C" fn dev_event_free(_dev: ggml_backend_dev_t, event: ggml_backend_event_t) {
@@ -201,11 +207,7 @@ unsafe extern "C" fn backend_synchronize(_backend: ggml_backend_t) {
     let _ = crate::engine::synchronize();
 }
 
-unsafe extern "C" fn backend_event_record(
-    _backend: ggml_backend_t,
-    _event: ggml_backend_event_t,
-) {
-}
+unsafe extern "C" fn backend_event_record(_backend: ggml_backend_t, _event: ggml_backend_event_t) {}
 
 unsafe extern "C" fn backend_event_wait(_backend: ggml_backend_t, _event: ggml_backend_event_t) {
     let _ = crate::engine::synchronize();
@@ -222,8 +224,9 @@ unsafe extern "C" fn backend_graph_plan_create(
     if graph.is_null() {
         return ptr::null_mut();
     }
-    Box::into_raw(Box::new(GraphPlan { graph: graph as *mut ggml_cgraph }))
-        as ggml_backend_graph_plan_t
+    Box::into_raw(Box::new(GraphPlan {
+        graph: graph as *mut ggml_cgraph,
+    })) as ggml_backend_graph_plan_t
 }
 
 unsafe extern "C" fn backend_graph_plan_free(

@@ -47,7 +47,10 @@ pub enum Dim {
     Static(i64),
     /// Runtime dimension bounded by `max`; used by bucketed prefill/continuous batching.
     #[allow(dead_code)] // represented on the wire; concrete ggml captures are static today
-    Bounded { min: i64, max: i64 },
+    Bounded {
+        min: i64,
+        max: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +150,13 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
         if t.is_null() {
             return None;
         }
+        // Empty state-selection views carry no bytes and require no device work. ggml may attach
+        // them to a non-empty scheduler split even when `supports_op` rejected the zero shape.
+        // Omitting them keeps the static NPU graph valid; any non-empty consumer would reintroduce
+        // the tensor as an external input and fail capability validation conservatively.
+        if (*t).ne.iter().any(|&dim| dim <= 0) {
+            continue;
+        }
         node_ptrs.push(t as usize);
         consumed.push(false);
 
@@ -194,7 +204,12 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
             params.as_mut_ptr(),
             n_params,
         );
-        graph.nodes.push(Node { op: (*t).op, inputs, output, op_params: params });
+        graph.nodes.push(Node {
+            op: (*t).op,
+            inputs,
+            output,
+            op_params: params,
+        });
     }
 
     for (i, &used) in consumed.iter().enumerate() {
@@ -292,6 +307,11 @@ pub unsafe fn wire_op_for_tensor(t: *const ggml_tensor) -> Option<WireOp> {
         return None;
     }
     let x = &*t;
+    // ggml deliberately emits zero-length state/gather views for empty sequence selections.
+    // They are valid CPU no-ops but cannot be represented by the static OpenVINO/NPU ABI.
+    if x.ne.iter().any(|&dim| dim <= 0) {
+        return None;
+    }
     Some(match x.op {
         GGML_OP_MUL_MAT => WireOp::MatMul,
         GGML_OP_MUL => WireOp::Mul,
@@ -361,8 +381,14 @@ mod tests {
             inputs: vec![0, 1],
             outputs: vec![2],
         };
-        assert_eq!(make(11, Dim::Static(4)).signature(), make(11, Dim::Static(4)).signature());
-        assert_ne!(make(11, Dim::Static(4)).signature(), make(12, Dim::Static(4)).signature());
+        assert_eq!(
+            make(11, Dim::Static(4)).signature(),
+            make(11, Dim::Static(4)).signature()
+        );
+        assert_ne!(
+            make(11, Dim::Static(4)).signature(),
+            make(12, Dim::Static(4)).signature()
+        );
         assert_ne!(
             make(11, Dim::Static(4)).signature(),
             make(11, Dim::Bounded { min: 1, max: 4 }).signature()

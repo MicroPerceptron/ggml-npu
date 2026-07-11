@@ -48,7 +48,9 @@ pub unsafe fn match_node(node: *const ggml_tensor) -> Option<Op> {
     if s0.ne[2] != 1 || s0.ne[3] != 1 || s1.ne[2] != 1 || s1.ne[3] != 1 || s0.ne[0] != s1.ne[0] {
         return None;
     }
-    if !ggml_is_contiguous(src0 as *const ggml_tensor) || !ggml_is_contiguous(src1 as *const ggml_tensor) {
+    if !ggml_is_contiguous(src0 as *const ggml_tensor)
+        || !ggml_is_contiguous(src1 as *const ggml_tensor)
+    {
         return None;
     }
     let (k, n, m) = (s0.ne[0], s0.ne[1], s1.ne[1]);

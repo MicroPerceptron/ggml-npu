@@ -79,7 +79,11 @@ fn main() {
     // pass yields the core Level Zero types plus the NPU graph extension.
     let ze_dir = manifest.join("src/vendor/ivpu/level_zero");
     let ze_header = ze_dir.join("ze_graph_ext.h");
-    assert!(ze_header.exists(), "vendored ze_graph_ext.h not found at {}", ze_header.display());
+    assert!(
+        ze_header.exists(),
+        "vendored ze_graph_ext.h not found at {}",
+        ze_header.display()
+    );
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed={}", ze_header.display());

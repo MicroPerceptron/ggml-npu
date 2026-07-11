@@ -30,7 +30,9 @@ pub fn run(m: i64, k: i64, n: i64, inputs: &[Operand], output: &Operand) -> bool
         compile::compile_const_blob(weight, m, k, n)
     });
     if !ok {
-        super::super::profile::note(&alloc::format!("[npu] matmul run FAIL (m={m} k={k} n={n})\n"));
+        super::super::profile::note(&alloc::format!(
+            "[npu] matmul run FAIL (m={m} k={k} n={n})\n"
+        ));
     }
     ok
 }

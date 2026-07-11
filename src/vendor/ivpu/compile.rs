@@ -196,7 +196,8 @@ fn shim() -> Option<&'static Shim> {
     match unsafe { load_shim() } {
         Some(s) => {
             let boxed = Box::into_raw(Box::new(s));
-            match SHIM.compare_exchange(ptr::null_mut(), boxed, Ordering::AcqRel, Ordering::Acquire) {
+            match SHIM.compare_exchange(ptr::null_mut(), boxed, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => Some(unsafe { &*boxed }),
                 Err(w) => {
                     drop(unsafe { Box::from_raw(boxed) });
@@ -209,7 +210,12 @@ fn shim() -> Option<&'static Shim> {
             }
         }
         None => {
-            let _ = SHIM.compare_exchange(ptr::null_mut(), SHIM_FAILED, Ordering::AcqRel, Ordering::Acquire);
+            let _ = SHIM.compare_exchange(
+                ptr::null_mut(),
+                SHIM_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             None
         }
     }
@@ -237,7 +243,13 @@ pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
 /// [`session::run_const`](super::session::run_const) graph-cache miss; the built graph is what stays
 /// resident, so the blob is never itself cached (no double-keep of every program's weights).
 pub(super) fn compile_const_blob(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
-    if m <= 0 || k <= 0 || n <= 0 || m > i32::MAX as i64 || k > i32::MAX as i64 || n > i32::MAX as i64 {
+    if m <= 0
+        || k <= 0
+        || n <= 0
+        || m > i32::MAX as i64
+        || k > i32::MAX as i64
+        || n > i32::MAX as i64
+    {
         return None;
     }
     compile_const(weight, m, k, n)
@@ -295,7 +307,13 @@ fn asymmetric() -> bool {
 
 fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
     let s = shim()?;
-    let rq = requant::requant(weight, k as usize, n as usize, choose_bits(weight, forced_bits()), asymmetric())?;
+    let rq = requant::requant(
+        weight,
+        k as usize,
+        n as usize,
+        choose_bits(weight, forced_bits()),
+        asymmetric(),
+    )?;
     let key = cache_key(&rq, m, k, n);
 
     let mut blob: *mut u8 = ptr::null_mut();
@@ -333,13 +351,23 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 
 pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
     let Some(s) = shim() else {
+        super::profile::note("[npu ir2] unavailable: OpenVINO compiler shim not loaded\n");
         return false;
     };
-    if s.compile_graph.is_none() || graph.nodes.is_empty() || graph.outputs.is_empty() {
+    if s.compile_graph.is_none() {
+        super::profile::note("[npu ir2] unavailable: shim lacks graph compiler symbol\n");
         return false;
     }
-    graph.nodes.iter().all(|node| {
+    if graph.nodes.is_empty() || graph.outputs.is_empty() {
+        super::profile::note("[npu ir2] rejected empty graph or output set\n");
+        return false;
+    }
+    for (index, node) in graph.nodes.iter().enumerate() {
         let Some(op) = GraphIr::wire_op(node) else {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected: unmapped ggml op {}\n",
+                node.op
+            ));
             return false;
         };
         if matches!(
@@ -350,9 +378,12 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 | crate::graph_ir::WireOp::SumRows
         ) && !moe_enabled()
         {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected: MoE op {op:?} requires GGML_NPU_MOE=1\n"
+            ));
             return false;
         }
-        matches!(
+        let supported = matches!(
             op,
             crate::graph_ir::WireOp::MatMul
                 | crate::graph_ir::WireOp::Mul
@@ -377,8 +408,16 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 | crate::graph_ir::WireOp::SoftMax
                 | crate::graph_ir::WireOp::Permute
                 | crate::graph_ir::WireOp::Swiglu
-        ) && node.inputs.len() <= IR_MAX_INPUTS
-    })
+        );
+        if !supported || node.inputs.len() > IR_MAX_INPUTS {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected: wire op {op:?}, inputs={}\n",
+                node.inputs.len()
+            ));
+            return false;
+        }
+    }
+    true
 }
 
 pub(super) unsafe fn graph_node_feasible(node: *const crate::ffi::ggml_tensor) -> bool {
@@ -437,7 +476,9 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
             return None;
         }
         let k = ne[0] as usize;
-        let elems = ne.iter().try_fold(1usize, |a, &b| a.checked_mul(b as usize))?;
+        let elems = ne
+            .iter()
+            .try_fold(1usize, |a, &b| a.checked_mul(b as usize))?;
         let n = elems.checked_div(k)?;
         let operand = Operand {
             ptr: t.data as *mut c_void,
@@ -446,7 +487,11 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
             owned: t.owned,
         };
         // Tiny convolution kernels are not group-quantizable; preserve them as f16.
-        let bits = if k % 32 == 0 { choose_bits(&operand, forced_bits()) } else { 16 };
+        let bits = if k % 32 == 0 {
+            choose_bits(&operand, forced_bits())
+        } else {
+            16
+        };
         let rq = requant::requant(&operand, k, n, bits, asymmetric())?;
         req_index[id] = Some(requants.len());
         requants.push(rq);
@@ -570,7 +615,14 @@ fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
 /// shape/quant params, and the re-quantized weight + scales bytes, plus a human-readable suffix.
 fn cache_key(rq: &Requant, m: i64, k: i64, n: i64) -> CString {
     let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
-    for v in [FORMAT_VERSION, m as u64, k as u64, n as u64, rq.bits as u64, rq.group as u64] {
+    for v in [
+        FORMAT_VERSION,
+        m as u64,
+        k as u64,
+        n as u64,
+        rq.bits as u64,
+        rq.group as u64,
+    ] {
         h = fnv1a(h, &v.to_le_bytes());
     }
     h = fnv1a(h, &rq.weight);
@@ -597,7 +649,12 @@ fn cache_key(rq: &Requant, m: i64, k: i64, n: i64) -> CString {
 /// shim/requant failure. Called once per distinct [`sg_signature`] on a
 /// [`session::run_subgraph`](super::session::run_subgraph) graph-cache miss.
 pub(super) fn compile_subgraph_blob(sg: &Subgraph) -> Option<Vec<u8>> {
-    if sg.m <= 0 || sg.inputs.is_empty() || sg.nodes.is_empty() || sg.outputs.is_empty() || sg.outs.is_empty() {
+    if sg.m <= 0
+        || sg.inputs.is_empty()
+        || sg.nodes.is_empty()
+        || sg.outputs.is_empty()
+        || sg.outs.is_empty()
+    {
         return None;
     }
     if sg.outputs.iter().any(|&o| o as usize >= sg.nodes.len()) {
@@ -644,7 +701,13 @@ pub(super) fn sg_signature(sg: &Subgraph) -> u64 {
         h = fnv1a(h, &[op]);
         h = fnv1a(h, &enc(nd.a).to_le_bytes());
         h = fnv1a(h, &nd.b.map(enc).unwrap_or(u32::MAX).to_le_bytes());
-        h = fnv1a(h, &nd.weight.map(|w| w as u32).unwrap_or(u32::MAX).to_le_bytes());
+        h = fnv1a(
+            h,
+            &nd.weight
+                .map(|w| w as u32)
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
     }
     for c in &sg.consts {
         h = fnv1a(h, &(c.weight.ptr as usize as u64).to_le_bytes());
@@ -665,7 +728,13 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
     // Re-quantize every baked weight (bytes must outlive the shim call → held in `requants`).
     let mut requants: Vec<Requant> = Vec::with_capacity(sg.consts.len());
     for c in &sg.consts {
-        requants.push(requant::requant(&c.weight, c.k as usize, c.n as usize, choose_bits(&c.weight, force), asymmetric())?);
+        requants.push(requant::requant(
+            &c.weight,
+            c.k as usize,
+            c.n as usize,
+            choose_bits(&c.weight, force),
+            asymmetric(),
+        )?);
     }
     let consts: Vec<SgConstAbi> = requants
         .iter()
@@ -713,7 +782,11 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
         .collect();
 
     let out_nodes: Vec<i32> = sg.outputs.iter().map(|&o| o as i32).collect();
-    let input_k: Vec<i32> = sg.inputs.iter().map(|op| (op.elems / sg.m as usize) as i32).collect();
+    let input_k: Vec<i32> = sg
+        .inputs
+        .iter()
+        .map(|op| (op.elems / sg.m as usize) as i32)
+        .collect();
     let key = subgraph_cache_key(sg, &requants, &nodes, &input_k, &out_nodes);
 
     let mut blob: *mut u8 = ptr::null_mut();
@@ -770,6 +843,11 @@ fn subgraph_cache_key(
         h = fnv1a(h, &rq.scales);
         h = fnv1a(h, &rq.zeros);
     }
-    let s = alloc::format!("sg-{h:016x}-m{}-n{}-o{}", sg.m, sg.nodes.len(), out_nodes.len());
+    let s = alloc::format!(
+        "sg-{h:016x}-m{}-n{}-o{}",
+        sg.m,
+        sg.nodes.len(),
+        out_nodes.len()
+    );
     CString::new(s).unwrap_or_else(|_| CString::new("badkey").unwrap())
 }

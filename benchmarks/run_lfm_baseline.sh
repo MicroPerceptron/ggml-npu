@@ -33,14 +33,18 @@ mkdir -p "$OUT"
     echo "attention_placement=${ATTENTION_PLACEMENT:-qkv}"
     echo "npu_bits=${GGML_NPU_BITS:-auto}"
     echo "npu_async=${GGML_NPU_ASYNC:-0}"
+    echo "lfm_shortconv=${GGML_NPU_LFM_SHORTCONV:-0}"
+    echo "flash_attention=${FLASH_ATTENTION:-auto}"
     echo "prompt_tokens=${PROMPT_TOKENS:-512}"
     echo "generated_tokens=${GEN_TOKENS:-128}"
     echo "repetitions=${REPETITIONS:-5}"
+    echo "backend_git_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
     uname -a
     free -b
 } > "$OUT/environment.txt"
 
-args=(-m "$MODEL" -p "${PROMPT_TOKENS:-512}" -n "${GEN_TOKENS:-128}" -r "${REPETITIONS:-5}")
+args=(-m "$MODEL" -p "${PROMPT_TOKENS:-512}" -n "${GEN_TOKENS:-128}" -r "${REPETITIONS:-5}"
+    -fa "${FLASH_ATTENTION:-auto}")
 case "$MODE" in
     cpu)
         args+=(-ngl 0)
@@ -63,6 +67,10 @@ case "$MODE" in
         exit 2
         ;;
 esac
+
+if [[ "$MODE" == npu && -f "$GGML_BACKEND_PATH" ]]; then
+    echo "backend_so_sha256=$(sha256sum "$GGML_BACKEND_PATH" | awk '{print $1}')" >> "$OUT/environment.txt"
+fi
 
 bench_pid=""
 guard_pid=""

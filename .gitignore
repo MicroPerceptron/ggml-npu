@@ -3,3 +3,4 @@
 *.o
 *.so
 /tests/registration_check
+/benchmarks/results/

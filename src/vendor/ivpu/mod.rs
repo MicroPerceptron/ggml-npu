@@ -67,7 +67,9 @@ impl Vendor for IvpuVendor {
         // supports_op no longer re-enumerates Level Zero on every call.
         let mut v = Vec::new();
         if let Some(r) = ze::runtime() {
-            v.push(DeviceInfo { name: r.name.clone() });
+            v.push(DeviceInfo {
+                name: r.name.clone(),
+            });
         }
         v
     }
@@ -102,6 +104,10 @@ impl Vendor for IvpuVendor {
 
     fn synchronize(&self) -> bool {
         session::synchronize()
+    }
+
+    fn debug_note(&self, message: &str) {
+        profile::note(message);
     }
 
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void {

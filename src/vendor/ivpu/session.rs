@@ -217,7 +217,11 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
         return None;
     }
 
-    Some(Box::leak(Box::new(Graph { handle, inputs, outs })))
+    Some(Box::leak(Box::new(Graph {
+        handle,
+        inputs,
+        outs,
+    })))
 }
 
 fn node_list(
@@ -270,10 +274,22 @@ unsafe fn bind_arg(
     op: &Operand,
 ) -> Option<Bind> {
     if op.owned {
-        if pfn_set(handle, arg.index, op.ptr) != ZE_RESULT_SUCCESS {
+        let result = pfn_set(handle, arg.index, op.ptr);
+        if result != ZE_RESULT_SUCCESS {
+            profile::note(&alloc::format!(
+                "[npu] bind FAIL: arg={} owned ptr={:p} op_elems={} graph_elems={} ze={}\n",
+                arg.index,
+                op.ptr,
+                op.elems,
+                arg.elems,
+                result
+            ));
             return None;
         }
-        Some(Bind { bounce: None, elems: 0 })
+        Some(Bind {
+            bounce: None,
+            elems: 0,
+        })
     } else {
         let bytes = arg.elems * 4;
         // NPU-mapped staging buffer, owned via `NpuHostAlloc` (no leaked raw pointer). `try_reserve`
@@ -282,14 +298,30 @@ unsafe fn bind_arg(
         buf.try_reserve_exact(bytes).ok()?;
         ptr::write_bytes(buf.as_mut_ptr(), 0, bytes);
         buf.set_len(bytes);
-        if pfn_set(handle, arg.index, buf.as_ptr() as *const c_void) != ZE_RESULT_SUCCESS {
+        let result = pfn_set(handle, arg.index, buf.as_ptr() as *const c_void);
+        if result != ZE_RESULT_SUCCESS {
+            profile::note(&alloc::format!(
+                "[npu] bind FAIL: arg={} bounce={:p} op_elems={} graph_elems={} ze={}\n",
+                arg.index,
+                buf.as_ptr(),
+                op.elems,
+                arg.elems,
+                result
+            ));
             return None;
         }
-        Some(Bind { bounce: Some(buf), elems: min(op.elems, arg.elems) })
+        Some(Bind {
+            bounce: Some(buf),
+            elems: min(op.elems, arg.elems),
+        })
     }
 }
 
-unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], outs: &[&Operand]) -> Option<&'static NodeList> {
+unsafe fn build_node_list(
+    g: &Graph,
+    inputs: &[&Operand],
+    outs: &[&Operand],
+) -> Option<&'static NodeList> {
     let l = ze::lib()?;
     let rt = ze::runtime()?;
     let ddi = rt.ddi;
@@ -309,16 +341,38 @@ unsafe fn build_node_list(g: &Graph, inputs: &[&Operand], outs: &[&Operand]) -> 
     ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
     ld.commandQueueGroupOrdinal = 0;
     let mut exec: ze_command_list_handle_t = ptr::null_mut();
-    if (l.cmd_list_create)(rt.context, rt.device, &ld, &mut exec) != ZE_RESULT_SUCCESS {
+    let create_result = (l.cmd_list_create)(rt.context, rt.device, &ld, &mut exec);
+    if create_result != ZE_RESULT_SUCCESS {
+        profile::note(&alloc::format!(
+            "[npu] command-list create FAIL: ze={create_result}\n"
+        ));
         return None;
     }
-    if pfn_exec(exec, g.handle, ptr::null_mut(), ptr::null_mut(), 0, ptr::null_mut()) != ZE_RESULT_SUCCESS
-        || (l.cmd_list_close)(exec) != ZE_RESULT_SUCCESS
-    {
+    let exec_result = pfn_exec(
+        exec,
+        g.handle,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        0,
+        ptr::null_mut(),
+    );
+    let close_result = if exec_result == ZE_RESULT_SUCCESS {
+        (l.cmd_list_close)(exec)
+    } else {
+        ZE_RESULT_SUCCESS
+    };
+    if exec_result != ZE_RESULT_SUCCESS || close_result != ZE_RESULT_SUCCESS {
+        profile::note(&alloc::format!(
+            "[npu] command-list record FAIL: execute ze={exec_result}, close ze={close_result}\n"
+        ));
         (l.cmd_list_destroy)(exec);
         return None;
     }
-    Some(Box::leak(Box::new(NodeList { exec, inputs: binds, outs: out_binds })))
+    Some(Box::leak(Box::new(NodeList {
+        exec,
+        inputs: binds,
+        outs: out_binds,
+    })))
 }
 
 /// Run a single **baked-Constant matmul** program: reuse (or build) its graph — keyed by the weight
@@ -332,7 +386,10 @@ pub(super) fn run_const(
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
     let key = (crate::backend::buffer_generation(), weight_ptr, m);
-    let Some(g) = CONST_GRAPHS.try_get_or_insert_with(key, || build_from(compile)).flatten() else {
+    let Some(g) = CONST_GRAPHS
+        .try_get_or_insert_with(key, || build_from(compile))
+        .flatten()
+    else {
         profile::note("[npu] run FAIL: const graph build None\n");
         return false;
     };
@@ -349,7 +406,10 @@ pub(super) fn run_subgraph(
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
     let key = (crate::backend::buffer_generation(), sig);
-    let Some(g) = SG_GRAPHS.try_get_or_insert_with(key, || build_from(compile)).flatten() else {
+    let Some(g) = SG_GRAPHS
+        .try_get_or_insert_with(key, || build_from(compile))
+        .flatten()
+    else {
         profile::note("[npu] run FAIL: subgraph graph build None\n");
         return false;
     };
@@ -377,7 +437,11 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
     };
     let prof = profile::enabled();
     unsafe {
-        let has_bounce = node.inputs.iter().chain(node.outs.iter()).any(|b| b.bounce.is_some());
+        let has_bounce = node
+            .inputs
+            .iter()
+            .chain(node.outs.iter())
+            .any(|b| b.bounce.is_some());
         // A host-visible staging buffer cannot be overwritten/read while an earlier submission is
         // in flight. Direct NPU-owned bindings can remain queued in order without this barrier.
         if has_bounce && !synchronize() {
@@ -426,8 +490,12 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
         }
         if prof {
             let t3 = profile::now_ns();
-            let owned =
-                node.inputs.iter().chain(node.outs.iter()).filter(|b| b.bounce.is_none()).count() as u64;
+            let owned = node
+                .inputs
+                .iter()
+                .chain(node.outs.iter())
+                .filter(|b| b.bounce.is_none())
+                .count() as u64;
             let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
             profile::record(t0, t1, tmid, t2, t3, owned, bounced, bytes_in, bytes_out);
         }

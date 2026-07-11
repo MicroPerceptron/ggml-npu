@@ -39,8 +39,11 @@ pub(crate) unsafe fn split(cgraph: *mut ggml_cgraph) {
             continue;
         }
         let x = &*t;
+        let name = core::ffi::CStr::from_ptr(x.name.as_ptr())
+            .to_str()
+            .unwrap_or("<non-utf8>");
         emit(&format!(
-            "[ggml-npu trace] node={i} op={} dtype={} ne={},{},{},{} nb={},{},{},{} data={:p} owned={}\n",
+            "[ggml-npu trace] node={i} name={name} op={} dtype={} ne={},{},{},{} nb={},{},{},{} data={:p} owned={}\n",
             x.op,
             x.type_,
             x.ne[0],

@@ -90,6 +90,8 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 - `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
 - `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
   any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.
+- `GGML_NPU_LFM_SHORTCONV=1` opts into ancestry-based placement of LFM convolution segments while
+  leaving sequence gather/write setup and unrelated attention/MoE glue on CPU/GPU.
 
 ## Roadmap
 

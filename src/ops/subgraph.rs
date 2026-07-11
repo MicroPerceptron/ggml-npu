@@ -68,7 +68,11 @@ pub struct Subgraph {
 }
 
 unsafe fn sg_const(w: *mut ggml_tensor) -> SgConst {
-    SgConst { weight: Operand::from_tensor(w), k: (*w).ne[0], n: (*w).ne[1] }
+    SgConst {
+        weight: Operand::from_tensor(w),
+        k: (*w).ne[0],
+        n: (*w).ne[1],
+    }
 }
 
 /// Is `w` a bakeable constant weight (a loaded model leaf with data)?
@@ -165,43 +169,116 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
             if !is_const_weight(w) {
                 return None; // runtime-operand matmul (e.g. attention KQ) — not bakeable yet
             }
-            let act = resolve((*t).src[1], &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
+            let act = resolve(
+                (*t).src[1],
+                &cnodes,
+                &ir_out,
+                ci,
+                &mut inputs,
+                &mut input_ptrs,
+            )?;
             let ci_c = consts.len() as u32;
             consts.push(sg_const(w));
-            ir_nodes.push(SgNode { op: SgOp::MatMul { n: (*w).ne[1] }, a: act, b: None, weight: Some(ci_c) });
+            ir_nodes.push(SgNode {
+                op: SgOp::MatMul { n: (*w).ne[1] },
+                a: act,
+                b: None,
+                weight: Some(ci_c),
+            });
         } else if op == GGML_OP_MUL || op == GGML_OP_ADD {
             if !same_2d((*t).src[0], (*t).src[1]) {
                 return None;
             }
-            let a = resolve((*t).src[0], &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
-            let b = resolve((*t).src[1], &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
-            let sgop = if op == GGML_OP_MUL { SgOp::Mul } else { SgOp::Add };
-            ir_nodes.push(SgNode { op: sgop, a, b: Some(b), weight: None });
+            let a = resolve(
+                (*t).src[0],
+                &cnodes,
+                &ir_out,
+                ci,
+                &mut inputs,
+                &mut input_ptrs,
+            )?;
+            let b = resolve(
+                (*t).src[1],
+                &cnodes,
+                &ir_out,
+                ci,
+                &mut inputs,
+                &mut input_ptrs,
+            )?;
+            let sgop = if op == GGML_OP_MUL {
+                SgOp::Mul
+            } else {
+                SgOp::Add
+            };
+            ir_nodes.push(SgNode {
+                op: sgop,
+                a,
+                b: Some(b),
+                weight: None,
+            });
         } else if is_silu(t) {
             if !glue_2d(t) {
                 return None;
             }
-            let a = resolve((*t).src[0], &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
-            ir_nodes.push(SgNode { op: SgOp::Silu, a, b: None, weight: None });
+            let a = resolve(
+                (*t).src[0],
+                &cnodes,
+                &ir_out,
+                ci,
+                &mut inputs,
+                &mut input_ptrs,
+            )?;
+            ir_nodes.push(SgNode {
+                op: SgOp::Silu,
+                a,
+                b: None,
+                weight: None,
+            });
         } else if is_rms_norm(t) {
             if !glue_2d(t) {
                 return None;
             }
-            let a = resolve((*t).src[0], &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
+            let a = resolve(
+                (*t).src[0],
+                &cnodes,
+                &ir_out,
+                ci,
+                &mut inputs,
+                &mut input_ptrs,
+            )?;
             let eps = f32::from_bits((*t).op_params[0] as u32);
-            ir_nodes.push(SgNode { op: SgOp::RmsNorm { eps }, a, b: None, weight: None });
+            ir_nodes.push(SgNode {
+                op: SgOp::RmsNorm { eps },
+                a,
+                b: None,
+                weight: None,
+            });
         } else if is_swiglu(t) {
             // SwiGLU(g, u) = silu(g)·u → two IR nodes; `swapped` picks which operand gets the silu.
             let swapped = (*t).op_params[1] != 0;
-            let (g, u) = if swapped { ((*t).src[1], (*t).src[0]) } else { ((*t).src[0], (*t).src[1]) };
+            let (g, u) = if swapped {
+                ((*t).src[1], (*t).src[0])
+            } else {
+                ((*t).src[0], (*t).src[1])
+            };
             if !same_2d(g, u) {
                 return None;
             }
             let gr = resolve(g, &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
             let ur = resolve(u, &cnodes, &ir_out, ci, &mut inputs, &mut input_ptrs)?;
-            ir_nodes.push(SgNode { op: SgOp::Silu, a: gr, b: None, weight: None });
+            ir_nodes.push(SgNode {
+                op: SgOp::Silu,
+                a: gr,
+                b: None,
+                weight: None,
+            });
             let silu_idx = (ir_nodes.len() - 1) as u32;
-            ir_nodes.push(SgNode { op: SgOp::Mul, a: Ref::Node(silu_idx), b: Some(ur), weight: None });
+            ir_nodes.push(SgNode {
+                op: SgOp::Mul,
+                a: Ref::Node(silu_idx),
+                b: Some(ur),
+                weight: None,
+            });
         } else {
             return None; // unsupported op
         }
@@ -254,7 +331,14 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
         }
     }
 
-    Some(Subgraph { m, inputs, consts, nodes: ir_nodes, outputs, outs })
+    Some(Subgraph {
+        m,
+        inputs,
+        consts,
+        nodes: ir_nodes,
+        outputs,
+        outs,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +366,6 @@ unsafe fn is_swiglu(t: *const ggml_tensor) -> bool {
 unsafe fn is_rms_norm(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_RMS_NORM
 }
-
 
 /// Plain 2D (`[K, M]`), so the single-node subgraph's `[M, K]` mapping is exact.
 unsafe fn glue_2d(t: *const ggml_tensor) -> bool {
@@ -363,7 +446,12 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             m: (*s0).ne[1],
             inputs: vec![Operand::from_tensor(s0)],
             consts: Vec::new(),
-            nodes: vec![SgNode { op: SgOp::Silu, a: Ref::Input(0), b: None, weight: None }],
+            nodes: vec![SgNode {
+                op: SgOp::Silu,
+                a: Ref::Input(0),
+                b: None,
+                weight: None,
+            }],
             outputs: vec![0],
             outs: vec![Operand::from_tensor(node)],
         });
@@ -381,7 +469,12 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             m: (*a).ne[1],
             inputs: vec![Operand::from_tensor(a), Operand::from_tensor(b)],
             consts: Vec::new(),
-            nodes: vec![SgNode { op: SgOp::Mul, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
+            nodes: vec![SgNode {
+                op: SgOp::Mul,
+                a: Ref::Input(0),
+                b: Some(Ref::Input(1)),
+                weight: None,
+            }],
             outputs: vec![0],
             outs: vec![Operand::from_tensor(node)],
         });
@@ -398,7 +491,12 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             m: (*a).ne[1],
             inputs: vec![Operand::from_tensor(a), Operand::from_tensor(b)],
             consts: Vec::new(),
-            nodes: vec![SgNode { op: SgOp::Add, a: Ref::Input(0), b: Some(Ref::Input(1)), weight: None }],
+            nodes: vec![SgNode {
+                op: SgOp::Add,
+                a: Ref::Input(0),
+                b: Some(Ref::Input(1)),
+                weight: None,
+            }],
             outputs: vec![0],
             outs: vec![Operand::from_tensor(node)],
         });
@@ -422,8 +520,18 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             inputs: vec![Operand::from_tensor(g), Operand::from_tensor(u)],
             consts: Vec::new(),
             nodes: vec![
-                SgNode { op: SgOp::Silu, a: Ref::Input(0), b: None, weight: None },
-                SgNode { op: SgOp::Mul, a: Ref::Node(0), b: Some(Ref::Input(1)), weight: None },
+                SgNode {
+                    op: SgOp::Silu,
+                    a: Ref::Input(0),
+                    b: None,
+                    weight: None,
+                },
+                SgNode {
+                    op: SgOp::Mul,
+                    a: Ref::Node(0),
+                    b: Some(Ref::Input(1)),
+                    weight: None,
+                },
             ],
             outputs: vec![1],
             outs: vec![Operand::from_tensor(node)],
@@ -439,7 +547,9 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
             inputs: vec![Operand::from_tensor(s0)],
             consts: Vec::new(),
             nodes: vec![SgNode {
-                op: SgOp::RmsNorm { eps: f32::from_bits((*node).op_params[0] as u32) },
+                op: SgOp::RmsNorm {
+                    eps: f32::from_bits((*node).op_params[0] as u32),
+                },
                 a: Ref::Input(0),
                 b: None,
                 weight: None,
