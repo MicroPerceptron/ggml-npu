@@ -41,7 +41,26 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `.gitmodules`, `docs/compiler-migration-plan.md`, submodule metadata.
   - Verified: 2026-07-12
 
+- `FINDING/lfm-pp512-cursor-host-oom` — A locked full LFM pp512 run co-located with Cursor failed from host OOM pressure (llama-bench RSS growth / host kill), not NPU device-heap exhaustion; Cursor received SIGBUS in the same cgroup pressure event while NPU utilization stayed small.
+  - Scope: Host/cgroup memory failure mode for fullperf under a stressed IDE session; not an NPU allocator or device-heap baseline.
+  - Evidence: `benchmarks/results/pr15-8e3ab44-pp512-fullperf-locked-memguard-1gib/`, GitHub issue #17.
+  - Verified: 2026-07-12
+
+- `FINDING/lfm-memguard-session-kill-gap` — The LFM MemAvailable guard could report a kill yet leave the bench process group alive long enough under swap/zram thrash for host OOM to win. The durable harness contract is a recorded `setsid` session/PGID kill (SIGTERM→SIGKILL), swap preflight refusal, and a raised MemAvailable floor when swap is already in use (issue #17 / PR #18 merged to develop as `e8fdcd4`).
+  - Scope: Host-RSS/swap safety only; not an NPU device-heap limit.
+  - Evidence: `benchmarks/lib/lfm_process_guard.sh`, `benchmarks/test_lfm_process_guard.sh`, `docs/benchmarking.md`, `benchmarks/README.md`, GitHub issue #17, PR #18.
+  - Verified: 2026-07-12
+
+- `FINDING/lfm-shared-bindings-dispatch-merge-loss` — Develop fullperf at `8cc351f` reported `0 imported / 1296 staged (0.0% no-copy)` vs remediation `880 imported / 416 staged (67.9%)` while still showing the same `shared allocations: 1 unique, 46.00 MiB` and similar stage-in/copy-out wall times. Root cause: tiered-cache merges kept `prepare_inference_shared` / `binding_key` but dropped the `a3b4af0` dispatch contract (`direct_binding_count` attribution, skip copy-out for direct outputs, `StagingAllocation` only for non-direct). PR #19 restores that contract on develop; short attribution (not full pp512) is the next validation gate for #6.
+  - Scope: Direct-IVPU binding attribution and direct-output skip; residual staged bounce after restore still tracked by #6.
+  - Evidence: `src/vendor/ivpu/session_direct.rs`, `benchmarks/results/develop-8cc351f-pp512-fullperf-locked/`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #19.
+  - Verified: 2026-07-12
+
 ## Constraints
+
+- `CONSTRAINT/no-default-full-pp512` — Full LFM pp512 and similarly long multi-sample locked llama-bench runs must not be started by default; prefer tests → Criterion → short attribution/profile → optional `r=1` smoke, and reserve full locked pp512 for explicit requests, acceptance criteria, or tok/s-moving changes after cheaper gates. Do not run locked fullperf inside a memory-/swap-stressed Cursor session; prefer a separate terminal/session and the cheaper ladder first. Respect the global flock; keep shim/`compile_graph_v3` current before NPU full benches; do not re-run only to “confirm.”
+  - Evidence: `.cursor/rules/benchmark-invocation.mdc`, `docs/benchmarking.md`, `benchmarks/README.md`, `benchmarks/lib/lfm_process_guard.sh`.
+  - Verified: 2026-07-12
 
 - `CONSTRAINT/upstream-ggml-npu-device-type` — CI builds that bind against upstream llama.cpp headers fail when `GGML_BACKEND_DEVICE_TYPE_NPU` is absent; `src/backend/shell.rs` currently requires that constant.
   - Evidence: `src/backend/shell.rs`, GitHub Actions build logs for `develop`.
@@ -97,9 +116,13 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4).
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`).
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, with attribution hooks and tok/s movement toward Vulkan under the locked harness.
-  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, issue #5.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, issue #5, PR #15, PR #20.
+
+- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract.
+  - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice).
+  - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, issue #6, PR #19.
 
 - `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact.
   - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven.
