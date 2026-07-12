@@ -10,9 +10,13 @@ use core::alloc::Layout;
 use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
 
+use crate::runtime::async_runtime::AtomicWait;
 use crate::runtime::Deadline;
 
 pub(crate) const ERROR_DOMAIN: u32 = u32::from_be_bytes(*b"HOST");
+
+mod async_services;
+pub(crate) use async_services::{BlockingExecutorFactory, ReactorFactory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HostError(pub i64);
@@ -197,6 +201,9 @@ pub(crate) trait HostEnvironment {
     type Diagnostics: DiagnosticService;
     type Allocator: AllocationService;
     type Libraries: DynamicLibraryService;
+    type AtomicWait: AtomicWait;
+    type ReactorFactory: ReactorFactory;
+    type BlockingExecutorFactory: BlockingExecutorFactory;
 
     fn files(&self) -> &Self::Files;
     fn clock(&self) -> &Self::Clock;
@@ -207,6 +214,9 @@ pub(crate) trait HostEnvironment {
     fn diagnostics(&self) -> &Self::Diagnostics;
     fn allocator(&self) -> &Self::Allocator;
     fn libraries(&self) -> &Self::Libraries;
+    fn atomic_wait(&self) -> &Self::AtomicWait;
+    fn reactor_factory(&self) -> &Self::ReactorFactory;
+    fn blocking_executor_factory(&self) -> &Self::BlockingExecutorFactory;
 }
 
 #[cfg(target_os = "linux")]

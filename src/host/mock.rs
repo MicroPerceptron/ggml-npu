@@ -9,11 +9,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{GlobalAlloc, System};
 
 use super::{
+    async_services::{CallerDrivenBlockingFactory, ReactorFactory},
     AllocationService, ArtifactService, ClockService, ConfigService, DiagnosticService,
     DynamicLibraryService, ExitCallback, FileError, FileService, HostEnvironment, HostError,
     LibraryVisibility, MapOptions, MappingOwner, MathService, MemoryMapping, MemoryStatusService,
     OpenOptions, OwnedFile, Ready, WaitInterest,
 };
+use crate::runtime::async_runtime::{AtomicWait, NoProgress, WaitChange, WaitError, WakeCount};
 use crate::runtime::Deadline;
 
 pub(crate) struct MockFile(i64);
@@ -80,6 +82,51 @@ pub(crate) struct MockClock(pub u64);
 impl ClockService for MockClock {
     fn monotonic_now_ns(&self) -> Result<u64, HostError> {
         Ok(self.0)
+    }
+}
+
+impl crate::runtime::async_runtime::MonotonicClock for MockClock {
+    fn now_ns(&self) -> Result<u64, WaitError> {
+        Ok(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MockAtomicWait;
+
+impl AtomicWait for MockAtomicWait {
+    fn wait_u32(
+        &self,
+        state: &core::sync::atomic::AtomicU32,
+        expected: u32,
+        deadline: Deadline,
+    ) -> Result<WaitChange, WaitError> {
+        if state.load(Ordering::Acquire) != expected {
+            Ok(WaitChange::Changed)
+        } else if matches!(deadline, Deadline::MonotonicNs(_)) {
+            Ok(WaitChange::TimedOut)
+        } else {
+            Ok(WaitChange::Spurious)
+        }
+    }
+
+    fn wake_u32(
+        &self,
+        _state: &core::sync::atomic::AtomicU32,
+        _count: WakeCount,
+    ) -> Result<(), WaitError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MockReactorFactory;
+
+impl ReactorFactory for MockReactorFactory {
+    type Reactor = NoProgress;
+
+    fn create(&self) -> Result<Self::Reactor, WaitError> {
+        Ok(NoProgress)
     }
 }
 
@@ -196,6 +243,9 @@ pub(crate) struct MockHost {
     pub diagnostics: MockDiagnostics,
     pub allocator: MockAllocator,
     pub libraries: MockLibraries,
+    pub atomic_wait: MockAtomicWait,
+    pub reactor_factory: MockReactorFactory,
+    pub blocking_executor_factory: CallerDrivenBlockingFactory,
 }
 
 impl HostEnvironment for MockHost {
@@ -208,6 +258,9 @@ impl HostEnvironment for MockHost {
     type Diagnostics = MockDiagnostics;
     type Allocator = MockAllocator;
     type Libraries = MockLibraries;
+    type AtomicWait = MockAtomicWait;
+    type ReactorFactory = MockReactorFactory;
+    type BlockingExecutorFactory = CallerDrivenBlockingFactory;
 
     fn files(&self) -> &Self::Files {
         &self.files
@@ -244,6 +297,18 @@ impl HostEnvironment for MockHost {
     fn libraries(&self) -> &Self::Libraries {
         &self.libraries
     }
+
+    fn atomic_wait(&self) -> &Self::AtomicWait {
+        &self.atomic_wait
+    }
+
+    fn reactor_factory(&self) -> &Self::ReactorFactory {
+        &self.reactor_factory
+    }
+
+    fn blocking_executor_factory(&self) -> &Self::BlockingExecutorFactory {
+        &self.blocking_executor_factory
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +341,9 @@ mod tests {
             diagnostics: MockDiagnostics::default(),
             allocator: MockAllocator,
             libraries: MockLibraries,
+            atomic_wait: MockAtomicWait,
+            reactor_factory: MockReactorFactory,
+            blocking_executor_factory: CallerDrivenBlockingFactory,
         };
 
         assert_eq!(host.clock().monotonic_now_ns(), Ok(42));

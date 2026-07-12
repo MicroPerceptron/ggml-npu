@@ -53,6 +53,17 @@ impl ClockService for LinuxClock {
     }
 }
 
+impl crate::runtime::async_runtime::MonotonicClock for LinuxClock {
+    fn now_ns(&self) -> Result<u64, crate::runtime::async_runtime::WaitError> {
+        self.monotonic_now_ns().map_err(|error| {
+            crate::runtime::async_runtime::WaitError::HostFailure {
+                domain: super::ERROR_DOMAIN,
+                code: error.0,
+            }
+        })
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LinuxMemoryStatus;
 

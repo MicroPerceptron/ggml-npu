@@ -15,12 +15,12 @@
 
 extern crate alloc;
 
-#[cfg(any(test, feature = "bench"))]
+#[cfg(any(test, feature = "bench", feature = "test-support"))]
 extern crate std;
 
 use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::ffi::{c_int, c_void};
-#[cfg(not(any(test, feature = "bench")))]
+#[cfg(not(any(test, feature = "bench", feature = "test-support")))]
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 
@@ -99,7 +99,7 @@ unsafe impl Allocator for HostAlloc {
 #[global_allocator]
 static HOST_ALLOC: HostAlloc = HostAlloc;
 
-#[cfg(not(any(test, feature = "bench")))]
+#[cfg(not(any(test, feature = "bench", feature = "test-support")))]
 #[panic_handler]
 fn on_panic(_info: &PanicInfo) -> ! {
     // no_std: no unwinding. Abort rather than let a panic cross the C ABI.
@@ -112,11 +112,11 @@ fn on_panic(_info: &PanicInfo) -> ! {
 // panic aborts in `on_panic` first). A leaner alternative is `-Zbuild-std` with
 // `panic_immediate_abort`, but that would force an explicit `--target` on every build.
 #[no_mangle]
-#[cfg(not(any(test, feature = "bench")))]
+#[cfg(not(any(test, feature = "bench", feature = "test-support")))]
 extern "C" fn rust_eh_personality() {}
 
 #[no_mangle]
-#[cfg(not(any(test, feature = "bench")))]
+#[cfg(not(any(test, feature = "bench", feature = "test-support")))]
 extern "C" fn _Unwind_Resume() -> ! {
     host::builtin().allocator().abort()
 }

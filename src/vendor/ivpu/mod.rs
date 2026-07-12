@@ -20,8 +20,11 @@ mod lower;
 mod profile;
 #[cfg(feature = "level-zero-compat")]
 mod session;
-#[cfg(not(feature = "level-zero-compat"))]
+#[cfg(all(not(feature = "level-zero-compat"), feature = "direct-ivpu"))]
 #[path = "session_direct.rs"]
+mod session;
+#[cfg(all(not(feature = "level-zero-compat"), not(feature = "direct-ivpu")))]
+#[path = "session_unavailable.rs"]
 mod session;
 #[cfg(feature = "level-zero-compat")]
 mod ze;
@@ -85,14 +88,17 @@ impl Vendor for IvpuVendor {
     }
 
     fn probe(&self) -> Vec<DeviceInfo> {
+        #[cfg(any(feature = "level-zero-compat", feature = "direct-ivpu"))]
         let mut v = Vec::new();
+        #[cfg(not(any(feature = "level-zero-compat", feature = "direct-ivpu")))]
+        let v = Vec::new();
         #[cfg(feature = "level-zero-compat")]
         if let Some(r) = ze::runtime() {
             v.push(DeviceInfo {
                 name: r.name.clone(),
             });
         }
-        #[cfg(not(feature = "level-zero-compat"))]
+        #[cfg(all(not(feature = "level-zero-compat"), feature = "direct-ivpu"))]
         if let Ok(device) = direct::IvpuDevice::open_first() {
             if let Ok(parameters) = device.parameters() {
                 v.push(DeviceInfo {

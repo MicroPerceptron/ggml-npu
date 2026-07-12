@@ -9,7 +9,7 @@ publish = false
 [lib]
 # What ggml dlopens. Cargo emits `libggml_npu.so` (underscore); load it explicitly
 # via GGML_BACKEND_PATH, so the exact filename does not matter for discovery.
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["direct-ivpu"]
@@ -18,13 +18,14 @@ direct-ivpu = ["dep:goblin"]
 level-zero-compat = []
 bench = ["dep:criterion", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
+test-support = []
 
 [dependencies]
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
 goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
 # Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
-rustix = { version = "1.1.4", features = ["event", "fs", "mm", "param", "time"], default-features = false }
+rustix = { version = "1.1.4", features = ["event", "fs", "mm", "param", "thread", "time"], default-features = false }
 
 [build-dependencies]
 bindgen = "0.72.1"
@@ -52,6 +53,15 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "async_runtime"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "hardware"
 harness = false
 required-features = ["bench-hardware"]
+
+[[test]]
+name = "async_runtime"
+required-features = ["test-support"]
