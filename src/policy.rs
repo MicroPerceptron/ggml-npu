@@ -89,6 +89,47 @@ unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
         })
 }
 
+/// True when `t` sits under FFN fusible producers (silu / SwiGLU / silu·up / FFN-shaped matmul).
+/// Used to enlarge layout/glue regions around FFN without pulling attention-side orphans (#5).
+unsafe fn has_ffn_fusible_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            crate::ops::subgraph::is_ffn_shaped_matmul(src)
+                || crate::ops::subgraph::is_silu(src)
+                || crate::ops::subgraph::is_swiglu(src)
+                || crate::ops::subgraph::is_ffn_shaped_activation(src)
+                || has_ffn_fusible_ancestor(src, depth - 1)
+        })
+}
+
+/// Dependency-aware fusible/metadata pull: FFN glue claims, or layout under an FFN fusible span.
+fn fusible_neighborhood_should_pull(
+    placement: PlacementClass,
+    claims_glue: bool,
+    ffn_fusible_ancestor: bool,
+) -> bool {
+    match placement {
+        PlacementClass::FusibleOnly | PlacementClass::Metadata => {
+            claims_glue || ffn_fusible_ancestor
+        }
+        _ => false,
+    }
+}
+
+unsafe fn should_pull_fusible_neighborhood(node: *const ggml_tensor, spec: OpSpec) -> bool {
+    fusible_neighborhood_should_pull(
+        spec.placement,
+        crate::ops::subgraph::claims_glue(node),
+        has_ffn_fusible_ancestor(node, 12),
+    )
+}
+
 unsafe fn has_disabled_moe_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
     if t.is_null() || depth == 0 {
         return false;
@@ -169,11 +210,11 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     {
         // Anchors may start a split. Cheap glue/layout may only extend a split downstream from an
         // anchor; this prevents embedding gathers or isolated unary nodes from becoming NPU
-        // dispatches merely because force mode was requested.
+        // dispatches merely because force mode was requested. Depth matches supports_region (#5).
         return match spec.placement {
             PlacementClass::Anchor | PlacementClass::StandaloneIfProfitable => true,
             PlacementClass::Stateful => x.op == GGML_OP_SSM_CONV,
-            PlacementClass::FusibleOnly | PlacementClass::Metadata => has_anchor_ancestor(node, 6),
+            PlacementClass::FusibleOnly | PlacementClass::Metadata => has_anchor_ancestor(node, 12),
         };
     }
     let min_work = env_u64(c"GGML_NPU_MIN_OFFLOAD_WORK", 4_000_000);
@@ -181,6 +222,11 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         GGML_OP_MUL_MAT | GGML_OP_MUL_MAT_ID => {
             let a = x.src[0];
             if a.is_null() {
+                return false;
+            }
+            // Runtime-weight matmuls cannot bake into fused NPU programs; pulling them creates
+            // uneconomic unitary islands. Const-weight FFN/attention projections remain eligible.
+            if x.op == GGML_OP_MUL_MAT && !crate::ops::subgraph::is_claimable_matmul(node) {
                 return false;
             }
             (x.ne[0].max(0) as u64)
@@ -191,9 +237,9 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
             x.ne.iter()
                 .fold(1u64, |a, &b| a.saturating_mul(b.max(0) as u64))
         }
-        // Elementwise/state nodes should move only as part of a larger split formed by an
-        // expensive anchor; pulling them independently creates synchronization islands.
-        _ => return false,
+        // Dependency-aware FFN glue/layout pull: enlarge fused partitions around ShortConv/FFN
+        // instead of leaving claimable silu/mul/residual on CPU while matmuls go NPU (#5).
+        _ => return should_pull_fusible_neighborhood(node, spec),
     };
     // Orphan/attention-side matmuls (not FFN-local) pay full handoff cost as unitary programs.
     // Default unitary floor is 4× MIN_OFFLOAD_WORK so uneconomic 1-node MUL_MAT pulls stay off
@@ -258,5 +304,30 @@ mod tests {
         assert_eq!(unitary_offload_floor(4_000_000), 16_000_000);
         assert_eq!(unitary_offload_floor(0), 0);
         assert_eq!(unitary_offload_floor(u64::MAX / 2 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout() {
+        // Claimed FFN glue always pulls; layout/metadata only under an FFN fusible ancestor.
+        assert!(fusible_neighborhood_should_pull(
+            PlacementClass::FusibleOnly,
+            true,
+            false
+        ));
+        assert!(fusible_neighborhood_should_pull(
+            PlacementClass::Metadata,
+            false,
+            true
+        ));
+        assert!(!fusible_neighborhood_should_pull(
+            PlacementClass::FusibleOnly,
+            false,
+            false
+        ));
+        assert!(!fusible_neighborhood_should_pull(
+            PlacementClass::Anchor,
+            true,
+            true
+        ));
     }
 }

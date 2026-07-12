@@ -61,6 +61,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/backend/shell.rs`, `src/backend/buffer.rs`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #22.
   - Verified: 2026-07-12
 
+- `FINDING/offload-skipped-ffn-glue` — `offload_op` historically pulled only `MUL_MAT` / `SSM_CONV` (plus opt-in ShortConv candidates). FFN glue claimed via `supports_op`/`claims_glue` stayed on foreign buffers unless already placed, so matmul anchors and their silu/mul/residual often split into unitary NPU programs. Policy now dependency-pulls claimed FFN glue and layout under an FFN fusible ancestor, refuses non-claimable runtime-weight `MUL_MAT` pulls, and aligns `FORCE_GRAPH` fusible ancestry depth with `supports_region` (12).
+  - Scope: Scheduler placement/`should_pull` only; not a measured split/unitary delta until short attribution or locked harness evidence.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/backend/shell.rs`, GitHub issue #5.
+  - Verified: 2026-07-12
+
 ## Constraints
 
 - `CONSTRAINT/no-default-full-pp512` — Full LFM pp512 and similarly long multi-sample locked llama-bench runs must not be started by default; prefer tests → Criterion → short attribution/profile → optional `r=1` smoke, and reserve full locked pp512 for explicit requests, acceptance criteria, or tok/s-moving changes after cheaper gates. Do not run locked fullperf inside a memory-/swap-stressed Cursor session; prefer a separate terminal/session and the cheaper ladder first. Respect the global flock; keep shim/`compile_graph_v3` current before NPU full benches; do not re-run only to “confirm.”
@@ -121,7 +126,7 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on.
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. Next fused-partition slice: dependency-aware `should_pull` for claimed FFN glue / FFN-span layout, refuse non-claimable matmul pulls, `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`).
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, with attribution hooks and tok/s movement toward Vulkan under the locked harness.
   - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, issue #5, PR #15, PR #20, PR #22.
 
