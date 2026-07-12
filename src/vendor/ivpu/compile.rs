@@ -773,6 +773,40 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 // dense/ShortConv building blocks; capability remains conservative as more WireOps are added.
 // ---------------------------------------------------------------------------
 
+/// Intel graph-compiler claim surface for a wire op (env/policy gates applied separately).
+/// Coverage gates compare this set to `tests/coverage_matrix.csv` so claims cannot outrun proofs.
+pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
+    matches!(
+        op,
+        crate::graph::WireOp::MatMul
+            | crate::graph::WireOp::Mul
+            | crate::graph::WireOp::Add
+            | crate::graph::WireOp::RmsNorm
+            | crate::graph::WireOp::Silu
+            | crate::graph::WireOp::Reshape
+            | crate::graph::WireOp::View
+            | crate::graph::WireOp::Cont
+            | crate::graph::WireOp::Transpose
+            | crate::graph::WireOp::Concat
+            | crate::graph::WireOp::Copy
+            | crate::graph::WireOp::SsmConv
+            | crate::graph::WireOp::Rope
+            | crate::graph::WireOp::GetRows
+            | crate::graph::WireOp::SetRows
+            | crate::graph::WireOp::Scale
+            | crate::graph::WireOp::Div
+            | crate::graph::WireOp::Clamp
+            | crate::graph::WireOp::Argsort
+            | crate::graph::WireOp::MatMulId
+            | crate::graph::WireOp::Sigmoid
+            | crate::graph::WireOp::SumRows
+            | crate::graph::WireOp::SoftMax
+            | crate::graph::WireOp::FlashAttention
+            | crate::graph::WireOp::Permute
+            | crate::graph::WireOp::Swiglu
+    )
+}
+
 pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
     if !execution_runtime_available() {
         super::profile::note("[npu ir2] unavailable: selected execution runtime rejected device\n");
@@ -851,36 +885,7 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
             ));
             return false;
         }
-        let supported = matches!(
-            op,
-            crate::graph::WireOp::MatMul
-                | crate::graph::WireOp::Mul
-                | crate::graph::WireOp::Add
-                | crate::graph::WireOp::RmsNorm
-                | crate::graph::WireOp::Silu
-                | crate::graph::WireOp::Reshape
-                | crate::graph::WireOp::View
-                | crate::graph::WireOp::Cont
-                | crate::graph::WireOp::Transpose
-                | crate::graph::WireOp::Concat
-                | crate::graph::WireOp::Copy
-                | crate::graph::WireOp::SsmConv
-                | crate::graph::WireOp::Rope
-                | crate::graph::WireOp::GetRows
-                | crate::graph::WireOp::SetRows
-                | crate::graph::WireOp::Scale
-                | crate::graph::WireOp::Div
-                | crate::graph::WireOp::Clamp
-                | crate::graph::WireOp::Argsort
-                | crate::graph::WireOp::MatMulId
-                | crate::graph::WireOp::Sigmoid
-                | crate::graph::WireOp::SumRows
-                | crate::graph::WireOp::SoftMax
-                | crate::graph::WireOp::FlashAttention
-                | crate::graph::WireOp::Permute
-                | crate::graph::WireOp::Swiglu
-        );
-        if !supported || node.inputs.len() > IR_MAX_INPUTS {
+        if !wire_op_compile_supported(op) || node.inputs.len() > IR_MAX_INPUTS {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected: wire op {op:?}, inputs={}\n",
                 node.inputs.len()

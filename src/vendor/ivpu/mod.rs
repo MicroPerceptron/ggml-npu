@@ -9,6 +9,7 @@ pub(crate) mod address;
 pub(crate) mod artifact;
 mod cache;
 mod compile;
+pub(crate) use compile::wire_op_compile_supported;
 #[cfg(feature = "direct-ivpu")]
 pub mod direct;
 #[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]

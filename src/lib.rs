@@ -42,6 +42,8 @@ pub(crate) mod ffi {
 pub(crate) mod address;
 pub mod artifact_cache;
 mod backend;
+#[cfg(any(test, feature = "test-support"))]
+mod coverage;
 mod engine;
 mod graph;
 mod hal;
