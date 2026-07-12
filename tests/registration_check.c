@@ -21,8 +21,10 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
-/* Requires GGML_BACKEND_DEVICE_TYPE_NPU from the MicroPerceptron/llama.cpp pin
- * (.github/workflows/ci.yml / issue #13). Upstream ggml-org headers fail the compile here. */
+/* Host-header feature detect (issue #13):
+ * - With MicroPerceptron/llama.cpp (native NPU enum): default expect NPU.
+ * - With stock ggml-org (no NPU enum): default expect ACCEL; never invent NPU.
+ * The registration script sets -DGGML_NPU_HEADERS_HAVE_NPU=1 when the headers declare it. */
 
 /* ggml symbols our cdylib references. Real hosts provide these from libggml; here stubs
  * are enough to satisfy RTLD_NOW — none are called during this registration check (we only
@@ -108,10 +110,22 @@ int main(int argc, char ** argv) {
     CHECK(reg->api_version == GGML_BACKEND_API_VERSION, "api_version == GGML_BACKEND_API_VERSION (2)");
     CHECK(ndev == 1, "exactly one device");
     const char * device_class = getenv("GGML_NPU_DEVICE_CLASS");
+#ifdef GGML_NPU_HEADERS_HAVE_NPU
     int expected_type = GGML_BACKEND_DEVICE_TYPE_NPU;
+#else
+    /* Stock upstream: backend defaults to ACCEL rather than inventing NPU (issue #13). */
+    int expected_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+#endif
     if (device_class && strcmp(device_class, "accel") == 0) expected_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
     if (device_class && strcmp(device_class, "gpu") == 0)   expected_type = GGML_BACKEND_DEVICE_TYPE_GPU;
     if (device_class && strcmp(device_class, "igpu") == 0)  expected_type = GGML_BACKEND_DEVICE_TYPE_IGPU;
+    if (device_class && strcmp(device_class, "npu") == 0) {
+#ifdef GGML_NPU_HEADERS_HAVE_NPU
+        expected_type = GGML_BACKEND_DEVICE_TYPE_NPU;
+#else
+        expected_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+#endif
+    }
     CHECK(dtype == expected_type, "device type matches native/override class");
     CHECK((int) props.type == dtype, "get_props type matches get_type");
     CHECK(sop == 0, "supports_op(NULL) safely returns false");

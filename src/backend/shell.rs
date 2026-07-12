@@ -27,7 +27,15 @@ unsafe extern "C" fn reg_get_proc_address(
     _reg: ggml_backend_reg_t,
     name: *const c_char,
 ) -> *mut core::ffi::c_void {
-    super::external::proc_address(name)
+    #[cfg(ggml_has_external_memory)]
+    {
+        super::external::proc_address(name)
+    }
+    #[cfg(not(ggml_has_external_memory))]
+    {
+        let _ = name;
+        ptr::null_mut()
+    }
 }
 
 unsafe extern "C" fn reg_get_device_count(_reg: ggml_backend_reg_t) -> usize {
@@ -109,18 +117,35 @@ fn async_enabled() -> bool {
 }
 
 fn device_type() -> ggml_backend_dev_type {
+    // When host headers lack GGML_BACKEND_DEVICE_TYPE_NPU (stock ggml-org), do not invent an
+    // enum value the scheduler would not understand — default to ACCEL (issue #13).
+    #[cfg(ggml_has_npu_device_type)]
+    const DEFAULT_TYPE: ggml_backend_dev_type = GGML_BACKEND_DEVICE_TYPE_NPU;
+    #[cfg(not(ggml_has_npu_device_type))]
+    const DEFAULT_TYPE: ggml_backend_dev_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+
     let Some(value) = crate::host::builtin()
         .config()
         .value(c"GGML_NPU_DEVICE_CLASS")
     else {
-        return GGML_BACKEND_DEVICE_TYPE_NPU;
+        return DEFAULT_TYPE;
     };
     match value.to_bytes() {
         b"accel" => GGML_BACKEND_DEVICE_TYPE_ACCEL,
         b"gpu" => GGML_BACKEND_DEVICE_TYPE_GPU,
         b"igpu" => GGML_BACKEND_DEVICE_TYPE_IGPU,
-        b"npu" => GGML_BACKEND_DEVICE_TYPE_NPU,
-        _ => GGML_BACKEND_DEVICE_TYPE_NPU,
+        b"npu" => {
+            #[cfg(ggml_has_npu_device_type)]
+            {
+                GGML_BACKEND_DEVICE_TYPE_NPU
+            }
+            #[cfg(not(ggml_has_npu_device_type))]
+            {
+                // Cannot claim NPU to a host that has no NPU device-type discriminator.
+                GGML_BACKEND_DEVICE_TYPE_ACCEL
+            }
+        }
+        _ => DEFAULT_TYPE,
     }
 }
 
