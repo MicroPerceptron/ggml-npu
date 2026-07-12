@@ -9,12 +9,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   `graph_node_feasible` and `graph_feasible` share the wire-op allowlist, MoE/attention env gates,
   input-arity ceiling, and compiler/runtime readiness. `policy::supports_region` is region-expansion
   / profitability neighborhood logic and must not gate `supports_op`; `offload_op` keeps
-  `should_pull`. Claimed splits that fail NPU execution return `GGML_STATUS_FAILED` with
-  attributable `claimed_execution_failure` traces rather than silent success.
+  `should_pull`. Two honest outcomes after that shared probe: **unclaim** (supports/offload false so
+  ggml places on Vulkan/BLAS/CPU — preferred for layout-only Metadata glue OpenVINO cannot lower
+  alone) vs **fail-closed** (claimed split that cannot complete returns `GGML_STATUS_FAILED` with
+  attributable `claimed_execution_failure` traces). Never silent success after NPU compile/exec
+  failure; bench baselines reject `npu-unproven`.
   - Rationale: Over-claim vs compile rejection made scheduler placement and tok/s attribution
-    unreliable (#8).
+    unreliable (#8); claim-then-abort on lone View aborted pp16 warmup (#5, PR #35).
   - Evidence: `src/vendor/ivpu/compile.rs`, `src/engine.rs`, `src/policy.rs`, `src/backend/shell.rs`,
-    GitHub issue #8.
+    `.cursor/rules/npu-claim-fallback.mdc`, `docs/coverage-gates.md`, GitHub issues #5/#8, PRs #32/#35.
   - Verified: 2026-07-12
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
@@ -91,6 +94,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 - `FINDING/offload-skipped-ffn-glue` — `offload_op` historically pulled only `MUL_MAT` / `SSM_CONV` (plus opt-in ShortConv candidates). FFN glue claimed via `supports_op`/`claims_glue` stayed on foreign buffers unless already placed, so matmul anchors and their silu/mul/residual often split into unitary NPU programs. Policy now dependency-pulls claimed FFN glue and layout under an FFN fusible ancestor, refuses non-claimable runtime-weight `MUL_MAT` pulls, and aligns `FORCE_GRAPH` fusible ancestry depth with `supports_region` (12).
   - Scope: Scheduler placement/`should_pull` only; not a measured split/unitary delta until short attribution or locked harness evidence.
   - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/backend/shell.rs`, GitHub issue #5.
+  - Verified: 2026-07-12
+
+- `FINDING/layout-only-overclaim-warmup-abort` — After fail-closed (#32), develop `856b43d` pp16 warmup aborted when a disconnected 1-node `View` partition was claimed then OpenVINO returned `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE` (`GGML_STATUS_FAILED`); an adjacent 7-node partition had already run direct-IVPU at 100% no-copy. Fix: reject Metadata/`traits.metadata` in `graph_node_feasible` and layout-only graphs in `graph_feasible` while keeping layout ops on the fused wire allowlist (PR #35).
+  - Scope: Standalone layout-only partitions (View/Reshape/Cont/Transpose/Permute); not a claim that fused layout+compute is proven on every LFM split.
+  - Evidence: `src/vendor/ivpu/compile.rs`, `benchmarks/results/develop-856b43d-targeted-pp16-debug/`, GitHub issues #5/#8, PR #35.
   - Verified: 2026-07-12
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
@@ -175,14 +183,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Pending milestones
 
-- `MILESTONE/capability-contract-complete` — Finish GitHub #8 beyond the fail-closed first slice:
-  harness summaries that distinguish proven direct-IVPU vs scheduler/Vulkan fallback; broader
-  mismatch regression tests (tensor-level supports_op vs compile); quant canonical-fallback
-  attribution clarity. First slice: shared wire/env gates + fail-loud claimed execution
-  (`ADR/capability-contract-fail-closed`).
+- `MILESTONE/capability-contract-complete` — Finish GitHub #8 beyond fail-closed + layout-only
+  unclaim: harness summaries that distinguish proven direct-IVPU vs scheduler/Vulkan fallback;
+  broader mismatch regression tests (tensor-level supports_op vs compile); quant canonical-fallback
+  attribution clarity. Landed slices: shared wire/env gates + fail-loud claimed execution (PR #32);
+  Metadata layout-only unclaim (PR #35); agent rule + hermetic contract tests
+  (`ADR/capability-contract-fail-closed`, `.cursor/rules/npu-claim-fallback.mdc`).
   - Acceptance: Bench summaries cannot present fallback tok/s as NPU proof; automated tests cover
     supports_op/compile disagreement cases; issue #8 acceptance criteria met with evidence.
-  - Evidence: `benchmarks/run_lfm_baseline.sh`, `src/engine.rs`, `src/vendor/ivpu/compile.rs`, issue #8.
+  - Evidence: `benchmarks/run_lfm_baseline.sh`, `src/engine.rs`, `src/vendor/ivpu/compile.rs`,
+    `docs/coverage-gates.md`, issue #8.
 
 - `MILESTONE/shared-memory-interop` — Promote a shared-memory interop contract only after at least two adapters prove matching ownership, visibility, ordering, cache-maintenance, synchronization, import/export, and failure semantics.
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
