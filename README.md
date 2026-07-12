@@ -25,6 +25,8 @@ stateful short-convolution, sparse routed-expert, and attention graph coverage; 
 - **Atomics over global locks.** The singleton vtable graph is published with a lock-free
   `AtomicPtr` CAS, not a `OnceLock`.
 - **Partitioned modules**, organized by association; vendors live under `vendor/<driver>/`.
+- **Portable ownership first.** `runtime/` defines device/program/memory/queue/event lifecycles;
+  `os/` supplies owned host primitives. Vendor command protocols stay below both interfaces.
 
 ## Layout
 
@@ -35,9 +37,12 @@ src/backend/shell.rs    registry + device + backend(stream) vtables
 src/backend/buffer.rs   buffer-type + buffer vtables (host allocation)
 src/engine.rs           scheduler split recognition and graph dispatch
 src/ops/                matmul, graph-pattern IR, and host requantization
-src/hal.rs              aspirational universal 5-verb submission seam
+src/hal.rs              legacy five-verb compatibility façade
+src/runtime/            portable fallible runtime lifecycle + artifact envelope
+src/os/                 OS service traits; rustix Linux implementation
 src/vendor/stub.rs      CPU-echo NpuHal (no hardware)
 src/vendor/ivpu/        Intel NPU (Level Zero + OpenVINO); level_zero/ vendored headers   <- active
+src/vendor/ivpu/direct/ feature-gated Linux intel_vpu discovery/resource UAPI (no submit)
 src/vendor/xdna/        AMD Ryzen AI (XRT + mlir-aie)                                       skeleton
 src/vendor/hexagon/     Qualcomm Hexagon (FastRPC/QNN + hexagon-mlir)                       skeleton
 tests/registration_check.c   self-contained registration verifier (mimics ggml's DL loader)
@@ -58,7 +63,20 @@ build.rs                bindgen driver (locates ggml headers + clang resource di
 ```sh
 cargo build --release                 # -> target/release/libggml_npu.so
 GGML_DIR=/path/to/llama.cpp cargo build --release   # if not a sibling
+cargo check --features direct-ivpu    # safe direct Linux foundation; no graph execution
 ```
+
+The direct runtime boundary and exact prerequisites for a first direct matmul are documented in
+[`docs/direct-runtime-foundation.md`](docs/direct-runtime-foundation.md). The existing OpenVINO and
+Level Zero runtime remains the default compatibility path. `direct-ivpu` enables a no-std,
+ELF-only Goblin configuration for device artifacts; host shared-library loading continues to use
+the platform `dlopen`/`dlsym` boundary.
+
+Host microbenchmarks use feature-gated Criterion, while llama-bench remains the end-to-end pp/tg
+framework; see [`docs/benchmarking.md`](docs/benchmarking.md). The io_uring transport decision is
+documented in [`docs/io-uring-assessment.md`](docs/io-uring-assessment.md).
+Persistent and in-process key semantics are documented in
+[`docs/identity.md`](docs/identity.md).
 
 `ggml_*` symbols are left undefined and resolve at `dlopen` from the host; set
 `GGML_LIB_DIR=/dir/with/libggml-base.so` to link deterministically instead. The cdylib is

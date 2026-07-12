@@ -63,8 +63,8 @@ pub fn run(graph: &GraphIr) -> bool {
     }
     let input_refs: Vec<&Operand> = inputs.iter().collect();
     let output_refs: Vec<&Operand> = outputs.iter().collect();
-    let sig = graph.signature();
-    session::run_subgraph(sig, &input_refs, &output_refs, || {
+    let key = graph.semantic_key();
+    session::run_subgraph(key, &input_refs, &output_refs, || {
         compile::compile_graph_blob(graph)
     })
 }

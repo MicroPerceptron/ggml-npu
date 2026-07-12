@@ -73,7 +73,7 @@ mkdir -p "$OUT"
 } > "$OUT/environment.txt"
 
 args=(-m "$MODEL" -p "${PROMPT_TOKENS:-512}" -n "${GEN_TOKENS:-128}" -r "${REPETITIONS:-5}"
-    -fa "${FLASH_ATTENTION:-auto}" -t "$THREADS")
+    -fa "${FLASH_ATTENTION:-auto}" -t "$THREADS" -o jsonl)
 case "$MODE" in
     cpu|cpu-native|cpu-openblas|cpu-flexiblas|cpu-mkl)
         args+=(-ngl 0)
@@ -87,7 +87,8 @@ case "$MODE" in
         : "${GGML_NPU_DEVICE_CLASS:=${NPU_DEVICE_CLASS:-npu}}"
         export GGML_BACKEND_PATH GGML_NPU_OVC GGML_NPU_DEVICE_CLASS
         export LD_LIBRARY_PATH="$OPENVINO_DIR/runtime/lib/intel64:${LD_LIBRARY_PATH:-}"
-        export GGML_NPU_PROFILE=1 GGML_NPU_TRACE=1
+        [[ "${NPU_PROFILE:-1}" == 1 ]] && export GGML_NPU_PROFILE=1
+        [[ "${NPU_TRACE:-0}" == 1 ]] && export GGML_NPU_TRACE=1
         if [[ "${ATTENTION_PLACEMENT:-qkv}" == full ]]; then
             export GGML_NPU_ATTENTION=full
         fi
@@ -116,6 +117,11 @@ energy_before=""
 [[ -r "$ENERGY_FILE" ]] && energy_before="$(<"$ENERGY_FILE")"
 cleanup() {
     [[ -n "$guard_pid" ]] && kill "$guard_pid" 2>/dev/null || true
+    if [[ -n "$bench_pid" ]] && kill -0 "$bench_pid" 2>/dev/null; then
+        kill -TERM -- "-$bench_pid" 2>/dev/null || true
+        sleep 1
+        kill -KILL -- "-$bench_pid" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -123,16 +129,23 @@ runner=()
 if [[ "$MODE" == npu ]]; then
     runner=(timeout --signal=TERM --kill-after=10s "${NPU_TIMEOUT:-180s}")
 fi
-/usr/bin/time -v "${runner[@]}" "$BENCH" "${args[@]}" > "$OUT/stdout.txt" 2> "$OUT/stderr.txt" &
+# One process group makes timeout, memory-guard, interrupt, and shell-exit cleanup reach every
+# descendant (the old wrapper-only kill could leave llama-bench running after its parent exited).
+setsid /usr/bin/time -f \
+    '{"wall_seconds":%e,"user_seconds":%U,"system_seconds":%S,"max_rss_kib":%M,"exit_status":%x}' \
+    -o "$OUT/process.json" "${runner[@]}" "$BENCH" "${args[@]}" \
+    > "$OUT/result.jsonl" 2> "$OUT/stderr.txt" &
 bench_pid=$!
 
 if [[ "$MODE" == npu ]]; then
     (
         while sleep 0.2; do
             avail_kb="$(awk '/MemAvailable:/ { print $2 }' /proc/meminfo)"
-            if (( avail_kb < ${MIN_AVAILABLE_KB:-400000} )); then
+            if (( avail_kb < ${MIN_AVAILABLE_KB:-4194304} )); then
                 echo "MemAvailable guard killed benchmark at ${avail_kb} KiB" >> "$OUT/guard.txt"
-                kill -TERM "$bench_pid" 2>/dev/null || true
+                kill -TERM -- "-$bench_pid" 2>/dev/null || true
+                sleep 1
+                kill -KILL -- "-$bench_pid" 2>/dev/null || true
                 exit 0
             fi
         done
@@ -140,13 +153,18 @@ if [[ "$MODE" == npu ]]; then
     guard_pid=$!
 fi
 
+set +e
 wait "$bench_pid"
+status=$?
+set -e
+bench_pid=""
 if [[ -n "$energy_before" && -r "$ENERGY_FILE" && -r "${ENERGY_FILE%/energy_uj}/max_energy_range_uj" ]]; then
     energy_after="$(<"$ENERGY_FILE")"
     energy_range="$(<"${ENERGY_FILE%/energy_uj}/max_energy_range_uj")"
     energy_delta=$((energy_after - energy_before))
     (( energy_delta < 0 )) && energy_delta=$((energy_delta + energy_range))
-    echo "$energy_delta" > "$OUT/energy_uj.txt"
+    printf '{"energy_uj":%s}\n' "$energy_delta" > "$OUT/energy.json"
 fi
 
 echo "$OUT"
+exit "$status"

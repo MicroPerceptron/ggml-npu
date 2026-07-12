@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
-"""Summarize committed benchmark runs and flag the balanced Pareto frontier."""
+"""Read structured llama-bench JSONL runs and emit a JSONL Pareto frontier."""
 from __future__ import annotations
 
-import csv
-import re
+import json
 import sys
 from pathlib import Path
 
 
-def first(pattern: str, text: str, default: float = 0.0) -> float:
-    match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
-    return float(match.group(1)) if match else default
-
-
 def load(run: Path) -> dict[str, object]:
-    out = (run / "stdout.txt").read_text(errors="replace")
-    err = (run / "stderr.txt").read_text(errors="replace")
+    result_path = run / "result.jsonl"
+    if not result_path.exists():
+        raise ValueError("legacy text result (rerun with structured benchmark tooling)")
+    results = [
+        json.loads(line)
+        for line in result_path.read_text().splitlines()
+        if line.strip()
+    ]
     env = dict(
         line.split("=", 1)
         for line in (run / "environment.txt").read_text(errors="replace").splitlines()
         if "=" in line
     )
-    # llama-bench emits pp/tg rows ending in a throughput number; accept both its table and
-    # explicit "tokens/s" variants so historical result formats remain analyzable.
-    rates = [float(x) for x in re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*(?:±[^|]*)?\|\s*$", out, re.MULTILINE)]
-    pp = rates[-2] if len(rates) >= 2 else first(r"pp[^\n]*?([0-9]+(?:\.[0-9]+)?)\s*t/s", out)
-    tg = rates[-1] if rates else first(r"tg[^\n]*?([0-9]+(?:\.[0-9]+)?)\s*t/s", out)
-    rss_kb = first(r"Maximum resident set size \(kbytes\):\s*(\d+)", err)
-    energy_uj = float((run / "energy_uj.txt").read_text()) if (run / "energy_uj.txt").exists() else 0.0
-    prompt_tokens = int(env.get("prompt_tokens") or first(r"\s-p\s+(\d+)", err))
-    generated_tokens = int(env.get("generated_tokens") or first(r"\s-n\s+(\d+)", err))
+    pp_rows = [row for row in results if int(row.get("n_prompt", 0)) > 0 and int(row.get("n_gen", 0)) == 0]
+    tg_rows = [row for row in results if int(row.get("n_gen", 0)) > 0 and int(row.get("n_prompt", 0)) == 0]
+    pp = float(pp_rows[-1]["avg_ts"]) if pp_rows else 0.0
+    tg = float(tg_rows[-1]["avg_ts"]) if tg_rows else 0.0
+    process = json.loads((run / "process.json").read_text())
+    energy = json.loads((run / "energy.json").read_text()) if (run / "energy.json").exists() else {}
+    energy_uj = float(energy.get("energy_uj", 0))
+    prompt_tokens = int(env["prompt_tokens"])
+    generated_tokens = int(env["generated_tokens"])
     return {
         "run": run.name,
         "mode": env.get("mode", ""),
@@ -38,9 +38,13 @@ def load(run: Path) -> dict[str, object]:
         "generated_tokens": generated_tokens,
         "pp_tps": pp,
         "tg_tps": tg,
-        "rss_mib": rss_kb / 1024.0,
+        "rss_mib": float(process["max_rss_kib"]) / 1024.0,
         "energy_j": energy_uj / 1_000_000.0,
-        "joules_per_generated_token": energy_uj / 1_000_000.0 / 128.0 if energy_uj else 0.0,
+        "joules_per_generated_token": (
+            energy_uj / 1_000_000.0 / generated_tokens
+            if energy_uj and generated_tokens
+            else 0.0
+        ),
     }
 
 
@@ -72,14 +76,19 @@ def dominates(a: dict[str, object], b: dict[str, object]) -> bool:
 
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parent / "results")
-    runs = [load(p) for p in sorted(root.iterdir()) if p.is_dir() and (p / "environment.txt").exists()]
+    runs = []
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or not (path / "environment.txt").exists():
+            continue
+        try:
+            runs.append(load(path))
+        except (ValueError, OSError, KeyError) as error:
+            print(f"skip {path.name}: {error}", file=sys.stderr)
     runs = [row for row in runs if float(row["pp_tps"]) > 0 and float(row["tg_tps"]) > 0]
     for row in runs:
         row["pareto"] = not any(dominates(other, row) for other in runs if other is not row)
-    fields = list(runs[0]) if runs else ["run", "pareto"]
-    writer = csv.DictWriter(sys.stdout, fieldnames=fields)
-    writer.writeheader()
-    writer.writerows(runs)
+    for row in runs:
+        print(json.dumps(row, sort_keys=True, separators=(",", ":")))
     return 0
 
 

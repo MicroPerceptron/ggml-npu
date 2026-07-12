@@ -1,10 +1,11 @@
-//! Env-gated performance instrumentation for the NPU dispatch hot path ([`super::session::run`]).
+//! Env-gated runtime diagnostics for submit/wait/copy crash and placement investigations.
 //!
 //! Every offloaded op — a single matmul or a fused subgraph — funnels through one `session::run`,
 //! so timing its three phases (host stage-in of foreign inputs, the device submit+sync round-trip,
 //! host copy-out of foreign outputs) plus the owned-vs-bounced argument split gives an evidence
-//! breakdown of where a token's wall-clock actually goes: host memcpy, device latency, or
-//! orchestration. Enabled by `GGML_NPU_PROFILE` (any non-empty value); the accumulated report is
+//! breakdown of where a token's wall-clock went: host memcpy, device latency, or
+//! orchestration. This is not a benchmark statistics engine; Criterion and llama-bench own those
+//! roles. Enabled by `GGML_NPU_PROFILE` (any non-empty value); the accumulated report is
 //! written to stderr at process exit (via `atexit`), so it works for both the scratchpad harnesses
 //! and a real `llama-cli` run.
 //!
@@ -15,6 +16,8 @@
 use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+use crate::metrics::{DispatchMetrics, MetricEvent, MetricsSink};
 
 extern "C" {
     fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
@@ -121,16 +124,40 @@ pub(super) fn record(
     bytes_in: u64,
     bytes_out: u64,
 ) {
-    N_DISPATCH.fetch_add(1, Ordering::Relaxed);
-    T_STAGE_IN.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-    T_DEVICE.fetch_add(t2.saturating_sub(t1), Ordering::Relaxed);
-    T_SUBMIT.fetch_add(tmid.saturating_sub(t1), Ordering::Relaxed);
-    T_SYNC.fetch_add(t2.saturating_sub(tmid), Ordering::Relaxed);
-    T_COPY_OUT.fetch_add(t3.saturating_sub(t2), Ordering::Relaxed);
-    N_ARGS_OWNED.fetch_add(owned, Ordering::Relaxed);
-    N_ARGS_BOUNCED.fetch_add(bounced, Ordering::Relaxed);
-    BYTES_IN.fetch_add(bytes_in, Ordering::Relaxed);
-    BYTES_OUT.fetch_add(bytes_out, Ordering::Relaxed);
+    PROFILE_SINK.event(MetricEvent::Dispatch(DispatchMetrics {
+        stage_in_ns: t1.saturating_sub(t0),
+        submit_ns: tmid.saturating_sub(t1),
+        wait_ns: t2.saturating_sub(tmid),
+        copy_out_ns: t3.saturating_sub(t2),
+        owned_bindings: owned,
+        bounced_bindings: bounced,
+        bytes_in,
+        bytes_out,
+    }));
+}
+
+struct ProfileSink;
+static PROFILE_SINK: ProfileSink = ProfileSink;
+
+impl MetricsSink for ProfileSink {
+    fn event(&self, event: MetricEvent) {
+        let MetricEvent::Dispatch(metrics) = event else {
+            return;
+        };
+        N_DISPATCH.fetch_add(1, Ordering::Relaxed);
+        T_STAGE_IN.fetch_add(metrics.stage_in_ns, Ordering::Relaxed);
+        T_SUBMIT.fetch_add(metrics.submit_ns, Ordering::Relaxed);
+        T_SYNC.fetch_add(metrics.wait_ns, Ordering::Relaxed);
+        T_DEVICE.fetch_add(
+            metrics.submit_ns.saturating_add(metrics.wait_ns),
+            Ordering::Relaxed,
+        );
+        T_COPY_OUT.fetch_add(metrics.copy_out_ns, Ordering::Relaxed);
+        N_ARGS_OWNED.fetch_add(metrics.owned_bindings, Ordering::Relaxed);
+        N_ARGS_BOUNCED.fetch_add(metrics.bounced_bindings, Ordering::Relaxed);
+        BYTES_IN.fetch_add(metrics.bytes_in, Ordering::Relaxed);
+        BYTES_OUT.fetch_add(metrics.bytes_out, Ordering::Relaxed);
+    }
 }
 
 fn ms(ns: u64) -> f64 {

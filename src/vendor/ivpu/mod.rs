@@ -7,6 +7,8 @@
 
 mod cache;
 mod compile;
+#[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
+pub mod direct;
 mod graph;
 mod lower;
 mod profile;

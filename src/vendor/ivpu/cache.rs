@@ -1,4 +1,4 @@
-//! A lock-free, bounded-retention cache keyed by a `Copy + PartialEq` key.
+//! A lock-free, bounded-retention cache keyed by exact `PartialEq` semantics.
 //!
 //! Reads (the hot path) are a plain atomic-load traversal — no lock (per the atomics-over-locks
 //! rule). Entries are not removed yet (they hold process-lifetime artifacts), so there is
@@ -30,7 +30,7 @@ pub(super) struct Cache<K, V> {
     limit: usize,
 }
 
-impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
+impl<K: PartialEq, V: Copy> Cache<K, V> {
     pub(super) const fn new(limit: usize) -> Self {
         Cache {
             head: AtomicPtr::new(core::ptr::null_mut()),
@@ -40,11 +40,11 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
     }
 
     /// Lock-free lookup.
-    pub(super) fn get(&self, key: K) -> Option<V> {
+    pub(super) fn get(&self, key: &K) -> Option<V> {
         let mut p = self.head.load(Ordering::Acquire);
         while !p.is_null() {
             let node = unsafe { &*p };
-            if node.key == key {
+            if node.key.eq(key) {
                 return Some(node.val);
             }
             p = node.next.load(Ordering::Acquire);
@@ -55,7 +55,7 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
     /// Bounded insertion. Returns `None` without invoking `f` once the retention budget is full,
     /// allowing the caller to fall back instead of compiling another process-lifetime artifact.
     pub(super) fn try_get_or_insert_with(&self, key: K, f: impl FnOnce() -> V) -> Option<V> {
-        if let Some(v) = self.get(key) {
+        if let Some(v) = self.get(&key) {
             return Some(v);
         }
         let slot = self.count.fetch_add(1, Ordering::AcqRel);
@@ -70,7 +70,7 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
         }));
         let v = unsafe { (*node).val };
         loop {
-            if let Some(existing) = self.get(key) {
+            if let Some(existing) = self.get(unsafe { &(*node).key }) {
                 drop(unsafe { Box::from_raw(node) });
                 self.count.fetch_sub(1, Ordering::AcqRel);
                 return Some(existing);
@@ -89,4 +89,4 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
 }
 
 // SAFETY: shared across threads; all mutation is via atomics, keys/values are Copy + 'static.
-unsafe impl<K: Copy + Send, V: Copy + Send> Sync for Cache<K, V> {}
+unsafe impl<K: Send, V: Copy + Send> Sync for Cache<K, V> {}

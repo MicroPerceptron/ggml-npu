@@ -8,7 +8,7 @@
 //! Two caches, both lock-free:
 //! - **[`CONST_GRAPHS`] / [`SG_GRAPHS`]** — one Level Zero graph per distinct *program*, keyed by
 //!   the same semantic identity that names the compiled artifact: `(weight ptr, M)` for a single
-//!   baked matmul, the structural [`sg_signature`](super::compile::sg_signature) for a fused
+//!   baked matmul, the exact [`sg_semantic_key`](super::compile::sg_semantic_key) for a fused
 //!   subgraph. The native blob is a **transient** compile artifact: [`build_graph`] parses it into
 //!   the driver-owned graph (`pfnCreate` then `pfnAppendGraphInitialize`, once), after which the
 //!   blob bytes are **freed** — only the graph is kept resident, so a program's weights are never
@@ -85,7 +85,8 @@ unsafe impl Sync for NodeList {}
 /// weight pointers are stable (never recycled by gallocr, unlike activation buffers), so these keys
 /// are safe from the address-reuse aliasing that [`LISTS`] guards against.
 static CONST_GRAPHS: Cache<(u64, usize, i64), Option<&'static Graph>> = Cache::new(256);
-static SG_GRAPHS: Cache<(u64, u64), Option<&'static Graph>> = Cache::new(256);
+static SG_GRAPHS: Cache<(u64, crate::identity::ExactSemanticKey), Option<&'static Graph>> =
+    Cache::new(256);
 
 const MAX_INPUT_BINDINGS: usize = 64;
 const MAX_OUTPUT_BINDINGS: usize = 8;
@@ -397,15 +398,15 @@ pub(super) fn run_const(
 }
 
 /// Run a **fused subgraph** program: reuse (or build) its graph — keyed by the structural
-/// [`sg_signature`](super::compile::sg_signature), so weightless glue subgraphs share one graph
+/// [`sg_semantic_key`](super::compile::sg_semantic_key), so weightless glue subgraphs share one graph
 /// across layers and the transient blob is freed after build — then dispatch this instance.
 pub(super) fn run_subgraph(
-    sig: u64,
+    semantic_key: crate::identity::ExactSemanticKey,
     inputs: &[&Operand],
     outs: &[&Operand],
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
-    let key = (crate::backend::buffer_generation(), sig);
+    let key = (crate::backend::buffer_generation(), semantic_key);
     let Some(g) = SG_GRAPHS
         .try_get_or_insert_with(key, || build_from(compile))
         .flatten()

@@ -806,48 +806,60 @@ impl GraphIr {
         })
     }
 
-    /// Stable structural identity within a model-buffer generation. Data addresses distinguish
-    /// baked constants; runtime binding addresses intentionally do not.
-    pub fn signature(&self) -> u64 {
-        fn fold(mut h: u64, v: u64) -> u64 {
-            h ^= v;
-            h.wrapping_mul(0x0000_0100_0000_01b3)
-        }
-        let mut h = fold(0xcbf2_9ce4_8422_2325, self.generation);
-        for node in &self.nodes {
-            h = fold(h, node.op as u64);
-            h = fold(h, node.inputs.len() as u64);
-            for &i in &node.inputs {
-                h = fold(h, i as u64);
+    /// Exact in-process program identity. BLAKE3 is only a lookup prefilter; cache equality also
+    /// verifies the owned length-framed semantic bytes.
+    pub fn semantic_key(&self) -> crate::identity::ExactSemanticKey {
+        let mut key = crate::identity::ExactKeyBuilder::new(b"graph-ir-v2/program");
+        key.u64(b"generation", self.generation)
+            .u64(b"value-count", self.values.len() as u64)
+            .u64(b"node-count", self.nodes.len() as u64)
+            .u64(b"input-count", self.inputs.len() as u64)
+            .u64(b"output-count", self.outputs.len() as u64);
+        for (index, value) in self.values.iter().enumerate() {
+            key.u64(b"value-index", index as u64)
+                .u64(b"value-role", value.role as u64)
+                .u64(b"value-dtype", value.dtype as u64)
+                .u64(b"value-owned", u64::from(value.owned));
+            for dim in value.dims {
+                match dim {
+                    Dim::Static(value) => {
+                        key.u64(b"dim-kind", 0).i64(b"dim-static", value);
+                    }
+                    Dim::Bounded { min, max } => {
+                        key.u64(b"dim-kind", 1)
+                            .i64(b"dim-min", min)
+                            .i64(b"dim-max", max);
+                    }
+                }
             }
-            let out = &self.values[node.output as usize];
-            h = fold(h, out.dtype as u64);
-            for d in out.dims {
-                let v = match d {
-                    Dim::Static(x) => x as u64,
-                    Dim::Bounded { min, max } => (min as u64).rotate_left(17) ^ max as u64,
-                };
-                h = fold(h, v);
+            for stride in value.strides {
+                key.u64(b"stride", stride as u64);
             }
-            for stride in out.strides {
-                h = fold(h, stride as u64);
-            }
-        }
-        for &id in &self.inputs {
-            let t = &self.values[id as usize];
-            h = fold(h, id as u64);
-            h = fold(h, t.role as u64);
-        }
-        for (id, t) in self.values.iter().enumerate() {
-            if t.role == TensorRole::Constant {
-                h = fold(h, id as u64);
-                h = fold(h, t.data as u64);
+            if value.role == TensorRole::Constant {
+                key.u64(b"constant-address", value.data as u64);
             }
         }
-        for &id in &self.outputs {
-            h = fold(h, id as u64);
+        for (index, node) in self.nodes.iter().enumerate() {
+            key.u64(b"node-index", index as u64)
+                .u64(b"node-op", node.op as u64)
+                .u64(
+                    b"node-wire-op",
+                    Self::wire_op(node).map_or(u64::MAX, |wire| wire as u64),
+                )
+                .u64(b"node-input-count", node.inputs.len() as u64);
+            for &input in &node.inputs {
+                key.u64(b"node-input", input as u64);
+            }
+            key.u64(b"node-output", node.output as u64)
+                .field(b"node-op-params", &node.op_params);
         }
-        h
+        for &input in &self.inputs {
+            key.u64(b"graph-input", input as u64);
+        }
+        for &output in &self.outputs {
+            key.u64(b"graph-output", output as u64);
+        }
+        key.finish()
     }
 }
 
@@ -869,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_tracks_structure_shape_and_constant_identity() {
+    fn semantic_key_tracks_structure_shape_and_constant_identity() {
         let make = |constant, dim| GraphIr {
             generation: 7,
             values: vec![
@@ -888,22 +900,22 @@ mod tests {
             outputs: vec![2],
         };
         assert_eq!(
-            make(11, Dim::Static(4)).signature(),
-            make(11, Dim::Static(4)).signature()
+            make(11, Dim::Static(4)).semantic_key(),
+            make(11, Dim::Static(4)).semantic_key()
         );
         assert_ne!(
-            make(11, Dim::Static(4)).signature(),
-            make(12, Dim::Static(4)).signature()
+            make(11, Dim::Static(4)).semantic_key(),
+            make(12, Dim::Static(4)).semantic_key()
         );
         assert_ne!(
-            make(11, Dim::Static(4)).signature(),
-            make(11, Dim::Bounded { min: 1, max: 4 }).signature()
+            make(11, Dim::Static(4)).semantic_key(),
+            make(11, Dim::Bounded { min: 1, max: 4 }).semantic_key()
         );
         let mut alternate_output = make(11, Dim::Static(4));
         alternate_output.outputs = vec![1];
         assert_ne!(
-            make(11, Dim::Static(4)).signature(),
-            alternate_output.signature()
+            make(11, Dim::Static(4)).semantic_key(),
+            alternate_output.semantic_key()
         );
     }
 

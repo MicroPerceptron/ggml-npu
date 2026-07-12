@@ -16,12 +16,12 @@
 
 extern crate alloc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 extern crate std;
 
 use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::ffi::{c_int, c_void};
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "bench")))]
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 
@@ -41,10 +41,17 @@ mod backend;
 mod engine;
 mod graph_ir;
 mod hal;
+pub mod identity;
+pub mod metrics;
 mod ops;
+pub mod os;
 mod policy;
+pub mod runtime;
 mod trace;
 mod vendor;
+
+#[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
+pub use vendor::ivpu::direct as direct_ivpu;
 
 // ---------------------------------------------------------------------------
 // Host runtime glue. These symbols resolve from the host process at dlopen.
@@ -53,7 +60,7 @@ extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
     fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> c_int;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "bench")))]
     fn abort() -> !;
 }
 
@@ -108,7 +115,7 @@ unsafe impl Allocator for HostAlloc {
 #[global_allocator]
 static HOST_ALLOC: HostAlloc = HostAlloc;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "bench")))]
 #[panic_handler]
 fn on_panic(_info: &PanicInfo) -> ! {
     // no_std: no unwinding. Abort rather than let a panic cross the C ABI.
@@ -121,11 +128,11 @@ fn on_panic(_info: &PanicInfo) -> ! {
 // panic aborts in `on_panic` first). A leaner alternative is `-Zbuild-std` with
 // `panic_immediate_abort`, but that would force an explicit `--target` on every build.
 #[no_mangle]
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "bench")))]
 extern "C" fn rust_eh_personality() {}
 
 #[no_mangle]
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "bench")))]
 extern "C" fn _Unwind_Resume() -> ! {
     unsafe { abort() }
 }

@@ -1,6 +1,10 @@
-//! The universal NPU submission seam.
+//! Legacy five-verb compatibility façade.
 //!
-//! Half the project's value is that all three target NPUs collapse onto **five verbs**:
+//! The active Level Zero implementation still reaches this API. New runtimes should implement the
+//! explicit ownership and lifecycle contracts in [`crate::runtime::RuntimeHal`]; this trait remains
+//! while the current backend is adapted incrementally.
+//!
+//! The original model collapses target NPUs onto **five verbs**:
 //! `load`, `alloc`, `bind`, `submit`, `sync`. The submission surface unifies even though
 //! the compilers do not. One implementation per vendor under [`crate::vendor`], each
 //! keeping its own native handles via the associated types (no boxing on the hot path).
