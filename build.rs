@@ -7,6 +7,12 @@
 //!
 //! Linking: `ggml_*` helper symbols are left UNDEFINED and resolve at dlopen from the
 //! host. Set `GGML_LIB_DIR` to link a prebuilt ggml instead.
+//!
+//! Host-header feature detect (issue #13): stock `ggml-org/llama.cpp` lacks
+//! `GGML_BACKEND_DEVICE_TYPE_NPU` and the external-memory registry ABI. When absent we
+//! compile without inventing those symbols (default device class falls back to `ACCEL`;
+//! external-memory registry is omitted). MicroPerceptron/llama.cpp remains the production
+//! pin that enables native NPU typing + external memory.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -70,11 +76,37 @@ fn main() {
         .unwrap_or_else(|_| manifest.join("../llama.cpp"));
     let inc = ggml_root.join("ggml/include");
     let src = ggml_root.join("ggml/src");
+    let backend_h = inc.join("ggml-backend.h");
     assert!(
-        inc.join("ggml-backend.h").exists(),
+        backend_h.exists(),
         "ggml headers not found under {} — set GGML_DIR to your llama.cpp checkout",
         ggml_root.display()
     );
+    let backend_hdr = std::fs::read_to_string(&backend_h).unwrap_or_default();
+    let has_npu_device_type = backend_hdr.contains("GGML_BACKEND_DEVICE_TYPE_NPU");
+    let has_external_memory = backend_hdr.contains("ggml_backend_external_memory_i");
+    // Tell rustc which optional host-ABI pieces are present (see shell.rs / external.rs).
+    println!("cargo:rustc-check-cfg=cfg(ggml_has_npu_device_type)");
+    println!("cargo:rustc-check-cfg=cfg(ggml_has_external_memory)");
+    if has_npu_device_type {
+        println!("cargo:rustc-cfg=ggml_has_npu_device_type");
+    } else {
+        println!(
+            "cargo:warning=GGML_BACKEND_DEVICE_TYPE_NPU absent in {} — defaulting device \
+             class to ACCEL (issue #13); use MicroPerceptron/llama.cpp for native NPU typing",
+            backend_h.display()
+        );
+    }
+    if has_external_memory {
+        println!("cargo:rustc-cfg=ggml_has_external_memory");
+    } else {
+        println!(
+            "cargo:warning=ggml_backend_external_memory_i absent in {} — omitting external-\
+             memory registry extension (issue #13)",
+            backend_h.display()
+        );
+    }
+
     let level_zero_compat = env::var_os("CARGO_FEATURE_LEVEL_ZERO_COMPAT").is_some();
     // ze_graph_ext.h pulls in ze_api.h + ze_graph_profiling_ext.h (same dir), so one optional
     // bindgen pass yields the core Level Zero types plus the NPU graph extension.

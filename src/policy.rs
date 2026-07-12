@@ -1,7 +1,9 @@
-//! Conservative heterogeneous placement policy.
+//! Conservative heterogeneous placement / profitability policy.
 //!
-//! Pre-placed NPU tensors use the normal capability path. `offload_op` uses this cost floor before
-//! pulling work from CPU/GPU memory, avoiding per-op ping-pong for tiny latency-bound kernels.
+//! Capability (`supports_op` / vendor `node_support` / `graph_feasible`) answers “can we execute
+//! correctly?”. This module answers “is it worth pulling?” via [`should_pull`] (`offload_op`).
+//! [`supports_region`] is region-expansion eligibility for fusible/metadata neighborhoods — it must
+//! **not** gate `supports_op`, or the backend over/under-claims relative to the compiler (#8).
 
 use core::ffi::CStr;
 
@@ -170,9 +172,10 @@ fn region_supported(
     }
 }
 
-/// Capability placement for scheduler expansion. Cheap metadata/elementwise work may extend an
-/// eligible accelerator region, but cannot cross a routed-MoE CPU boundary or anchor a split by
-/// itself. This is shape/graph based and deliberately contains no model or tensor-name checks.
+/// Region-expansion eligibility (fusible/metadata near an anchor), not binary capability.
+/// Cheap metadata/elementwise work may extend an eligible accelerator region, but cannot cross a
+/// routed-MoE CPU boundary or anchor a split by itself. Shape/graph based; no tensor-name checks.
+/// Callers: profitability / neighborhood logic only — never `supports_op` (#8).
 pub(crate) unsafe fn supports_region(node: *const ggml_tensor, spec: OpSpec) -> bool {
     if node.is_null() {
         return false;
@@ -277,6 +280,12 @@ mod tests {
         spec.placement = placement;
         spec.traits.moe = moe;
         spec
+    }
+
+    #[test]
+    fn supports_region_rejects_null_and_stays_off_supports_op_path() {
+        // supports_region is region-expansion only; engine::supports must not call it (#8).
+        assert!(!unsafe { supports_region(core::ptr::null(), spec(PlacementClass::Anchor, false)) });
     }
 
     #[test]
