@@ -66,6 +66,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `docs/compiler-migration-plan.md`, `src/runtime/artifact.rs`, `src/vendor/ivpu/session_direct.rs`.
   - Verified: 2026-07-12
 
+- `ADR/rust-first-implementation` — Prefer new logic in Rust (including graph/scheduler analysis and
+  policy). Interop with ggml/llama.cpp is a thin C ABI only; do not grow C/C++ for algorithms that
+  can live in Rust. Fat LTO (`Cargo.toml` `[profile.release]`) amortizes FFI cost; Rust safety
+  remains the priority. OpenVINO/shim C++ stays only where the vendor compiler API forces it.
+  - Rationale: Keep algorithms and ownership in the `no_std` Rust cdylib; confine C++ to the
+    OpenVINO compile shim rather than duplicating policy across the FFI boundary.
+  - Evidence: `Cargo.toml`, `docs/restructure-decision.md`, `docs/architecture-boundaries.md`,
+    `docs/compiler-migration-plan.md`, `.cursor/rules/rust-first-implementation.mdc`, `shim/`.
+  - Verified: 2026-07-12
+
 ## Verified findings
 
 - `FINDING/direct-ivpu-tiny-execution` — Lunar Lake device `0x643e` revision 4 executed the same 45,192-byte vector-add artifact twice through direct IVPU. All 32 FP32 outputs were bit-identical to the Level Zero oracle; waits were bounded and successful cleanup restored the observed FD and device-memory baselines.
