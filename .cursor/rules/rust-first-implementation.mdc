@@ -1,0 +1,23 @@
+---
+description: Prefer Rust for new logic; thin C ABI to ggml; OpenVINO C++ only when forced
+alwaysApply: true
+---
+
+# Rust-first implementation
+
+Prefer implementing new logic in **Rust**, including graph/scheduler analysis and policy.
+
+## Boundaries
+
+- Interop with ggml / llama.cpp via a **thin C ABI only**. Do not grow C/C++ for algorithms that
+  can live in Rust.
+- Release builds rely on **fat LTO** (`Cargo.toml` `[profile.release]`) to keep FFI cheap; that is
+  not a reason to push logic into C/C++. Rust safety and ownership remain the priority.
+- Keep **OpenVINO / shim C++** only where the vendor compiler API forces it (`shim/`). Prefer
+  opaque artifacts and Rust-side orchestration everywhere else.
+
+## Examples
+
+- Graph partitioning, offload policy, capability probes → Rust (`src/policy.rs`, `src/engine.rs`, …)
+- ggml backend vtable / `dlopen` surface → thin C ABI wrappers only
+- OpenVINO model compile entrypoints → shim C++ only as required by the vendor API
