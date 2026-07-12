@@ -5,6 +5,7 @@
 //! without linking a logging framework into this `no_std` cdylib.
 
 use alloc::format;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ffi::*;
 use crate::host::{ConfigService, DiagnosticService, HostEnvironment};
@@ -19,6 +20,14 @@ fn emit(line: &str) {
     crate::host::builtin()
         .diagnostics()
         .write_stderr(line.as_bytes());
+}
+
+/// Report the production quant-transcode kernel once when normal tracing is enabled.
+pub(crate) fn quant_kernel(name: &str) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if enabled() && !REPORTED.swap(true, Ordering::Relaxed) {
+        emit(&format!("[ggml-npu trace] quant-kernel={name}\n"));
+    }
 }
 
 /// Emit the shape/stride/storage summary of a scheduler split before recognition.
