@@ -110,6 +110,7 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 - `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV and FlashAttention candidates; the default keeps
   attention on GPU while allowing constant-weight/QKV projections.
 - `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path.
+  `GGML_NPU_MOE=0` or unset keeps MoE routing unclaimed (presence of `=0` must not enable).
 - `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
 - `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
   any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.

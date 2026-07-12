@@ -151,6 +151,15 @@ pub(crate) trait ConfigService {
         self.value(name)
             .is_some_and(|value| !value.to_bytes().is_empty())
     }
+
+    /// Opt-in flag: enabled only when the value is exactly `1`.
+    ///
+    /// Presence alone is not enough — harnesses and docs use `VAR=0` to mean off
+    /// (`GGML_NPU_MOE=0` in targeted smokes). Matching `is_set` would falsely enable.
+    fn is_opt_in_one(&self, name: &CStr) -> bool {
+        self.value(name)
+            .is_some_and(|value| value.to_bytes() == b"1")
+    }
 }
 
 pub(crate) type ExitCallback = extern "C" fn(*mut c_void);

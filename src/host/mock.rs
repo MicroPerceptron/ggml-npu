@@ -440,6 +440,8 @@ mod tests {
         assert_eq!(host.artifacts().load(c"ignored", 8).unwrap(), b"artifact");
         assert!(host.config().is_nonempty(c"SETTING"));
         assert!(!host.config().is_set(c"MISSING"));
+        assert!(!host.config().is_opt_in_one(c"SETTING"));
+        assert!(!host.config().is_opt_in_one(c"MISSING"));
         host.diagnostics().write_stderr(b"abc");
         assert!(host
             .diagnostics()
@@ -450,6 +452,30 @@ mod tests {
             .libraries()
             .open(c"missing", LibraryVisibility::Local)
             .is_err());
+    }
+
+    #[test]
+    fn opt_in_one_requires_exact_one_not_mere_presence() {
+        // Harness exports GGML_NPU_MOE=0 to disable; presence must not enable (#5/#11).
+        let zero = MockConfig {
+            name: c"GGML_NPU_MOE",
+            value: c"0",
+        };
+        assert!(zero.is_set(c"GGML_NPU_MOE"));
+        assert!(!zero.is_opt_in_one(c"GGML_NPU_MOE"));
+
+        let one = MockConfig {
+            name: c"GGML_NPU_MOE",
+            value: c"1",
+        };
+        assert!(one.is_opt_in_one(c"GGML_NPU_MOE"));
+
+        let empty = MockConfig {
+            name: c"GGML_NPU_MOE",
+            value: c"",
+        };
+        assert!(empty.is_set(c"GGML_NPU_MOE"));
+        assert!(!empty.is_opt_in_one(c"GGML_NPU_MOE"));
     }
 
     #[test]

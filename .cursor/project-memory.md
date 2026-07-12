@@ -15,12 +15,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   attributable `claimed_execution_failure` traces). Never silent success after NPU compile/exec
   failure; bench baselines reject `npu-unproven`. Layout-only regions **inside** a claimed split that
   also has lowerable compute are host-realized as `layout_glue_host` rather than rejecting the whole
-  claimed graph.
+  claimed graph. MoE opt-in is exact `GGML_NPU_MOE=1` (`ConfigService::is_opt_in_one`); `=0` or unset
+  must unclaim MoE-tagged ops (not `is_set`, which falsely enables under harness `MOE=0`).
   - Rationale: Over-claim vs compile rejection made scheduler placement and tok/s attribution
     unreliable (#8); claim-then-abort on lone View aborted pp16 warmup (#5, PR #35); layout-only
-    semantic regions inside claimed multi-op splits aborted warmup after PR #35/#36 (#5/#8).
+    semantic regions inside claimed multi-op splits aborted warmup after PR #35/#36 (#5/#8);
+    `GGML_NPU_MOE=0` presence falsely claimed MoE routing and corrupted expert ids (#5/#11).
   - Evidence: `src/vendor/ivpu/compile.rs`, `src/engine.rs`, `src/policy.rs`, `src/backend/shell.rs`,
-    `.cursor/rules/npu-claim-fallback.mdc`, `docs/coverage-gates.md`, GitHub issues #5/#8, PRs #32/#35.
+    `src/host/mod.rs`, `.cursor/rules/npu-claim-fallback.mdc`, `docs/coverage-gates.md`, GitHub
+    issues #5/#8/#11, PRs #32/#35/#37.
   - Verified: 2026-07-12
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
@@ -104,9 +107,14 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/vendor/ivpu/compile.rs`, `benchmarks/results/develop-856b43d-targeted-pp16-debug/`, GitHub issues #5/#8, PR #35.
   - Verified: 2026-07-12
 
-- `FINDING/layout-only-semantic-region-failclosed` — After PR #35/#36, LFM targeted pp16/pp128 r=1 on develop `dfbc35a` aborted warmup (`res=-3`) when a claimed multi-op split partitioned into layout-only semantic regions; `graph_feasible` rejected them and fail-closed returned. Fix: classify layout-only only when **all** nodes are layout metadata; inside a claimed split that also has lowerable compute, schedule those regions as `PartitionReason::LayoutGlueHost` and host-realize (aliasing View/Reshape/Transpose/Permute no-op; Cont copies) instead of asking OpenVINO to compile them alone. Standalone layout-only splits still refuse (prefer unclaim).
+- `FINDING/layout-only-semantic-region-failclosed` — After PR #35/#36, LFM targeted pp16/pp128 r=1 on develop `dfbc35a` aborted warmup (`res=-3`) when a claimed multi-op split partitioned into layout-only semantic regions; `graph_feasible` rejected them and fail-closed returned. Fix (PR #37 @ `5ccffe4`): classify layout-only only when **all** nodes are layout metadata; inside a claimed split that also has lowerable compute, schedule those regions as `PartitionReason::LayoutGlueHost` and host-realize (aliasing View/Reshape/Transpose/Permute no-op; Cont copies) instead of asking OpenVINO to compile them alone. Standalone layout-only splits still refuse (prefer unclaim). Post-fix pp16 smoke shows `layout_glue_host` working; warmup then hits a separate MoE expert-id assert (`FINDING/moe-expert-id-assert-after-layout-glue`).
   - Scope: Execute/partition path for claimed graphs; does not reopen soft-fallback for failed NPU compute compile/exec.
-  - Evidence: `src/engine.rs`, `src/graph.rs`, `src/vendor/ivpu/compile.rs`, `.cursor/rules/npu-claim-fallback.mdc`, `benchmarks/results/develop-dfbc35a-targeted-pp16-sharing-on/`, `benchmarks/results/develop-dfbc35a-targeted-pp128-sharing-on/`, issues #5/#8.
+  - Evidence: `src/engine.rs`, `src/graph.rs`, `src/vendor/ivpu/compile.rs`, `.cursor/rules/npu-claim-fallback.mdc`, `benchmarks/results/develop-dfbc35a-targeted-pp16-sharing-on/`, `benchmarks/results/develop-dfbc35a-targeted-pp128-sharing-on/`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/`, issues #5/#8, PR #37.
+  - Verified: 2026-07-12
+
+- `FINDING/moe-expert-id-assert-after-layout-glue` — After PR #37 cleared layout-only region rejects, develop `5ccffe4` pp16 r=1 sharing-on smoke aborted warmup (exit 134) with `GGML_ASSERT(id >= 0 && id < n_expert)` in llama.cpp `ggml-backend.cpp` after NPU claimed MoE routing (Argsort/GetRows/SumRows/Sigmoid) despite `npu_moe=0`. Root cause: `moe_enabled()` used `ConfigService::is_set`, and `_run_targeted_smoke.sh` always exports `GGML_NPU_MOE=0`, so presence alone falsely enabled MoE; bad expert ids then reached `MUL_MAT_ID` on another backend. Fix: MoE (and shared `is_opt_in_one`) requires exact value `1`; `=0`/unset unclaims MoE-tagged ops.
+  - Scope: Env-gate honesty for MoE claim policy under harness `GGML_NPU_MOE=0`; not a claim that `GGML_NPU_MOE=1` routing is correct on NPU.
+  - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `src/policy.rs`, `benchmarks/results/_run_targeted_smoke.sh`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/`, issues #5/#11.
   - Verified: 2026-07-12
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
@@ -144,6 +152,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Rejected alternatives
+
+- `REJECTED/moe-enabled-via-is-set` — Do not treat `ConfigService::is_set("GGML_NPU_MOE")` as MoE
+  enable. Targeted smokes and docs export `GGML_NPU_MOE=0` to mean off; presence-only gating falsely
+  claimed Argsort/Sigmoid/SumRows/MatMulId, corrupted expert ids, and aborted on
+  `GGML_ASSERT(id >= 0 && id < n_expert)`.
+  - Rationale: Opt-in flags that document `=1` must use exact-value checks (`is_opt_in_one`), matching
+    `GGML_NPU_ATTENTION=full` style, not mere env presence.
+  - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `benchmarks/results/_run_targeted_smoke.sh`,
+    `FINDING/moe-expert-id-assert-after-layout-glue`, issues #5/#11.
+  - Verified: 2026-07-12
 
 - `REJECTED/invent-npu-device-type-vs-upstream` — Do not define a local `GGML_BACKEND_DEVICE_TYPE_NPU` (or fake external-memory ABI) against stock `ggml-org/llama.cpp` headers to green CI.
   - Rationale: A backend-local enum value the host scheduler does not understand would mis-report device class; use ACCEL fallback + omit external memory when headers lack the ABI, and MicroPerceptron/llama.cpp when native NPU typing is required (issue #13). Pinning CI to the private MicroPerceptron fork was also rejected for Actions: anonymous HTTPS clone fails without credentials.
