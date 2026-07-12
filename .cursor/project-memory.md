@@ -13,9 +13,12 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   ggml places on Vulkan/BLAS/CPU — preferred for layout-only Metadata glue OpenVINO cannot lower
   alone) vs **fail-closed** (claimed split that cannot complete returns `GGML_STATUS_FAILED` with
   attributable `claimed_execution_failure` traces). Never silent success after NPU compile/exec
-  failure; bench baselines reject `npu-unproven`.
+  failure; bench baselines reject `npu-unproven`. Layout-only regions **inside** a claimed split that
+  also has lowerable compute are host-realized as `layout_glue_host` rather than rejecting the whole
+  claimed graph.
   - Rationale: Over-claim vs compile rejection made scheduler placement and tok/s attribution
-    unreliable (#8); claim-then-abort on lone View aborted pp16 warmup (#5, PR #35).
+    unreliable (#8); claim-then-abort on lone View aborted pp16 warmup (#5, PR #35); layout-only
+    semantic regions inside claimed multi-op splits aborted warmup after PR #35/#36 (#5/#8).
   - Evidence: `src/vendor/ivpu/compile.rs`, `src/engine.rs`, `src/policy.rs`, `src/backend/shell.rs`,
     `.cursor/rules/npu-claim-fallback.mdc`, `docs/coverage-gates.md`, GitHub issues #5/#8, PRs #32/#35.
   - Verified: 2026-07-12
@@ -99,6 +102,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 - `FINDING/layout-only-overclaim-warmup-abort` — After fail-closed (#32), develop `856b43d` pp16 warmup aborted when a disconnected 1-node `View` partition was claimed then OpenVINO returned `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE` (`GGML_STATUS_FAILED`); an adjacent 7-node partition had already run direct-IVPU at 100% no-copy. Fix: reject Metadata/`traits.metadata` in `graph_node_feasible` and layout-only graphs in `graph_feasible` while keeping layout ops on the fused wire allowlist (PR #35).
   - Scope: Standalone layout-only partitions (View/Reshape/Cont/Transpose/Permute); not a claim that fused layout+compute is proven on every LFM split.
   - Evidence: `src/vendor/ivpu/compile.rs`, `benchmarks/results/develop-856b43d-targeted-pp16-debug/`, GitHub issues #5/#8, PR #35.
+  - Verified: 2026-07-12
+
+- `FINDING/layout-only-semantic-region-failclosed` — After PR #35/#36, LFM targeted pp16/pp128 r=1 on develop `dfbc35a` aborted warmup (`res=-3`) when a claimed multi-op split partitioned into layout-only semantic regions; `graph_feasible` rejected them and fail-closed returned. Fix: classify layout-only only when **all** nodes are layout metadata; inside a claimed split that also has lowerable compute, schedule those regions as `PartitionReason::LayoutGlueHost` and host-realize (aliasing View/Reshape/Transpose/Permute no-op; Cont copies) instead of asking OpenVINO to compile them alone. Standalone layout-only splits still refuse (prefer unclaim).
+  - Scope: Execute/partition path for claimed graphs; does not reopen soft-fallback for failed NPU compute compile/exec.
+  - Evidence: `src/engine.rs`, `src/graph.rs`, `src/vendor/ivpu/compile.rs`, `.cursor/rules/npu-claim-fallback.mdc`, `benchmarks/results/develop-dfbc35a-targeted-pp16-sharing-on/`, `benchmarks/results/develop-dfbc35a-targeted-pp128-sharing-on/`, issues #5/#8.
   - Verified: 2026-07-12
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
@@ -187,8 +195,10 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   unclaim: harness summaries that distinguish proven direct-IVPU vs scheduler/Vulkan fallback;
   broader mismatch regression tests (tensor-level supports_op vs compile); quant canonical-fallback
   attribution clarity. Landed slices: shared wire/env gates + fail-loud claimed execution (PR #32);
-  Metadata layout-only unclaim (PR #35); agent rule + hermetic contract tests
-  (`ADR/capability-contract-fail-closed`, `.cursor/rules/npu-claim-fallback.mdc`).
+  Metadata layout-only unclaim (PR #35); agent rule + hermetic contract tests (PR #36,
+  `ADR/capability-contract-fail-closed`, `.cursor/rules/npu-claim-fallback.mdc`); host-realize
+  layout-only semantic regions inside claimed multi-op splits
+  (`FINDING/layout-only-semantic-region-failclosed`).
   - Acceptance: Bench summaries cannot present fallback tok/s as NPU proof; automated tests cover
     supports_op/compile disagreement cases; issue #8 acceptance criteria met with evidence.
   - Evidence: `benchmarks/run_lfm_baseline.sh`, `src/engine.rs`, `src/vendor/ivpu/compile.rs`,
@@ -198,7 +208,7 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). Next: short attribution once swap is calm; safe async overlap only after per-submission completion objects.
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). Next: short attribution once swap is calm; safe async overlap only after per-submission completion objects.
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, with attribution hooks and tok/s movement toward Vulkan under the locked harness.
   - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25.
 

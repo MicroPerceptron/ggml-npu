@@ -21,13 +21,16 @@ Use this for:
 
 Layout ops may remain on `wire_op_compile_supported` for **fused** graphs next to real compute;
 standalone layout-only graphs must fail `graph_feasible` / `graph_node_feasible` up front
-(PR #35, issues #5/#8).
+(PR #35, issues #5/#8). When a **claimed multi-op split** still partitions into a layout-only
+semantic region beside real compute, host-realize that region as `layout_glue_host` — do not
+reject the whole claimed graph as layout-only.
 
 ## 2. Fail-closed after claim
 
 Only when we asserted NPU would execute (`supports_op` true and the split was assigned) and truly
 cannot complete: return `GGML_STATUS_FAILED` / `engine::compute → false` with attributable
 `claimed_execution_failure` traces. Never soft-success, skip, or “leave outputs untouched.”
+Host-realized `layout_glue_host` beside compute is successful glue execution, not a soft fallback.
 
 ## 3. Never silent success after NPU compile/exec failure
 
@@ -45,5 +48,6 @@ claimed splits must all surface as failure. ggml may reschedule elsewhere only a
 - Keep `supports_op` (`graph_node_feasible`) and `graph_feasible` on the **same** wire/env/readiness
   contract; `policy::supports_region` / `should_pull` are profitability only — never gate claim.
 - Prefer unclaim over claim-then-abort for layout-only / known-unlowerable partitions.
-- Add hermetic tests that lock: layout-only alone → not feasible; claimed runtime failure → not
-  success. Update `tests/coverage_matrix.csv` proofs when compile claims change (#12).
+- Add hermetic tests that lock: layout-only alone → not feasible; layout glue inside a claimed
+  compute split → host-realized; claimed runtime failure → not success. Update
+  `tests/coverage_matrix.csv` proofs when compile claims change (#12).
