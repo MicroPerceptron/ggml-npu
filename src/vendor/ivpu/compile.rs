@@ -1873,6 +1873,47 @@ mod tests {
     }
 
     #[test]
+    fn rope_is_admitted_without_attention_full_while_softmax_stays_gated() {
+        // Prefill QKV continuity (#10): RoPE (LFM NEOX mode 2) must pass env_policy without
+        // GGML_NPU_ATTENTION=full; SoftMax/FA remain gated so we do not vanity-claim the core.
+        use crate::graph::{Node, OpRegistry, OperationContract, OP_PARAM_BYTES};
+        let mut rope_params = [0u8; OP_PARAM_BYTES];
+        rope_params[8..12].copy_from_slice(&2i32.to_ne_bytes()); // NEOX
+        let rope = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_ROPE,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: rope_params,
+        })
+        .expect("NEOX RoPE must decode");
+        assert!(!rope.traits.attention);
+        assert!(env_policy_admits(&rope, false));
+
+        let softmax = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_SOFT_MAX,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SoftMax must decode");
+        assert!(softmax.traits.attention);
+        assert!(!env_policy_admits(&softmax, false));
+
+        let flash = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_FLASH_ATTN_EXT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1, 2],
+            output: 3,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("FlashAttention must decode");
+        assert!(flash.traits.attention);
+        assert!(!env_policy_admits(&flash, false));
+    }
+
+    #[test]
     fn layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted() {
         // Layout ops stay on the wire allowlist for fused ShortConv/FFN regions, but a disconnected
         // layout-only partition must not be claimed — OpenVINO returns UNSUPPORTED_FEATURE (#5/#8).

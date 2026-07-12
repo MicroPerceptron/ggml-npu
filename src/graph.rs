@@ -345,13 +345,12 @@ fn traits_for(wire: WireOp) -> OpTraits {
             WireOp::Reshape | WireOp::View | WireOp::Cont | WireOp::Transpose | WireOp::Permute
         ),
         stateful: matches!(wire, WireOp::SsmConv | WireOp::SetRows),
-        // SetRows is mutable-state scatter (ShortConv / recurrent caches), not attention.
-        // Gating it behind GGML_NPU_ATTENTION=full forced ShortConv state-write regions onto
-        // CPU islands (#9). Attention KV writes remain optional via SoftMax/FA/Rope policy.
-        attention: matches!(
-            wire,
-            WireOp::Rope | WireOp::SoftMax | WireOp::Permute | WireOp::FlashAttention
-        ),
+        // SoftMax / FlashAttention stay behind GGML_NPU_ATTENTION=full (runtime KQ/KQV core).
+        // RoPE is QKV-adjacent position encoding (LFM NEOX mode 2 / normal mode 0); gating it
+        // with SoftMax/FA forced prefill QKV-proj islands onto CPU/GPU (#10). Permute is layout
+        // metadata like Reshape/View — fused-only via placement, not an attention-core gate.
+        // SetRows is mutable-state scatter (ShortConv / KV cache), not SoftMax/FA (#9/#10).
+        attention: matches!(wire, WireOp::SoftMax | WireOp::FlashAttention),
         moe: matches!(
             wire,
             WireOp::Argsort | WireOp::MatMulId | WireOp::Sigmoid | WireOp::SumRows
@@ -1236,6 +1235,35 @@ mod tests {
             decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3)
                 .map(|spec| (spec.wire, spec.traits.stateful, spec.traits.attention)),
             Ok((WireOp::SetRows, true, false))
+        );
+        // LFM uses NEOX (mode 2); normal (mode 0) remains admitted. Other modes stay rejected.
+        assert!(decode_spec(GGML_OP_ROPE, 0, 0.0, 0, 2).is_ok());
+        assert!(decode_spec(GGML_OP_ROPE, 0, 0.0, 2, 2).is_ok());
+        assert_eq!(
+            decode_spec(GGML_OP_ROPE, 0, 0.0, 8, 2),
+            Err(OpReject::UnsupportedVariant)
+        );
+    }
+
+    #[test]
+    fn prefill_qkv_rope_and_layout_are_not_attention_gated() {
+        // RoPE + Permute must not require GGML_NPU_ATTENTION=full; SoftMax/FA still do (#10).
+        assert_eq!(
+            decode_spec(GGML_OP_ROPE, 0, 0.0, 2, 2).map(|s| (s.wire, s.traits.attention)),
+            Ok((WireOp::Rope, false))
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_PERMUTE, 0, 0.0, 0, 1).map(|s| (s.wire, s.traits.attention)),
+            Ok((WireOp::Permute, false))
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 0.0, 0, 1).map(|s| (s.wire, s.traits.attention)),
+            Ok((WireOp::SoftMax, true))
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_FLASH_ATTN_EXT, 0, 0.0, 0, 3)
+                .map(|s| (s.wire, s.traits.attention)),
+            Ok((WireOp::FlashAttention, true))
         );
     }
 
