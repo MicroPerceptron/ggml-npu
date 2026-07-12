@@ -27,18 +27,36 @@ enum { IR_INPUT = 0, IR_CONSTANT = 1, IR_STATE = 2, IR_INTERMEDIATE = 3, IR_OUTP
        IR_SSM_CONV = 12, IR_ROPE = 13, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
        IR_FLASH_ATTN = 22, IR_SET_ROWS = 26,
        IR_MAX_INPUTS = 16 };
+/* Matches shim `npu_constant_desc` / Rust `ConstantAbi` for compile_graph_v3. */
+struct ir_constant {
+    int32_t numeric_kind, bit_width, storage_bits, signedness;
+    int32_t block_elems, group_elems, packing;
+    int32_t scale_encoding, offset_encoding, exactness;
+    const uint8_t * values; size_t values_len;
+    const uint8_t * scale_base; size_t scale_base_len;
+    const uint8_t * scale_factor; size_t scale_factor_len;
+    const uint8_t * offset_base; size_t offset_base_len;
+    const uint8_t * offset_factor; size_t offset_factor_len;
+};
 struct ir_tensor {
     int32_t role, dtype;
     int64_t ne[4];
-    int32_t bits, group;
-    const uint8_t * weight; size_t weight_len;
-    const uint8_t * scales; size_t scales_len;
-    const uint8_t * zeros;  size_t zeros_len;
+    struct ir_constant constant;
 };
 struct ir_node {
     int32_t op, n_inputs, inputs[IR_MAX_INPUTS], output;
     uint8_t params[64];
 };
+static struct ir_constant ir_f16_constant(const uint16_t * values, size_t n_values) {
+    struct ir_constant c;
+    memset(&c, 0, sizeof(c));
+    c.numeric_kind = 0; /* NPU_NUMERIC_FLOAT */
+    c.bit_width = 16;
+    c.storage_bits = 16;
+    c.values = (const uint8_t *)values;
+    c.values_len = n_values * sizeof(uint16_t);
+    return c;
+}
 typedef int (*compile_fn)(int32_t, const struct ir_tensor *, int32_t, const struct ir_node *,
         int32_t, const uint32_t *, int32_t, const uint32_t *, const char *, uint8_t **, size_t *);
 typedef void (*free_fn)(uint8_t *);
@@ -61,7 +79,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "backend dlopen: %s\n", dlerror());
         return 1;
     }
-    compile_fn compile = (compile_fn)dlsym(shim, "ggml_npu_ov_compile_graph");
+    compile_fn compile = (compile_fn)dlsym(shim, "ggml_npu_ov_compile_graph_v3");
     free_fn free_blob = (free_fn)dlsym(shim, "ggml_npu_ov_free");
     run_fn run = (run_fn)dlsym(backend, "ggml_npu_ivpu_selftest");
     run_multi_fn run_multi = (run_multi_fn)dlsym(backend, "ggml_npu_ivpu_selftest_multi");
@@ -74,8 +92,8 @@ int main(int argc, char ** argv) {
     const uint16_t kernels[] = {0x3c00, 0x3c00, 0x3c00, 0x3800, 0x0000, 0xb800};
     struct ir_tensor tensors[3] = {
         {.role=IR_INPUT, .dtype=0, .ne={4,2,1,1}},
-        {.role=IR_CONSTANT, .dtype=0, .ne={3,2,1,1}, .bits=16,
-         .weight=(const uint8_t *)kernels, .weight_len=sizeof(kernels)},
+        {.role=IR_CONSTANT, .dtype=0, .ne={3,2,1,1},
+         .constant=ir_f16_constant(kernels, 6)},
         {.role=IR_OUTPUT, .dtype=0, .ne={2,2,1,1}},
     };
     struct ir_node node = {.op=IR_SSM_CONV, .n_inputs=2, .inputs={0,1}, .output=2};
@@ -83,7 +101,7 @@ int main(int argc, char ** argv) {
     uint8_t * blob = NULL;
     size_t blob_len = 0;
     int rc = compile(3, tensors, 1, &node, 1, inputs, 1, outputs,
-                     "ir2-shortconv-e2e-v1", &blob, &blob_len);
+                     "ir3-shortconv-e2e-v1", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "compile failed: %d\n", rc);
         return 1;
@@ -119,7 +137,7 @@ int main(int argc, char ** argv) {
     uint32_t gather_inputs[] = {0,1}, gather_outputs[] = {2};
     blob = NULL; blob_len = 0;
     rc = compile(3, gather_tensors, 1, &gather_node, 2, gather_inputs, 1, gather_outputs,
-                 "ir2-batched-get-rows-e2e-v1", &blob, &blob_len);
+                 "ir3-batched-get-rows-e2e-v1", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "batched GetRows compile failed: %d\n", rc);
         return 1;
@@ -154,8 +172,8 @@ int main(int argc, char ** argv) {
     }
     struct ir_tensor moe_tensors[5] = {
         {.role=IR_INPUT, .dtype=0, .ne={4,1,1,1}},
-        {.role=IR_CONSTANT, .dtype=0, .ne={4,2,4,1}, .bits=16,
-         .weight=(const uint8_t *)experts, .weight_len=sizeof(experts)},
+        {.role=IR_CONSTANT, .dtype=0, .ne={4,2,4,1},
+         .constant=ir_f16_constant(experts, 4 * 2 * 4)},
         {.role=IR_INPUT, .dtype=0, .ne={4,1,1,1}},
         {.role=IR_INTERMEDIATE, .dtype=1, .ne={2,1,1,1}},
         {.role=IR_OUTPUT, .dtype=0, .ne={2,2,1,1}},
@@ -167,7 +185,7 @@ int main(int argc, char ** argv) {
     uint32_t moe_inputs[] = {0,2}, moe_outputs[] = {4};
     blob = NULL; blob_len = 0;
     rc = compile(5, moe_tensors, 2, moe_nodes, 2, moe_inputs, 1, moe_outputs,
-                 "ir2-moe-routing-e2e-v2", &blob, &blob_len);
+                 "ir3-moe-routing-e2e-v2", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "MoE Gather/MatMul compile failed: %d\n", rc);
         return 1;
@@ -204,7 +222,7 @@ int main(int argc, char ** argv) {
     uint32_t state_inputs[] = {0,1,2}, state_outputs[] = {3};
     blob = NULL; blob_len = 0;
     rc = compile(4, state_tensors, 1, &state_node, 3, state_inputs, 1, state_outputs,
-                 "ir2-set-rows-state-v1", &blob, &blob_len);
+                 "ir3-set-rows-state-v1", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "mutable SetRows compile failed: %d\n", rc);
         return 1;
@@ -247,6 +265,50 @@ int main(int argc, char ** argv) {
     }
     free_blob(blob);
 
+    /* Mutable-state gather → write round-trip (GET_ROWS of state, SET_ROWS of gathered rows). */
+    {
+        struct ir_tensor gw_tensors[5] = {
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+            {.role=IR_INPUT, .dtype=1, .ne={2,1,1,1}},
+            {.role=IR_INTERMEDIATE, .dtype=0, .ne={2,2,1,1}},
+            {.role=IR_INPUT, .dtype=2, .ne={2,1,1,1}},
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+        };
+        struct ir_node gw_nodes[2] = {
+            {.op=IR_GET_ROWS, .n_inputs=2, .inputs={0,1}, .output=2},
+            {.op=IR_SET_ROWS, .n_inputs=3, .inputs={2,3,0}, .output=4},
+        };
+        uint32_t gw_inputs[] = {0,1,3}, gw_outputs[] = {4};
+        blob = NULL; blob_len = 0;
+        rc = compile(5, gw_tensors, 2, gw_nodes, 3, gw_inputs, 1, gw_outputs,
+                     "ir3-state-gather-write-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "state gather/write compile failed: %d\n", rc);
+            return 1;
+        }
+        const float gw_state[] = {1,2,3,4,5,6,7,8};
+        const int32_t gw_gidx[] = {3,1};
+        const int64_t gw_widx[] = {0,2};
+        /* Gather rows 3 and 1 → {7,8,3,4}; write into slots 0 and 2. */
+        const float gw_expected[] = {7,8,3,4,3,4,7,8};
+        const void * gw_args[] = {gw_state, gw_gidx, gw_widx};
+        const size_t gw_lens[] = {8,2,4};
+        float gw_actual[8] = {0};
+        rc = run_multi(blob, blob_len, gw_args, gw_lens, 3, gw_actual, 8);
+        if (rc != 8) {
+            fprintf(stderr, "state gather/write NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (fabsf(gw_actual[i] - gw_expected[i]) > 0.05f) {
+                fprintf(stderr, "state gather/write mismatch[%d]: got %.5f expected %.5f\n",
+                        i, gw_actual[i], gw_expected[i]);
+                return 1;
+            }
+        }
+        free_blob(blob);
+    }
+
     struct ir_tensor rope_tensors[3] = {
         {.role=IR_INPUT, .dtype=0, .ne={8,2,2,1}},
         {.role=IR_INPUT, .dtype=1, .ne={2,1,1,1}},
@@ -263,7 +325,7 @@ int main(int argc, char ** argv) {
     uint32_t rope_inputs[] = {0,1}, rope_outputs[] = {2};
     blob = NULL; blob_len = 0;
     rc = compile(3, rope_tensors, 1, &rope_node, 2, rope_inputs, 1, rope_outputs,
-                 "ir2-rope-normal-v1", &blob, &blob_len);
+                 "ir3-rope-normal-v1", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "RoPE compile failed: %d\n", rc);
         return 1;
@@ -301,7 +363,7 @@ int main(int argc, char ** argv) {
     uint32_t fa_inputs[] = {0,1,2,3}, fa_outputs[] = {4};
     blob = NULL; blob_len = 0;
     rc = compile(5, fa_tensors, 1, &fa_node, 4, fa_inputs, 1, fa_outputs,
-                 "ir2-flash-attn-gqa-v2", &blob, &blob_len);
+                 "ir3-flash-attn-gqa-v2", &blob, &blob_len);
     if (rc != 0 || !blob || !blob_len) {
         fprintf(stderr, "FlashAttention compile failed: %d\n", rc);
         return 1;

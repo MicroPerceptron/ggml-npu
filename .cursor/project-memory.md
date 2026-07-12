@@ -81,6 +81,17 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/backend/shell.rs`, GitHub issue #5.
   - Verified: 2026-07-12
 
+- `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
+  `traits.attention`, so `graph_feasible` rejected ShortConv/mutable-state write regions unless
+  `GGML_NPU_ATTENTION=full`. SetRows is stateful scatter (also used by LFM `cache_r*` recurrent
+  writes via CPY/GET_ROWS adjacency), not attention SoftMax/FA/Rope. Under
+  `GGML_NPU_LFM_SHORTCONV`, placement now pulls SSM_CONV/SET_ROWS/GET_ROWS/CPY when they sit under
+  `.conv.` ancestry or touch `cache_r*` (not `cache_k`/`cache_v`).
+  - Scope: Capability/placement for ShortConv state edges (#9); not a claim that one OpenVINO
+    program can fuse SSM_CONV+SET_ROWS (Intel NPU compile currently rejects that fusion).
+  - Evidence: `src/graph.rs`, `src/policy.rs`, `tests/graph_ir_shortconv_check.c`, GitHub issue #9.
+  - Verified: 2026-07-12
+
 - `FINDING/direct-warm-binding-reuse` — Direct resident programs historically keyed the full shared-binding identity into one cache entry, so weightless/glue programs re-staged ELF+HPI+command for every distinct IO set. PR #25 caches artifacts ≤512 KiB by program semantic key (L0 `SG_GRAPHS` analogue), retains a pre-JIT section snapshot, and re-JITs IO bindings in place; larger baked-weight programs keep the binding-set key to avoid host double-keep of weight blobs.
   - Scope: Direct session resident cache / prepare path only; not a measured handoff_begin or tok/s delta until short attribution or locked harness evidence. Device/host async overlap remains intentionally synchronous.
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, `src/vendor/ivpu/direct/load.rs`, GitHub issue #5, PR #25.

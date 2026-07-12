@@ -1747,4 +1747,24 @@ mod tests {
         assert!(predicted >= elements * 2);
         assert!(predicted <= elements * 3);
     }
+
+    #[test]
+    fn set_rows_is_not_gated_as_attention() {
+        // SetRows must not inherit the attention gate; otherwise ShortConv state-write regions
+        // are rejected unless GGML_NPU_ATTENTION=full (#9). Full graph_feasible still needs the
+        // OpenVINO shim at runtime — this asserts the contract that removes the false gate.
+        use crate::graph::{Node, OperationContract, OP_PARAM_BYTES};
+        let spec = crate::graph::OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_SET_ROWS,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1, 2],
+            output: 3,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SetRows must decode");
+        assert!(spec.traits.stateful);
+        assert!(!spec.traits.attention);
+        assert_eq!(spec.wire, crate::graph::WireOp::SetRows);
+        assert_eq!(spec.placement, crate::graph::PlacementClass::Stateful);
+    }
 }
