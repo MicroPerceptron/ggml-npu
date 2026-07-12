@@ -54,6 +54,7 @@ pub mod metrics;
 mod ops;
 mod policy;
 pub mod runtime;
+mod sched;
 mod trace;
 mod vendor;
 
