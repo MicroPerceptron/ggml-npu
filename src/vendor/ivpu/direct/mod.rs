@@ -1,9 +1,10 @@
 //! Direct Linux `intel_vpu` foundation.
 //!
-//! This milestone deliberately stops before command queues, submission, and firmware packets.
+//! Command submission is restricted to validated, opt-in tiny hardware tests.
 
 #![allow(dead_code)]
 
+pub mod budget;
 pub mod elf;
 mod firmware;
 pub mod hpi;
@@ -39,9 +40,6 @@ const DEVICE_PATHS: [&core::ffi::CStr; 8] = [
     c"/dev/accel/accel6",
     c"/dev/accel/accel7",
 ];
-
-/// Conservative bring-up ceiling. This is not a claim about hardware capacity.
-pub const MAX_DIRECT_BO_BYTES: u64 = 64 * 1024 * 1024;
 
 fn runtime_error(error: crate::os::OsError) -> RuntimeError {
     RuntimeError::Os(error.0)
@@ -190,7 +188,7 @@ impl IvpuDevice {
     /// Create a small mappable GEM BO. This wrapper is implemented for ABI validation but is not
     /// used by backend execution until the direct command protocol is specified.
     pub fn create_bo(&self, bytes: u64, flags: u32) -> Result<BufferObject<'_>, RuntimeError> {
-        if bytes == 0 || bytes > MAX_DIRECT_BO_BYTES || flags & !DRM_IVPU_BO_FLAGS != 0 {
+        if bytes == 0 || bytes > usize::MAX as u64 || flags & !DRM_IVPU_BO_FLAGS != 0 {
             return Err(RuntimeError::InvalidArgument);
         }
         let mut request = DrmIvpuBoCreate {
@@ -366,11 +364,7 @@ impl BufferObject<'_> {
 
     pub fn map(&self, writable: bool) -> Result<BoMapping<'_>, RuntimeError> {
         let info = self.info()?;
-        if info.mmap_offset == 0
-            || info.bytes == 0
-            || info.bytes > MAX_DIRECT_BO_BYTES
-            || info.bytes > usize::MAX as u64
-        {
+        if info.mmap_offset == 0 || info.bytes == 0 || info.bytes > usize::MAX as u64 {
             return Err(RuntimeError::InvalidArgument);
         }
         let mapping = LinuxOs
@@ -435,6 +429,39 @@ pub struct CommandQueue<'device> {
 impl CommandQueue<'_> {
     pub const fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Submit one already-validated command image using the stable explicit-CMDQ UAPI.
+    ///
+    /// A zero preemption index requests the kernel-managed preemption allocation. Callers must
+    /// retain every BO in `handles` until the command BO reports completion.
+    pub fn submit(
+        &self,
+        handles: &[u32],
+        commands_offset: u32,
+        preempt_buffer_index: u32,
+    ) -> Result<(), RuntimeError> {
+        if self.id == 0
+            || handles.is_empty()
+            || handles.len() > validate::MAX_SUBMISSION_BUFFERS
+            || handles.iter().any(|handle| *handle == 0)
+            || commands_offset % 8 != 0
+            || (preempt_buffer_index != 0 && preempt_buffer_index as usize >= handles.len())
+        {
+            return Err(RuntimeError::InvalidArgument);
+        }
+        let buffer_count =
+            u32::try_from(handles.len()).map_err(|_| RuntimeError::InvalidArgument)?;
+        let value = DrmIvpuCmdqSubmit {
+            buffers_ptr: handles.as_ptr() as u64,
+            buffer_count,
+            cmdq_id: self.id,
+            flags: 0,
+            commands_offset,
+            preempt_buffer_index,
+            reserved: 0,
+        };
+        ioctl_cmdq_submit(&self.device.file, value)
     }
 
     pub fn destroy(mut self) -> Result<(), RuntimeError> {
@@ -541,6 +568,19 @@ fn ioctl_cmdq_destroy(file: &LinuxFile, id: u32) -> Result<(), RuntimeError> {
     .map_err(ioctl_error)
 }
 
+/// SAFETY boundary for DRM_IOCTL_IVPU_CMDQ_SUBMIT (`_IOW`, 32-byte repr(C) value).
+fn ioctl_cmdq_submit(file: &LinuxFile, value: DrmIvpuCmdqSubmit) -> Result<(), RuntimeError> {
+    // SAFETY: the request number, direction, value layout, and pointer lifetime are checked by
+    // the UAPI assertions and CommandQueue::submit; ioctl consumes the handle array synchronously.
+    unsafe {
+        ioctl::ioctl(
+            file.as_fd(),
+            ioctl::Setter::<{ DRM_IOCTL_IVPU_CMDQ_SUBMIT }, DrmIvpuCmdqSubmit>::new(value),
+        )
+    }
+    .map_err(ioctl_error)
+}
+
 /// SAFETY boundary for DRM_IOCTL_GEM_CLOSE (`_IOW`, 8-byte repr(C) value).
 fn ioctl_gem_close(file: &LinuxFile, handle: u32) -> Result<(), RuntimeError> {
     let value = DrmGemClose { handle, pad: 0 };
@@ -598,8 +638,7 @@ mod tests {
 
     #[test]
     fn direct_bo_requests_are_strictly_bounded_without_hardware() {
-        assert_eq!(MAX_DIRECT_BO_BYTES, 64 * 1024 * 1024);
-        assert!(0u64 < MAX_DIRECT_BO_BYTES);
+        assert!(usize::MAX as u64 >= 64 * 1024 * 1024);
         assert_eq!(DRM_IVPU_BO_FLAGS & 0x8000_0000, 0);
     }
 
@@ -739,5 +778,164 @@ mod tests {
             level_zero.len(),
             level_zero[0].name,
         );
+    }
+
+    #[test]
+    #[cfg(feature = "bench-hardware")]
+    #[ignore = "explicit tiny direct-IVPU execution; performs two submits only after the first succeeds"]
+    fn tiny_known_answer_direct_submission() {
+        use std::time::Instant;
+        use std::vec::Vec;
+
+        use super::elf::parse_intel_elf;
+        use super::hpi::inspect_hpi_requirements;
+        use super::prepare::{prepare_inference, PreparationBudget};
+        use super::transport::release_host_writes;
+
+        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
+        const ARTIFACT_LIMIT: usize = 1024 * 1024;
+        const ELEMENTS: usize = 32;
+        const OUTPUT_BYTES: usize = ELEMENTS * core::mem::size_of::<f32>();
+        const MAX_ABS_ERROR: f32 = 1.0e-5;
+        const MAX_REL_ERROR: f32 = 1.0e-5;
+        const SUBMISSIONS: usize = 2;
+
+        let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
+        assert!(length <= ARTIFACT_LIMIT);
+        let mut artifact = Vec::new();
+        artifact.try_reserve_exact(length).unwrap();
+        artifact.resize(length, 0);
+        std::fs::File::open(PATH)
+            .unwrap()
+            .read_exact(&mut artifact)
+            .unwrap();
+
+        let input0 = core::array::from_fn::<_, ELEMENTS, _>(|index| index as f32 * 0.125 - 1.5);
+        let input1 =
+            core::array::from_fn::<_, ELEMENTS, _>(|index| ((index * 7) % 17) as f32 * 0.25 - 2.0);
+        let mut oracle = [0.0f32; ELEMENTS];
+        let level_zero = super::super::ze::probe();
+        assert_eq!(level_zero.len(), 1);
+        let oracle_count = super::super::graph::run_native_blob(
+            &level_zero[0],
+            &artifact,
+            &[&input0, &input1],
+            &mut oracle,
+        )
+        .unwrap();
+        assert_eq!(oracle_count, ELEMENTS);
+        assert!(oracle.iter().all(|value| value.is_finite()));
+        drop(level_zero);
+
+        let input0_bytes =
+            unsafe { core::slice::from_raw_parts(input0.as_ptr().cast::<u8>(), OUTPUT_BYTES) };
+        let input1_bytes =
+            unsafe { core::slice::from_raw_parts(input1.as_ptr().cast::<u8>(), OUTPUT_BYTES) };
+
+        let before = resources();
+        let mut observed_outputs = [[0.0f32; ELEMENTS]; SUBMISSIONS];
+        let mut elapsed = [std::time::Duration::ZERO; SUBMISSIONS];
+        let (path, queue_id, user_bytes, preempt_bytes, accounted_bytes, firmware_api) = {
+            let elf = parse_intel_elf(&artifact).unwrap();
+            let device = IvpuDevice::open_first().unwrap();
+            let parameters = device.parameters().unwrap();
+            super::validate::validate_device(&parameters).unwrap();
+            assert_eq!(
+                parameters.capability_bits & (1 << DRM_IVPU_CAP_MANAGE_CMDQ),
+                1 << DRM_IVPU_CAP_MANAGE_CMDQ
+            );
+            let hpi = inspect_hpi_requirements(&elf, &parameters).unwrap();
+            let prepared = prepare_inference(
+                &device,
+                &parameters,
+                &elf,
+                &hpi,
+                &[input0_bytes, input1_bytes],
+                PreparationBudget {
+                    max_user_bo_bytes: 64 * 1024 * 1024,
+                    max_total_accounted_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+            assert_eq!(prepared.command_count, 2);
+            assert!(prepared.outputs_are_zero().unwrap());
+            assert!(prepared.total_accounted_bytes <= 64 * 1024 * 1024);
+            let queue = device
+                .create_queue(DRM_IVPU_JOB_PRIORITY_DEFAULT, 0)
+                .unwrap();
+
+            for submission in 0..SUBMISSIONS {
+                if submission != 0 {
+                    prepared.zero_outputs().unwrap();
+                    assert!(prepared.outputs_are_zero().unwrap());
+                }
+                release_host_writes();
+                let started = Instant::now();
+                queue
+                    .submit(&prepared.handles, prepared.commands_offset(), 0)
+                    .unwrap();
+                let now = LinuxOs.monotonic_now_ns().unwrap();
+                let deadline = now.checked_add(2_000_000_000).unwrap();
+                let status = prepared
+                    .command
+                    .wait_idle(Deadline::MonotonicNs(deadline))
+                    .unwrap();
+                elapsed[submission] = started.elapsed();
+                assert_eq!(status, DRM_IVPU_JOB_STATUS_SUCCESS);
+
+                let mut bytes = [0u8; OUTPUT_BYTES];
+                prepared.copy_output(0, &mut bytes).unwrap();
+                for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+                    observed_outputs[submission][index] =
+                        f32::from_le_bytes(chunk.try_into().unwrap());
+                }
+                assert!(observed_outputs[submission]
+                    .iter()
+                    .all(|value| value.is_finite()));
+                for (actual, expected) in observed_outputs[submission].iter().zip(oracle) {
+                    let absolute = (actual - expected).abs();
+                    let relative = absolute / expected.abs().max(1.0);
+                    assert!(
+                        absolute <= MAX_ABS_ERROR || relative <= MAX_REL_ERROR,
+                        "submission={submission} actual={actual} expected={expected} absolute={absolute} relative={relative}"
+                    );
+                }
+            }
+            assert_eq!(
+                observed_outputs[0].map(f32::to_bits),
+                observed_outputs[1].map(f32::to_bits)
+            );
+            let observed = (
+                device.device_path().to_string_lossy().into_owned(),
+                queue.id(),
+                prepared.total_user_bo_bytes,
+                parameters.preempt_buffer_bytes,
+                prepared.total_accounted_bytes,
+                parameters.firmware_api,
+            );
+            queue.destroy().unwrap();
+            prepared.destroy();
+            drop(device);
+            observed
+        };
+        let after = resources();
+        let mut max_absolute = 0.0f32;
+        let mut max_relative = 0.0f32;
+        for (actual, expected) in observed_outputs[0].iter().zip(oracle) {
+            let absolute = (actual - expected).abs();
+            max_absolute = max_absolute.max(absolute);
+            max_relative = max_relative.max(absolute / expected.abs().max(1.0));
+        }
+        std::println!(
+            "device={path} queue_id={queue_id} artifact={PATH} submissions={SUBMISSIONS} user_bo_bytes={user_bytes} preempt_buffer_bytes={preempt_bytes} accounted_bytes={accounted_bytes} firmware_api={firmware_api:?} oracle={oracle:?} direct={:?} max_absolute={max_absolute} max_relative={max_relative} tolerance_abs={MAX_ABS_ERROR} tolerance_rel={MAX_REL_ERROR} elapsed={elapsed:?} before={before:?} after={after:?}",
+            observed_outputs[0],
+        );
+        assert_eq!(after.open_fds, before.open_fds);
+        if let (Some(before_rss), Some(after_rss)) = (before.rss_kib, after.rss_kib) {
+            assert!(after_rss <= before_rss.saturating_add(4096));
+        }
+        if let (Some(before_swap), Some(after_swap)) = (before.swap_kib, after.swap_kib) {
+            assert!(after_swap <= before_swap);
+        }
     }
 }

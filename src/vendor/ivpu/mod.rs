@@ -9,21 +9,34 @@ mod cache;
 mod compile;
 #[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
 pub mod direct;
+#[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]
+#[path = "session_direct.rs"]
+mod direct_benchmark_session;
+#[cfg(feature = "level-zero-compat")]
 mod graph;
 mod lower;
 mod profile;
+#[cfg(feature = "level-zero-compat")]
 mod session;
+#[cfg(not(feature = "level-zero-compat"))]
+#[path = "session_direct.rs"]
+mod session;
+#[cfg(feature = "level-zero-compat")]
 mod ze;
 
 use alloc::vec::Vec;
+#[cfg(feature = "level-zero-compat")]
 use core::alloc::{AllocError, Allocator, Layout};
 use core::ffi::c_void;
+#[cfg(feature = "level-zero-compat")]
 use core::ptr::NonNull;
 
+#[cfg(feature = "level-zero-compat")]
 use crate::hal::{BufFlags, NpuHal};
 use crate::ops::{Op, Operand};
 use crate::vendor::{DeviceInfo, LoweringSupport, Vendor};
 
+#[cfg(feature = "level-zero-compat")]
 pub use ze::Device as IvpuDevice;
 
 /// [`Allocator`] over NPU-MMU-mapped host memory (`zeMemAllocHost`), so NPU-resident buffers are
@@ -31,9 +44,11 @@ pub use ze::Device as IvpuDevice;
 /// does today (issue #1). The driver page-aligns (4096), satisfying any alignment we bind. Returns
 /// [`AllocError`] when the Level Zero runtime is absent (no NPU) or the request is over-aligned —
 /// a caller then falls back to [`crate::HostAlloc`]. ZST: free to pass by value.
+#[cfg(feature = "level-zero-compat")]
 #[derive(Clone, Copy, Default)]
 pub(super) struct NpuHostAlloc;
 
+#[cfg(feature = "level-zero-compat")]
 unsafe impl Allocator for NpuHostAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
@@ -65,13 +80,24 @@ impl Vendor for IvpuVendor {
     }
 
     fn probe(&self) -> Vec<DeviceInfo> {
-        // The cached runtime (created once) holds the device; deriving the name from it means
-        // supports_op no longer re-enumerates Level Zero on every call.
         let mut v = Vec::new();
+        #[cfg(feature = "level-zero-compat")]
         if let Some(r) = ze::runtime() {
             v.push(DeviceInfo {
                 name: r.name.clone(),
             });
+        }
+        #[cfg(not(feature = "level-zero-compat"))]
+        if let Ok(device) = direct::IvpuDevice::open_first() {
+            if let Ok(parameters) = device.parameters() {
+                v.push(DeviceInfo {
+                    name: alloc::format!(
+                        "Intel NPU (direct ivpu {:#x} rev {})",
+                        parameters.device_id,
+                        parameters.revision
+                    ),
+                });
+            }
         }
         v
     }
@@ -125,21 +151,41 @@ impl Vendor for IvpuVendor {
     }
 
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void {
-        ze::alloc_host(size)
+        #[cfg(feature = "level-zero-compat")]
+        {
+            return ze::alloc_host(size);
+        }
+        #[cfg(not(feature = "level-zero-compat"))]
+        {
+            let mut allocation = core::ptr::null_mut();
+            if crate::posix_memalign(&mut allocation, 4096, size.max(1)) != 0 {
+                return core::ptr::null_mut();
+            }
+            allocation
+        }
     }
 
     unsafe fn free_host(&self, ptr: *mut c_void) {
-        ze::free_host(ptr)
+        #[cfg(feature = "level-zero-compat")]
+        {
+            ze::free_host(ptr);
+        }
+        #[cfg(not(feature = "level-zero-compat"))]
+        {
+            crate::free(ptr);
+        }
     }
 }
 
 /// Bring-up self-test: run a native (OpenVINO-compiled) blob on the first discovered NPU,
 /// feeding `input` (f32) and writing the first output into `output` (f32). Returns the
 /// number of outputs written, or a negative error. Scaffold for the submit path.
+#[cfg(feature = "level-zero-compat")]
 pub fn run_blob_selftest(blob: &[u8], input: &[f32], output: &mut [f32]) -> i32 {
     run_blob_selftest_multi(blob, &[input], output)
 }
 
+#[cfg(feature = "level-zero-compat")]
 pub fn run_blob_selftest_multi(blob: &[u8], inputs: &[&[f32]], output: &mut [f32]) -> i32 {
     let devices = <IvpuHal as NpuHal>::probe();
     let Some(dev) = devices.first() else {
@@ -153,11 +199,85 @@ pub fn run_blob_selftest_multi(blob: &[u8], inputs: &[&[f32]], output: &mut [f32
     }
 }
 
+#[cfg(not(feature = "level-zero-compat"))]
+pub fn run_blob_selftest(blob: &[u8], input: &[f32], output: &mut [f32]) -> i32 {
+    run_blob_selftest_multi(blob, &[input], output)
+}
+
+#[cfg(not(feature = "level-zero-compat"))]
+pub fn run_blob_selftest_multi(blob: &[u8], inputs: &[&[f32]], output: &mut [f32]) -> i32 {
+    match session::run_blob_selftest_multi(blob, inputs, output) {
+        Ok(written) => written as i32,
+        Err(_) => -1,
+    }
+}
+
+/// Persistent Level Zero fixture exposed only to the guarded hardware Criterion target.
+#[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]
+pub struct LevelZeroBenchmarkFixture(graph::PersistentNativeGraph);
+
+#[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]
+impl LevelZeroBenchmarkFixture {
+    pub fn new(blob: &[u8], inputs: &[&[f32]]) -> Result<Self, i32> {
+        let devices = ze::probe();
+        let device = devices.first().ok_or(-100)?;
+        graph::PersistentNativeGraph::new(device, blob, inputs).map(Self)
+    }
+
+    pub fn execute(&mut self, timeout_ns: u64) -> Result<(), i32> {
+        self.0.execute(timeout_ns)
+    }
+
+    pub fn copy_output(&self, output: &mut [f32]) -> Result<usize, i32> {
+        self.0.copy_output(output)
+    }
+}
+
+#[cfg(feature = "bench-hardware")]
+pub(crate) enum HardwareBenchmarkFixture {
+    Direct(direct_benchmark_session::DirectBenchmarkFixture),
+    LevelZero(LevelZeroBenchmarkFixture),
+}
+
+#[cfg(feature = "bench-hardware")]
+impl HardwareBenchmarkFixture {
+    pub fn new(kind: u32, blob: &[u8], inputs: &[&[f32]]) -> Result<Self, i32> {
+        match kind {
+            0 => direct_benchmark_session::DirectBenchmarkFixture::new(blob, inputs)
+                .map(Self::Direct)
+                .map_err(|_| -1),
+            1 => LevelZeroBenchmarkFixture::new(blob, inputs)
+                .map(Self::LevelZero)
+                .map_err(|_| -1),
+            _ => Err(-1),
+        }
+    }
+
+    pub fn execute(&mut self) -> Result<(), i32> {
+        match self {
+            Self::Direct(fixture) => fixture.execute().map_err(|_| -1),
+            Self::LevelZero(fixture) => fixture.execute(2_000_000_000),
+        }
+    }
+
+    pub fn copy_output(&self, output: &mut [f32]) -> Result<usize, i32> {
+        match self {
+            Self::Direct(fixture) => fixture.copy_output(output).map_err(|_| -1),
+            Self::LevelZero(fixture) => fixture.copy_output(output),
+        }
+    }
+}
+
+#[cfg(feature = "level-zero-compat")]
 pub struct IvpuHal; // ze driver/context + graph-ext dispatch table
+#[cfg(feature = "level-zero-compat")]
 pub struct IvpuQueue; // ze_command_queue_handle_t (+ command list)
+#[cfg(feature = "level-zero-compat")]
 pub struct IvpuBinary; // ze_graph_handle_t created from a NATIVE blob
+#[cfg(feature = "level-zero-compat")]
 pub struct IvpuBuffer; // zeMemAllocHost / zeMemAllocDevice allocation
 
+#[cfg(feature = "level-zero-compat")]
 impl NpuHal for IvpuHal {
     type Device = IvpuDevice;
     type Queue = IvpuQueue;
@@ -195,5 +315,37 @@ impl NpuHal for IvpuHal {
     }
     fn sync(&self, q: &IvpuQueue) {
         unimplemented!("zeCommandQueueSynchronize")
+    }
+}
+
+#[cfg(all(test, not(feature = "level-zero-compat")))]
+mod direct_tests {
+    use std::io::Read;
+    use std::vec;
+
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit direct-runtime hardware execution using an existing bounded artifact"]
+    fn default_runtime_executes_tiny_known_answer_without_level_zero() {
+        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
+        let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
+        assert!(length <= 1024 * 1024);
+        let mut artifact = vec![0u8; length];
+        std::fs::File::open(PATH)
+            .unwrap()
+            .read_exact(&mut artifact)
+            .unwrap();
+        let input0 = core::array::from_fn::<_, 32, _>(|index| index as f32 * 0.125 - 1.5);
+        let input1 =
+            core::array::from_fn::<_, 32, _>(|index| ((index * 7) % 17) as f32 * 0.25 - 2.0);
+        let mut output = [0.0f32; 32];
+        assert_eq!(
+            run_blob_selftest_multi(&artifact, &[&input0, &input1], &mut output),
+            32
+        );
+        for ((actual, left), right) in output.iter().zip(input0).zip(input1) {
+            assert_eq!(actual.to_bits(), (left + right).to_bits());
+        }
     }
 }

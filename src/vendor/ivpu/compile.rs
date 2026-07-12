@@ -39,7 +39,18 @@ extern "C" {
 const RTLD_NOW: c_int = 2;
 
 /// Persistent artifact namespace. Increment whenever compiler semantics or framing changes.
-const FORMAT_VERSION: u64 = 7;
+const FORMAT_VERSION: u64 = 8;
+
+fn execution_runtime_available() -> bool {
+    #[cfg(feature = "level-zero-compat")]
+    {
+        super::ze::runtime().is_some()
+    }
+    #[cfg(not(feature = "level-zero-compat"))]
+    {
+        super::session::runtime_available()
+    }
+}
 
 fn persistent_hasher(domain: &[u8]) -> SemanticHasher {
     let mut hasher = SemanticHasher::new(domain);
@@ -296,6 +307,7 @@ pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
         && m <= i32::MAX as i64
         && k <= i32::MAX as i64
         && n <= i32::MAX as i64
+        && execution_runtime_available()
         && shim().is_some()
         && requant::can_requant(weight, k as usize)
 }
@@ -413,6 +425,10 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
+    if !execution_runtime_available() {
+        super::profile::note("[npu ir2] unavailable: selected execution runtime rejected device\n");
+        return false;
+    }
     let Some(s) = shim() else {
         super::profile::note("[npu ir2] unavailable: OpenVINO compiler shim not loaded\n");
         return false;
@@ -1076,7 +1092,7 @@ mod tests {
         let second = cache_key(&requant(8), 0x2000, 0, 1, 32, 1);
         let first = first.to_str().unwrap();
         let second = second.to_str().unwrap();
-        assert!(first.starts_with("matmul-b3v7-"));
+        assert!(first.starts_with("matmul-b3v8-"));
         assert_eq!(first.split('-').nth(2).unwrap().len(), 64);
         assert_ne!(first, second);
         assert_ne!(

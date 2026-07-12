@@ -52,6 +52,8 @@ mod vendor;
 
 #[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
 pub use vendor::ivpu::direct as direct_ivpu;
+#[cfg(feature = "bench-hardware")]
+pub use vendor::ivpu::LevelZeroBenchmarkFixture;
 
 // ---------------------------------------------------------------------------
 // Host runtime glue. These symbols resolve from the host process at dlopen.
@@ -217,4 +219,75 @@ pub extern "C" fn ggml_npu_ivpu_selftest_multi(
     }
     let output = unsafe { core::slice::from_raw_parts_mut(output, output_cap) };
     vendor::ivpu::run_blob_selftest_multi(blob, &inputs, output)
+}
+
+#[cfg(feature = "bench-hardware")]
+#[no_mangle]
+pub extern "C" fn ggml_npu_hardware_fixture_create(
+    kind: u32,
+    blob: *const u8,
+    blob_len: usize,
+    input_ptrs: *const *const f32,
+    input_lens: *const usize,
+    input_count: usize,
+) -> *mut c_void {
+    if blob.is_null() || input_ptrs.is_null() || input_lens.is_null() || input_count == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: benchmark caller keeps these immutable buffers live for fixture construction.
+    let blob = unsafe { core::slice::from_raw_parts(blob, blob_len) };
+    let pointers = unsafe { core::slice::from_raw_parts(input_ptrs, input_count) };
+    let lengths = unsafe { core::slice::from_raw_parts(input_lens, input_count) };
+    let mut inputs = alloc::vec::Vec::with_capacity(input_count);
+    for (&pointer, &length) in pointers.iter().zip(lengths) {
+        if pointer.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: lengths are supplied with live benchmark input pointers.
+        inputs.push(unsafe { core::slice::from_raw_parts(pointer, length) });
+    }
+    match vendor::ivpu::HardwareBenchmarkFixture::new(kind, blob, &inputs) {
+        Ok(fixture) => alloc::boxed::Box::into_raw(alloc::boxed::Box::new(fixture)).cast(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+#[cfg(feature = "bench-hardware")]
+#[no_mangle]
+pub extern "C" fn ggml_npu_hardware_fixture_execute(fixture: *mut c_void) -> c_int {
+    if fixture.is_null() {
+        return -1;
+    }
+    // SAFETY: pointer was returned by create and remains uniquely owned by the caller.
+    let fixture = unsafe { &mut *fixture.cast::<vendor::ivpu::HardwareBenchmarkFixture>() };
+    fixture.execute().map_or_else(|code| code, |_| 0)
+}
+
+#[cfg(feature = "bench-hardware")]
+#[no_mangle]
+pub extern "C" fn ggml_npu_hardware_fixture_copy_output(
+    fixture: *const c_void,
+    output: *mut f32,
+    output_capacity: usize,
+) -> c_int {
+    if fixture.is_null() || output.is_null() {
+        return -1;
+    }
+    // SAFETY: pointers were created by this API and output capacity is caller-supplied.
+    let fixture = unsafe { &*fixture.cast::<vendor::ivpu::HardwareBenchmarkFixture>() };
+    let output = unsafe { core::slice::from_raw_parts_mut(output, output_capacity) };
+    fixture
+        .copy_output(output)
+        .map_or_else(|code| code, |count| count as c_int)
+}
+
+#[cfg(feature = "bench-hardware")]
+#[no_mangle]
+pub extern "C" fn ggml_npu_hardware_fixture_destroy(fixture: *mut c_void) {
+    if !fixture.is_null() {
+        // SAFETY: pointer was returned by create and must be destroyed exactly once.
+        drop(unsafe {
+            alloc::boxed::Box::from_raw(fixture.cast::<vendor::ivpu::HardwareBenchmarkFixture>())
+        });
+    }
 }

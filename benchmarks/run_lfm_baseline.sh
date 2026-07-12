@@ -62,6 +62,9 @@ mkdir -p "$OUT"
     echo "npu_cache=${GGML_NPU_CACHE:-default}"
     echo "npu_timeout=${NPU_TIMEOUT:-180s}"
     echo "lfm_shortconv=${GGML_NPU_LFM_SHORTCONV:-0}"
+    echo "npu_moe=${GGML_NPU_MOE:-0}"
+    echo "npu_debug=${GGML_NPU_DEBUG:-0}"
+    echo "npu_trace=${GGML_NPU_TRACE:-0}"
     echo "flash_attention=${FLASH_ATTENTION:-auto}"
     echo "prompt_tokens=${PROMPT_TOKENS:-512}"
     echo "generated_tokens=${GEN_TOKENS:-128}"
@@ -108,15 +111,20 @@ esac
 
 if [[ "$MODE" == npu && -f "$GGML_BACKEND_PATH" ]]; then
     echo "backend_so_sha256=$(sha256sum "$GGML_BACKEND_PATH" | awk '{print $1}')" >> "$OUT/environment.txt"
+    [[ -f "$GGML_NPU_OVC" ]] &&
+        echo "compiler_shim_sha256=$(sha256sum "$GGML_NPU_OVC" | awk '{print $1}')" >> "$OUT/environment.txt"
 fi
+echo "llama_bench_sha256=$(sha256sum "$BENCH" | awk '{print $1}')" >> "$OUT/environment.txt"
 
 bench_pid=""
 guard_pid=""
+monitor_pid=""
 ENERGY_FILE="${ENERGY_FILE:-/sys/class/powercap/intel-rapl:0/energy_uj}"
 energy_before=""
 [[ -r "$ENERGY_FILE" ]] && energy_before="$(<"$ENERGY_FILE")"
 cleanup() {
     [[ -n "$guard_pid" ]] && kill "$guard_pid" 2>/dev/null || true
+    [[ -n "$monitor_pid" ]] && kill "$monitor_pid" 2>/dev/null || true
     if [[ -n "$bench_pid" ]] && kill -0 "$bench_pid" 2>/dev/null; then
         kill -TERM -- "-$bench_pid" 2>/dev/null || true
         sleep 1
@@ -136,6 +144,36 @@ setsid /usr/bin/time -f \
     -o "$OUT/process.json" "${runner[@]}" "$BENCH" "${args[@]}" \
     > "$OUT/result.jsonl" 2> "$OUT/stderr.txt" &
 bench_pid=$!
+
+(
+    printf 'monotonic_seconds\tllama_bench_rss_kib\tmem_available_kib\tswap_used_kib\tnpu_memory_bytes\tmemory_psi_some_total\tmemory_psi_full_total\n'
+    while kill -0 "$bench_pid" 2>/dev/null; do
+        read -r mem_available swap_total swap_free < <(
+            awk '
+                /^MemAvailable:/ { available = $2 }
+                /^SwapTotal:/ { total = $2 }
+                /^SwapFree:/ { free = $2 }
+                END { print available, total, free }
+            ' /proc/meminfo
+        )
+        bench_rss="$(ps -e -o comm=,rss= | awk '$1 == "llama-bench" { total += $2 } END { print total + 0 }')"
+        npu_memory=0
+        [[ -r /sys/class/accel/accel0/device/npu_memory_utilization ]] &&
+            read -r npu_memory < /sys/class/accel/accel0/device/npu_memory_utilization
+        read -r psi_some psi_full < <(
+            awk '
+                $1 == "some" { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); some = a[2] } }
+                $1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); full = a[2] } }
+                END { print some + 0, full + 0 }
+            ' /proc/pressure/memory
+        )
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(awk '{ print $1 }' /proc/uptime)" "$bench_rss" "$mem_available" \
+            "$((swap_total - swap_free))" "$npu_memory" "$psi_some" "$psi_full"
+        sleep "${MONITOR_INTERVAL:-0.2}"
+    done
+) > "$OUT/resources.tsv" &
+monitor_pid=$!
 
 if [[ "$MODE" == npu ]]; then
     (
@@ -158,12 +196,43 @@ wait "$bench_pid"
 status=$?
 set -e
 bench_pid=""
+[[ -n "$guard_pid" ]] && kill "$guard_pid" 2>/dev/null || true
+[[ -n "$monitor_pid" ]] && kill "$monitor_pid" 2>/dev/null || true
+[[ -n "$guard_pid" ]] && wait "$guard_pid" 2>/dev/null || true
+[[ -n "$monitor_pid" ]] && wait "$monitor_pid" 2>/dev/null || true
+guard_pid=""
+monitor_pid=""
+awk -F '\t' '
+    NR > 1 {
+        if ($2 > rss) rss = $2
+        if (min_available == 0 || $3 < min_available) min_available = $3
+        if ($4 > swap) swap = $4
+        if ($5 > npu) npu = $5
+        if (first_some == "") {
+            first_some = $6
+            first_full = $7
+        }
+        last_some = $6
+        last_full = $7
+    }
+    END {
+        printf "{\"peak_llama_bench_rss_kib\":%d,\"min_mem_available_kib\":%d,\"peak_swap_used_kib\":%d,\"peak_npu_memory_bytes\":%d,\"memory_psi_some_delta_us\":%d,\"memory_psi_full_delta_us\":%d}\n",
+            rss, min_available, swap, npu, last_some - first_some, last_full - first_full
+    }
+' "$OUT/resources.tsv" > "$OUT/resources.json"
 if [[ -n "$energy_before" && -r "$ENERGY_FILE" && -r "${ENERGY_FILE%/energy_uj}/max_energy_range_uj" ]]; then
     energy_after="$(<"$ENERGY_FILE")"
     energy_range="$(<"${ENERGY_FILE%/energy_uj}/max_energy_range_uj")"
     energy_delta=$((energy_after - energy_before))
     (( energy_delta < 0 )) && energy_delta=$((energy_delta + energy_range))
     printf '{"energy_uj":%s}\n' "$energy_delta" > "$OUT/energy.json"
+fi
+
+if [[ "${BENCHMARK_SUMMARY:-1}" == 1 ]]; then
+    if ! python3 "$ROOT/benchmarks/summarize.py" "$OUT" \
+        --output "$OUT/summary.txt" --json-out "$OUT/summary.json"; then
+        echo "warning: benchmark summary generation failed for $OUT" >&2
+    fi
 fi
 
 echo "$OUT"

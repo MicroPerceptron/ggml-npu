@@ -20,7 +20,6 @@ use super::link::{
 use super::transport::{acquire_device_writes, release_host_writes};
 use super::{BufferObject, IvpuDevice};
 
-pub const MAX_TINY_SUBMISSION_BO_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_STAGED_SECTIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +287,7 @@ pub fn stage_program<'device>(
     device: &'device IvpuDevice,
     elf: &ParsedIntelElf<'_>,
     hpi: &HpiRequirements,
+    max_user_bo_bytes: u64,
 ) -> Result<StagedProgram<'device>, LoadError> {
     let plans = collect_placements(elf)?;
     let mut sections = Vec::new();
@@ -314,7 +314,7 @@ pub fn stage_program<'device>(
         total_bo_bytes = total_bo_bytes
             .checked_add(info.bytes)
             .ok_or(LoadError::BudgetExceeded)?;
-        if total_bo_bytes > MAX_TINY_SUBMISSION_BO_BYTES {
+        if total_bo_bytes > max_user_bo_bytes {
             return Err(LoadError::BudgetExceeded);
         }
         let section = StagedSection {
@@ -363,8 +363,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_budget_is_strictly_below_hardware_test_limit() {
-        assert_eq!(MAX_TINY_SUBMISSION_BO_BYTES, 8 * 1024 * 1024);
+    fn staging_section_count_is_bounded() {
         assert!(MAX_STAGED_SECTIONS <= 64);
     }
 
@@ -387,7 +386,7 @@ mod tests {
         let device = IvpuDevice::open_first().unwrap();
         let parameters = device.parameters().unwrap();
         let hpi = inspect_hpi_requirements(&elf, &parameters).unwrap();
-        let staged = stage_program(&device, &elf, &hpi).unwrap();
+        let staged = stage_program(&device, &elf, &hpi, 64 * 1024 * 1024).unwrap();
         std::println!(
             "artifact={PATH} sections={} total_bo_bytes={} entry_address={:#x} entry_bytes={} jit_relocations={} plan_digest={} linked_digest={}",
             staged.sections().len(),
@@ -398,7 +397,7 @@ mod tests {
             staged.plan_digest.hex(),
             staged.linked_digest.hex(),
         );
-        assert!(staged.total_bo_bytes <= MAX_TINY_SUBMISSION_BO_BYTES);
+        assert!(staged.total_bo_bytes <= 64 * 1024 * 1024);
         assert_eq!(staged.sections().len(), 17);
         assert_eq!(hpi.entry_bytes, 0x980);
         assert_eq!(staged.jit_relocations, 3);

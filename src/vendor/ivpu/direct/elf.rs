@@ -182,6 +182,27 @@ fn section_has_file_data(section_type: u32) -> bool {
 }
 
 pub fn inspect_elf(bytes: &[u8]) -> Result<ElfInspection, ElfError> {
+    inspect_elf_with_limits(
+        bytes,
+        MAX_INTEL_RESIDENT_BYTES,
+        MAX_SYMBOLS,
+        MAX_RELOCATIONS,
+    )
+}
+
+fn inspect_elf_with_resident_limit(
+    bytes: &[u8],
+    max_resident_bytes: u64,
+) -> Result<ElfInspection, ElfError> {
+    inspect_elf_with_limits(bytes, max_resident_bytes, MAX_SYMBOLS, MAX_RELOCATIONS)
+}
+
+fn inspect_elf_with_limits(
+    bytes: &[u8],
+    max_resident_bytes: u64,
+    max_symbols: u64,
+    max_relocations: u64,
+) -> Result<ElfInspection, ElfError> {
     if bytes.len() < ELF64_HEADER_BYTES {
         return Err(ElfError::Truncated);
     }
@@ -274,7 +295,7 @@ pub fn inspect_elf(bytes: &[u8]) -> Result<ElfInspection, ElfError> {
             resident_bytes = resident_bytes
                 .checked_add(size)
                 .ok_or(ElfError::ResidentLimitExceeded)?;
-            if resident_bytes > MAX_INTEL_RESIDENT_BYTES {
+            if resident_bytes > max_resident_bytes {
                 return Err(ElfError::ResidentLimitExceeded);
             }
         }
@@ -290,7 +311,7 @@ pub fn inspect_elf(bytes: &[u8]) -> Result<ElfInspection, ElfError> {
             relocation_count = relocation_count
                 .checked_add(size / entry_size)
                 .ok_or(ElfError::TooManyRelocations)?;
-            if relocation_count > MAX_RELOCATIONS {
+            if relocation_count > max_relocations {
                 return Err(ElfError::TooManyRelocations);
             }
         }
@@ -302,7 +323,7 @@ pub fn inspect_elf(bytes: &[u8]) -> Result<ElfInspection, ElfError> {
             symbol_count = symbol_count
                 .checked_add(size / entry_size)
                 .ok_or(ElfError::TooManySymbols)?;
-            if symbol_count > MAX_SYMBOLS {
+            if symbol_count > max_symbols {
                 return Err(ElfError::TooManySymbols);
             }
             let string_table = read_u32(bytes, base + 40)? as usize;
@@ -462,7 +483,23 @@ fn validate_symbol_relocation_bounds(
 }
 
 pub fn parse_intel_elf(bytes: &[u8]) -> Result<ParsedIntelElf<'_>, ElfError> {
-    let inspection = inspect_elf(bytes)?;
+    parse_intel_elf_with_resident_limit(bytes, MAX_INTEL_RESIDENT_BYTES)
+}
+
+pub fn parse_intel_elf_with_resident_limit(
+    bytes: &[u8],
+    max_resident_bytes: u64,
+) -> Result<ParsedIntelElf<'_>, ElfError> {
+    // Runtime-compiled artifacts are already bounded by the transient blob and resident-memory
+    // budgets. Permit every symbol/relocation record that can physically fit in that bounded blob;
+    // the preflight still validates each table range and entry before Goblin allocates.
+    let blob_bytes = bytes.len() as u64;
+    let inspection = inspect_elf_with_limits(
+        bytes,
+        max_resident_bytes,
+        MAX_SYMBOLS.max(blob_bytes / ELF64_SYMBOL_BYTES),
+        MAX_RELOCATIONS.max(blob_bytes / 16),
+    )?;
     if inspection.machine != INTEL_NPU_MACHINE
         || !matches!(inspection.file_type, header::ET_REL | header::ET_EXEC)
     {
@@ -784,6 +821,7 @@ mod tests {
             parse_intel_elf(&elf),
             Err(ElfError::ResidentLimitExceeded)
         ));
+        assert!(inspect_elf_with_resident_limit(&elf, MAX_INTEL_RESIDENT_BYTES + 4096).is_ok());
     }
 
     #[test]

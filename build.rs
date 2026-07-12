@@ -1,9 +1,9 @@
-//! Build script: generate ggml + Level Zero C-ABI bindings with bindgen.
+//! Build script: generate ggml bindings and optional Level Zero compatibility bindings.
 //!
 //! ggml headers come from the sibling llama.cpp checkout by default (override with
 //! `GGML_DIR`). Level Zero types come from the vendored `ze_api.h`; we generate **types
-//! and constants only** — the functions are resolved at runtime via `dlopen`/`dlsym`
-//! (see `vendor/ivpu/ze.rs`), so the cdylib has no hard dependency on `libze_loader`.
+//! and constants only** when `level-zero-compat` is enabled. Normal direct-runtime builds neither
+//! parse those headers nor probe the Level Zero loader.
 //!
 //! Linking: `ggml_*` helper symbols are left UNDEFINED and resolve at dlopen from the
 //! host. Set `GGML_LIB_DIR` to link a prebuilt ggml instead.
@@ -75,22 +75,27 @@ fn main() {
         "ggml headers not found under {} — set GGML_DIR to your llama.cpp checkout",
         ggml_root.display()
     );
-    // ze_graph_ext.h pulls in ze_api.h + ze_graph_profiling_ext.h (same dir), so one bindgen
-    // pass yields the core Level Zero types plus the NPU graph extension.
+    let level_zero_compat = env::var_os("CARGO_FEATURE_LEVEL_ZERO_COMPAT").is_some();
+    // ze_graph_ext.h pulls in ze_api.h + ze_graph_profiling_ext.h (same dir), so one optional
+    // bindgen pass yields the core Level Zero types plus the NPU graph extension.
     let ze_dir = manifest.join("src/vendor/ivpu/level_zero");
     let ze_header = ze_dir.join("ze_graph_ext.h");
-    assert!(
-        ze_header.exists(),
-        "vendored ze_graph_ext.h not found at {}",
-        ze_header.display()
-    );
+    if level_zero_compat {
+        assert!(
+            ze_header.exists(),
+            "vendored ze_graph_ext.h not found at {}",
+            ze_header.display()
+        );
+    }
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!(
         "cargo:rerun-if-changed={}",
         inc.join("ggml-backend.h").display()
     );
-    println!("cargo:rerun-if-changed={}", ze_header.display());
+    if level_zero_compat {
+        println!("cargo:rerun-if-changed={}", ze_header.display());
+    }
     println!("cargo:rerun-if-env-changed=GGML_DIR");
     println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");
 
@@ -136,17 +141,19 @@ fn main() {
         .write_to_file(out.join("bindings.rs"))
         .expect("write bindings.rs");
 
-    // ---- Level Zero bindings (types + constants only; functions are dlsym'd) ----
+    // ---- Optional Level Zero compatibility bindings (types/constants only; functions dlsym'd) ----
     // ze_graph_ext.h uses `bool` without including <stdbool.h> (valid in C++, not C), so
     // force-include it for the C parse.
-    base_builder(ze_header.to_str().unwrap(), &resource, &host)
-        .clang_arg(format!("-I{}", ze_dir.display()))
-        .clang_arg("-include")
-        .clang_arg("stdbool.h")
-        .allowlist_type("ze_.*")
-        .allowlist_var("ZE_.*")
-        .generate()
-        .expect("bindgen failed for Level Zero")
-        .write_to_file(out.join("ze_bindings.rs"))
-        .expect("write ze_bindings.rs");
+    if level_zero_compat {
+        base_builder(ze_header.to_str().unwrap(), &resource, &host)
+            .clang_arg(format!("-I{}", ze_dir.display()))
+            .clang_arg("-include")
+            .clang_arg("stdbool.h")
+            .allowlist_type("ze_.*")
+            .allowlist_var("ZE_.*")
+            .generate()
+            .expect("bindgen failed for Level Zero")
+            .write_to_file(out.join("ze_bindings.rs"))
+            .expect("write ze_bindings.rs");
+    }
 }

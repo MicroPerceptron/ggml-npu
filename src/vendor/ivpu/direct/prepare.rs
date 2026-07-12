@@ -1,6 +1,4 @@
-//! Binding, HostParsedInference, and command-buffer dry-run preparation.
-//!
-//! No submit ioctl exists in this module.
+//! Binding, HostParsedInference, and validated command-buffer preparation.
 
 #![allow(dead_code)]
 
@@ -17,8 +15,8 @@ use super::hpi::{HpiRequirements, HOST_PARSED_INFERENCE_ALIGNMENT, HOST_PARSED_I
 use super::link::{
     visit_binding_requirements, BindingRequirement, DeviceMemoryClass, PlacedSection,
 };
-use super::load::{stage_program, LoadError, StagedProgram, MAX_TINY_SUBMISSION_BO_BYTES};
-use super::transport::release_host_writes;
+use super::load::{stage_program, LoadError, StagedProgram};
+use super::transport::{acquire_device_writes, release_host_writes};
 use super::uapi::{
     DRM_IVPU_BO_DMA_MEM, DRM_IVPU_BO_MAPPABLE, DRM_IVPU_BO_WC, DRM_IVPU_PARAM_UNIQUE_INFERENCE_ID,
 };
@@ -36,6 +34,12 @@ const NOP_COMMAND_BYTES: usize = 24;
 const COMMAND_LOGICAL_BYTES: usize =
     COMMAND_LIST_OFFSET + INFERENCE_COMMAND_BYTES + NOP_COMMAND_BYTES;
 const MAX_PREPARED_HANDLES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparationBudget {
+    pub max_user_bo_bytes: u64,
+    pub max_total_accounted_bytes: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareError {
@@ -65,13 +69,123 @@ pub struct PreparedInference<'device> {
     pub hpi: BufferObject<'device>,
     pub command: BufferObject<'device>,
     pub handles: Vec<u32>,
+    pub executable_bo_bytes: u64,
+    pub binding_bo_bytes: u64,
+    pub hpi_bo_bytes: u64,
+    pub command_bo_bytes: u64,
+    pub preemption_bytes: u64,
     pub total_user_bo_bytes: u64,
+    pub total_accounted_bytes: u64,
     pub command_count: usize,
     pub inference_id: u64,
     pub command_digest: SemanticDigest,
 }
 
 impl PreparedInference<'_> {
+    pub const fn commands_offset(&self) -> u32 {
+        COMMAND_HEADER_OFFSET as u32
+    }
+
+    pub fn copy_output(&self, output_index: usize, target: &mut [u8]) -> Result<(), PrepareError> {
+        let binding = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+            .nth(output_index)
+            .ok_or(PrepareError::BindingMismatch)?;
+        if target.len() != binding.logical_bytes as usize {
+            return Err(PrepareError::BindingMismatch);
+        }
+        let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
+        if mapping.len() < target.len() {
+            return Err(PrepareError::InvalidMetadata);
+        }
+        acquire_device_writes();
+        // SAFETY: both regions are live, non-overlapping, and exactly bounded by target.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                mapping.address().as_ptr(),
+                target.as_mut_ptr(),
+                target.len(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn write_inputs(&self, inputs: &[&[u8]]) -> Result<(), PrepareError> {
+        let expected = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Input)
+            .count();
+        if inputs.len() != expected {
+            return Err(PrepareError::BindingMismatch);
+        }
+        for (binding, input) in self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Input)
+            .zip(inputs)
+        {
+            if input.len() != binding.logical_bytes as usize {
+                return Err(PrepareError::BindingMismatch);
+            }
+            map_and_initialize(&binding.bo, binding.logical_bytes as usize, Some(input))?;
+        }
+        Ok(())
+    }
+
+    pub fn input_bytes(&self, input_index: usize) -> Option<usize> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Input)
+            .nth(input_index)
+            .and_then(|binding| usize::try_from(binding.logical_bytes).ok())
+    }
+
+    pub fn output_bytes(&self, output_index: usize) -> Option<usize> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+            .nth(output_index)
+            .and_then(|binding| usize::try_from(binding.logical_bytes).ok())
+    }
+
+    pub fn zero_outputs(&self) -> Result<(), PrepareError> {
+        for binding in self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+        {
+            map_and_initialize(&binding.bo, binding.logical_bytes as usize, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn outputs_are_zero(&self) -> Result<bool, PrepareError> {
+        for binding in self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+        {
+            let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
+            if mapping.len() < binding.logical_bytes as usize {
+                return Err(PrepareError::InvalidMetadata);
+            }
+            // SAFETY: bounded read-only view while the mapping is alive.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    mapping.address().as_ptr(),
+                    binding.logical_bytes as usize,
+                )
+            };
+            if bytes.iter().any(|byte| *byte != 0) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn destroy(self) {
         drop(self);
     }
@@ -206,7 +320,7 @@ fn create_bindings<'device>(
         };
         let bo = device
             .create_bo(
-                requirement.bytes.max(1),
+                requirement.allocation_bytes.max(1),
                 DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM,
             )
             .map_err(PrepareError::Runtime)?;
@@ -214,14 +328,14 @@ fn create_bindings<'device>(
         if info.vpu_address % requirement.alignment != 0 {
             return Err(PrepareError::InvalidMetadata);
         }
-        map_and_initialize(&bo, requirement.bytes as usize, initial)?;
+        map_and_initialize(&bo, requirement.allocation_bytes as usize, initial)?;
         total = total
             .checked_add(info.bytes)
             .ok_or(PrepareError::BudgetExceeded)?;
         placements.push(PlacedSection {
             section: requirement.section,
             device_address: info.vpu_address,
-            bytes: requirement.bytes,
+            bytes: requirement.allocation_bytes,
         });
         buffers.push(BindingBuffer {
             section: requirement.section,
@@ -297,9 +411,11 @@ pub fn prepare_inference<'device>(
     elf: &ParsedIntelElf<'_>,
     hpi_requirements: &HpiRequirements,
     input_data: &[&[u8]],
+    budget: PreparationBudget,
 ) -> Result<PreparedInference<'device>, PrepareError> {
     validate_device(parameters).map_err(PrepareError::Validation)?;
-    let mut staged = stage_program(device, elf, hpi_requirements).map_err(PrepareError::Load)?;
+    let mut staged = stage_program(device, elf, hpi_requirements, budget.max_user_bo_bytes)
+        .map_err(PrepareError::Load)?;
     let requirements = collect_bindings(elf)?;
     let (bindings, binding_placements, binding_bo_bytes) =
         create_bindings(device, &requirements, input_data)?;
@@ -317,7 +433,7 @@ pub fn prepare_inference<'device>(
         .and_then(|total| total.checked_add(hpi_bo_bytes))
         .and_then(|total| total.checked_add(command_bo_bytes))
         .ok_or(PrepareError::BudgetExceeded)?;
-    if total_user_bo_bytes > MAX_TINY_SUBMISSION_BO_BYTES {
+    if total_user_bo_bytes > budget.max_user_bo_bytes {
         return Err(PrepareError::BudgetExceeded);
     }
 
@@ -402,31 +518,70 @@ pub fn prepare_inference<'device>(
         return Err(PrepareError::InvalidMetadata);
     }
 
-    // Managed CMDQ submit with preemption index 0 causes the kernel to allocate the reported
-    // preemption buffer. On this machine that is 28,389,376 bytes, violating the explicit 8 MiB
-    // proof budget. Keep the fully prepared resources unreachable from submit.
-    if parameters.preempt_buffer_bytes > 0
-        && total_user_bo_bytes
-            .checked_add(parameters.preempt_buffer_bytes)
-            .is_none_or(|total| total > MAX_TINY_SUBMISSION_BO_BYTES)
-    {
+    // Managed CMDQ submit with preemption index 0 causes the kernel to account the reported
+    // preemption allocation. Include it in the caller's queried/configured total ceiling.
+    let Some(total_accounted_bytes) =
+        total_user_bo_bytes.checked_add(parameters.preempt_buffer_bytes)
+    else {
+        return Err(PrepareError::BudgetExceeded);
+    };
+    if total_accounted_bytes > budget.max_total_accounted_bytes {
         return Err(PrepareError::ExplicitQueuePreemptionExceedsBudget {
             user_bytes: total_user_bo_bytes,
             preemption_bytes: parameters.preempt_buffer_bytes,
         });
     }
+    if command_info.flags & (DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_WC)
+        != DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_WC
+        || command_info.flags & super::uapi::DRM_IVPU_BO_READ_ONLY != 0
+        || command_info.vpu_address != command.vpu_address()
+        || hpi_info.flags & DRM_IVPU_BO_MAPPABLE == 0
+    {
+        return Err(PrepareError::InvalidMetadata);
+    }
+    for (section, placement) in staged.sections().iter().zip(staged.placements()) {
+        let info = section.bo.info().map_err(PrepareError::Runtime)?;
+        if info.vpu_address != placement.device_address
+            || info.bytes < placement.bytes.max(1)
+            || info.flags & !super::uapi::DRM_IVPU_BO_FLAGS != 0
+        {
+            return Err(PrepareError::InvalidMetadata);
+        }
+    }
+    for binding in &bindings {
+        let info = binding.bo.info().map_err(PrepareError::Runtime)?;
+        if info.flags & (DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
+            != DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM
+            || info.flags & super::uapi::DRM_IVPU_BO_READ_ONLY != 0
+            || info.vpu_address != binding.bo.vpu_address()
+            || info.bytes < binding.logical_bytes
+        {
+            return Err(PrepareError::InvalidMetadata);
+        }
+    }
 
-    Ok(PreparedInference {
+    let executable_bo_bytes = staged.total_bo_bytes;
+    let prepared = PreparedInference {
         staged,
         bindings,
         hpi,
         command,
         handles,
+        executable_bo_bytes,
+        binding_bo_bytes,
+        hpi_bo_bytes,
+        command_bo_bytes,
+        preemption_bytes: parameters.preempt_buffer_bytes,
         total_user_bo_bytes,
+        total_accounted_bytes,
         command_count,
         inference_id,
         command_digest,
-    })
+    };
+    if !prepared.outputs_are_zero()? {
+        return Err(PrepareError::InvalidMetadata);
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -468,8 +623,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "bench-hardware")]
-    #[ignore = "full dry-run preparation only; expected to stop at preemption budget, never submit"]
-    fn prepare_tiny_artifact_stops_before_submit() {
+    #[ignore = "full dry-run preparation only; allocates bounded BOs but never submits"]
+    fn prepare_tiny_artifact_with_accounted_preemption() {
         const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
         let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
         assert!(length <= 1024 * 1024);
@@ -486,20 +641,31 @@ mod tests {
         let hpi = inspect_hpi_requirements(&elf, &parameters).unwrap();
         let input0 = [0x11u8; 128];
         let input1 = [0x22u8; 128];
-        let result = prepare_inference(&device, &parameters, &elf, &hpi, &[&input0, &input1]);
+        let prepared = prepare_inference(
+            &device,
+            &parameters,
+            &elf,
+            &hpi,
+            &[&input0, &input1],
+            PreparationBudget {
+                max_user_bo_bytes: 64 * 1024 * 1024,
+                max_total_accounted_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
         std::println!(
-            "device={} artifact={PATH} preempt_buffer_bytes={} error={:?}",
+            "device={} artifact={PATH} preempt_buffer_bytes={} user_bo_bytes={} accounted_bytes={}",
             device.device_path().to_string_lossy(),
             parameters.preempt_buffer_bytes,
-            result.as_ref().err(),
+            prepared.total_user_bo_bytes,
+            prepared.total_accounted_bytes,
         );
-        assert!(matches!(
-            result,
-            Err(PrepareError::ExplicitQueuePreemptionExceedsBudget {
-                user_bytes,
-                preemption_bytes,
-            }) if user_bytes < 1024 * 1024
-                && preemption_bytes == parameters.preempt_buffer_bytes
-        ));
+        assert!(prepared.total_user_bo_bytes < 1024 * 1024);
+        assert_eq!(
+            prepared.total_accounted_bytes,
+            prepared.total_user_bo_bytes + parameters.preempt_buffer_bytes
+        );
+        assert!(prepared.total_accounted_bytes <= 64 * 1024 * 1024);
+        assert!(prepared.outputs_are_zero().unwrap());
     }
 }

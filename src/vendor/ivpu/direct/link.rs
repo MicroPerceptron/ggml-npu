@@ -66,7 +66,11 @@ pub struct SectionPlacement<'a> {
 pub struct BindingRequirement {
     pub section: usize,
     pub class: DeviceMemoryClass,
+    /// Host-visible tensor bytes from the section symbol. This can be smaller than the ELF
+    /// section because the compiler reserves private DMA padding after the logical tensor.
     pub bytes: u64,
+    /// Full NOBITS section extent that firmware may address.
+    pub allocation_bytes: u64,
     pub alignment: u64,
 }
 
@@ -191,14 +195,64 @@ pub fn visit_binding_requirements(
             None
         };
         if let Some(class) = class {
+            let mut logical = BindingLogicalSize::new(section.memory_bytes);
+            if elf
+                .visit_symbols(|symbol| {
+                    if symbol.section_index == section.index {
+                        logical.consider(symbol.value, symbol.bytes);
+                    }
+                })
+                .is_err()
+            {
+                logical.ambiguous = true;
+            }
             visitor(BindingRequirement {
                 section: section.index,
                 class,
-                bytes: section.memory_bytes,
+                bytes: logical.finish(),
+                allocation_bytes: section.memory_bytes,
                 alignment: section.alignment.max(1),
             });
         }
     });
+}
+
+#[derive(Clone, Copy)]
+struct BindingLogicalSize {
+    allocation_bytes: u64,
+    selected: Option<u64>,
+    ambiguous: bool,
+}
+
+impl BindingLogicalSize {
+    const fn new(allocation_bytes: u64) -> Self {
+        Self {
+            allocation_bytes,
+            selected: None,
+            ambiguous: false,
+        }
+    }
+
+    fn consider(&mut self, value: u64, bytes: u64) {
+        if value != 0 || bytes == 0 || bytes > self.allocation_bytes {
+            return;
+        }
+        match self.selected {
+            None => self.selected = Some(bytes),
+            Some(selected) if selected == bytes => {}
+            Some(_) => self.ambiguous = true,
+        }
+    }
+
+    const fn finish(self) -> u64 {
+        if self.ambiguous {
+            self.allocation_bytes
+        } else if let Some(bytes) = self.selected {
+            bytes
+        } else {
+            self.allocation_bytes
+        }
+    }
 }
 
 pub fn resolve_symbol(
@@ -359,5 +413,22 @@ mod tests {
             apply_link_operation(&mut [], operation(R_VPU_64, 8), 0),
             Err(LinkError::TargetOutOfBounds)
         );
+    }
+
+    #[test]
+    fn binding_symbol_size_preserves_private_section_padding() {
+        let mut size = BindingLogicalSize::new(138_240);
+        size.consider(0, 131_072);
+        assert_eq!(size.finish(), 131_072);
+
+        let mut invalid = BindingLogicalSize::new(138_240);
+        invalid.consider(1, 131_072);
+        invalid.consider(0, 140_000);
+        assert_eq!(invalid.finish(), 138_240);
+
+        let mut ambiguous = BindingLogicalSize::new(138_240);
+        ambiguous.consider(0, 131_072);
+        ambiguous.consider(0, 130_000);
+        assert_eq!(ambiguous.finish(), 138_240);
     }
 }

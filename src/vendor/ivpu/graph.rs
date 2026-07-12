@@ -33,183 +33,248 @@ pub(super) fn run_native_blob(
     inputs: &[&[f32]],
     output: &mut [f32],
 ) -> Result<usize, i32> {
-    let l = ze::lib().ok_or(-1)?;
-    unsafe {
-        // Context.
-        let mut ctx_desc: ze_context_desc_t = mem::zeroed();
-        ctx_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
-        let mut ctx: ze_context_handle_t = ptr::null_mut();
-        chk((l.context_create)(dev.driver, &ctx_desc, &mut ctx))?;
+    let mut fixture = PersistentNativeGraph::new(dev, blob, inputs)?;
+    fixture.execute(2_000_000_000)?;
+    fixture.copy_output(output)
+}
 
-        // Run the body; always tear the context down afterwards.
-        let r = run_inner(l, dev, ctx, blob, inputs, output);
-        (l.context_destroy)(ctx);
-        r
+/// Reusable Level Zero fixture used by the one-shot self-test and guarded hardware benchmark.
+pub(super) struct PersistentNativeGraph {
+    l: &'static ze::ZeLib,
+    graph_table: *mut ze_graph_dditable_ext_t,
+    context: ze_context_handle_t,
+    graph: ze_graph_handle_t,
+    queue: ze_command_queue_handle_t,
+    execute_list: ze_command_list_handle_t,
+    memories: Vec<*mut c_void>,
+    output: *mut f32,
+    output_elements: usize,
+    failed: bool,
+}
+
+impl PersistentNativeGraph {
+    pub(super) fn new(dev: &ze::Device, blob: &[u8], inputs: &[&[f32]]) -> Result<Self, i32> {
+        let l = ze::lib().ok_or(-1)?;
+        // SAFETY: every Level Zero handle is initialized before use and owned by the fixture.
+        unsafe {
+            let mut table: *mut c_void = ptr::null_mut();
+            chk((l.get_ext_fn_addr)(
+                dev.driver,
+                c"ZE_extension_graph".as_ptr(),
+                &mut table,
+            ))?;
+            let graph_table = table.cast::<ze_graph_dditable_ext_t>();
+            if graph_table.is_null() {
+                return Err(-2);
+            }
+            let pfn_create = (*graph_table).pfnCreate.ok_or(-3)?;
+            let pfn_props = (*graph_table).pfnGetProperties.ok_or(-3)?;
+            let pfn_arg = (*graph_table).pfnGetArgumentProperties.ok_or(-3)?;
+            let pfn_set = (*graph_table).pfnSetArgumentValue.ok_or(-3)?;
+            let pfn_init = (*graph_table).pfnAppendGraphInitialize.ok_or(-3)?;
+            let pfn_exec = (*graph_table).pfnAppendGraphExecute.ok_or(-3)?;
+
+            let mut context_desc: ze_context_desc_t = mem::zeroed();
+            context_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
+            let mut context = ptr::null_mut();
+            chk((l.context_create)(dev.driver, &context_desc, &mut context))?;
+            let mut fixture = Self {
+                l,
+                graph_table,
+                context,
+                graph: ptr::null_mut(),
+                queue: ptr::null_mut(),
+                execute_list: ptr::null_mut(),
+                memories: Vec::new(),
+                output: ptr::null_mut(),
+                output_elements: 0,
+                failed: false,
+            };
+
+            let graph_desc = ze_graph_desc_t {
+                stype: ZE_STRUCTURE_TYPE_GRAPH_DESC,
+                pNext: ptr::null_mut(),
+                format: ZE_GRAPH_FORMAT_NATIVE,
+                inputSize: blob.len(),
+                pInput: blob.as_ptr(),
+                pBuildFlags: ptr::null(),
+            };
+            chk(pfn_create(
+                fixture.context,
+                dev.handle,
+                &graph_desc,
+                &mut fixture.graph,
+            ))?;
+
+            let mut properties: ze_graph_properties_t = mem::zeroed();
+            properties.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES;
+            chk(pfn_props(fixture.graph, &mut properties))?;
+
+            let mut host_desc: ze_host_mem_alloc_desc_t = mem::zeroed();
+            host_desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+            let mut input_index = 0usize;
+            for argument in 0..properties.numGraphArgs {
+                let mut argument_properties: ze_graph_argument_properties_t = mem::zeroed();
+                argument_properties.stype = ZE_STRUCTURE_TYPE_GRAPH_ARGUMENT_PROPERTIES;
+                chk(pfn_arg(fixture.graph, argument, &mut argument_properties))?;
+                let elements = argument_properties
+                    .dims
+                    .iter()
+                    .copied()
+                    .filter(|dimension| *dimension != 0)
+                    .try_fold(1usize, |product, dimension| {
+                        product.checked_mul(dimension as usize).ok_or(-4)
+                    })?;
+                let element_bytes = match argument_properties.devicePrecision {
+                    ZE_GRAPH_ARGUMENT_PRECISION_FP32
+                    | ZE_GRAPH_ARGUMENT_PRECISION_INT32
+                    | ZE_GRAPH_ARGUMENT_PRECISION_UINT32 => 4,
+                    ZE_GRAPH_ARGUMENT_PRECISION_FP16 => 2,
+                    ZE_GRAPH_ARGUMENT_PRECISION_INT64 | ZE_GRAPH_ARGUMENT_PRECISION_UINT64 => 8,
+                    _ => return Err(-4),
+                };
+                let bytes = elements.checked_mul(element_bytes).ok_or(-4)?;
+                let mut memory = ptr::null_mut();
+                chk((l.mem_alloc_host)(
+                    fixture.context,
+                    &host_desc,
+                    bytes,
+                    4096,
+                    &mut memory,
+                ))?;
+                fixture.memories.push(memory);
+                ptr::write_bytes(memory.cast::<u8>(), 0, bytes);
+
+                if argument_properties.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
+                    let input = inputs.get(input_index).ok_or(-4)?;
+                    if input.len().checked_mul(mem::size_of::<f32>()) != Some(bytes) {
+                        return Err(-4);
+                    }
+                    ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), memory.cast(), bytes);
+                    input_index += 1;
+                } else if fixture.output.is_null() {
+                    fixture.output = memory.cast::<f32>();
+                    fixture.output_elements = elements;
+                }
+                chk(pfn_set(fixture.graph, argument, memory))?;
+            }
+            if input_index != inputs.len() || fixture.output.is_null() {
+                return Err(-4);
+            }
+
+            let mut queue_desc: ze_command_queue_desc_t = mem::zeroed();
+            queue_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+            queue_desc.ordinal = 0;
+            queue_desc.mode = ZE_COMMAND_QUEUE_MODE_DEFAULT;
+            chk((l.cmd_queue_create)(
+                fixture.context,
+                dev.handle,
+                &queue_desc,
+                &mut fixture.queue,
+            ))?;
+
+            let mut list_desc: ze_command_list_desc_t = mem::zeroed();
+            list_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
+            list_desc.commandQueueGroupOrdinal = 0;
+            let mut initialize_list = ptr::null_mut();
+            chk((l.cmd_list_create)(
+                fixture.context,
+                dev.handle,
+                &list_desc,
+                &mut initialize_list,
+            ))?;
+            let initialize_result = (|| {
+                chk(pfn_init(
+                    initialize_list,
+                    fixture.graph,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                ))?;
+                chk((l.cmd_list_close)(initialize_list))?;
+                chk((l.cmd_queue_exec)(
+                    fixture.queue,
+                    1,
+                    &mut initialize_list,
+                    ptr::null_mut(),
+                ))?;
+                chk((l.cmd_queue_sync)(fixture.queue, 2_000_000_000))
+            })();
+            (l.cmd_list_destroy)(initialize_list);
+            initialize_result?;
+
+            chk((l.cmd_list_create)(
+                fixture.context,
+                dev.handle,
+                &list_desc,
+                &mut fixture.execute_list,
+            ))?;
+            chk(pfn_exec(
+                fixture.execute_list,
+                fixture.graph,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            ))?;
+            chk((l.cmd_list_close)(fixture.execute_list))?;
+            Ok(fixture)
+        }
+    }
+
+    pub(super) fn execute(&mut self, timeout_ns: u64) -> Result<(), i32> {
+        if self.failed {
+            return Err(-6);
+        }
+        // SAFETY: the closed list and queue remain owned and idle after each successful sync.
+        let result = unsafe {
+            chk((self.l.cmd_queue_exec)(
+                self.queue,
+                1,
+                &mut self.execute_list,
+                ptr::null_mut(),
+            ))
+            .and_then(|()| chk((self.l.cmd_queue_sync)(self.queue, timeout_ns)))
+        };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub(super) fn copy_output(&self, output: &mut [f32]) -> Result<usize, i32> {
+        if self.failed || self.output.is_null() || output.len() < self.output_elements {
+            return Err(-7);
+        }
+        // SAFETY: synchronization precedes this read and the output allocation remains live.
+        unsafe {
+            ptr::copy_nonoverlapping(self.output, output.as_mut_ptr(), self.output_elements);
+        }
+        Ok(self.output_elements)
     }
 }
 
-unsafe fn run_inner(
-    l: &ze::ZeLib,
-    dev: &ze::Device,
-    ctx: ze_context_handle_t,
-    blob: &[u8],
-    inputs: &[&[f32]],
-    output: &mut [f32],
-) -> Result<usize, i32> {
-    // Graph dispatch table (v1.0 fields only; base name gives a >=1.0 table).
-    let mut table: *mut c_void = ptr::null_mut();
-    chk((l.get_ext_fn_addr)(
-        dev.driver,
-        c"ZE_extension_graph".as_ptr(),
-        &mut table,
-    ))?;
-    let g = table as *mut ze_graph_dditable_ext_t;
-    if g.is_null() {
-        return Err(-2);
-    }
-    let pfn_create = (*g).pfnCreate.ok_or(-3)?;
-    let pfn_props = (*g).pfnGetProperties.ok_or(-3)?;
-    let pfn_arg = (*g).pfnGetArgumentProperties.ok_or(-3)?;
-    let pfn_set = (*g).pfnSetArgumentValue.ok_or(-3)?;
-    let pfn_init = (*g).pfnAppendGraphInitialize.ok_or(-3)?;
-    let pfn_exec = (*g).pfnAppendGraphExecute.ok_or(-3)?;
-
-    // Create the graph from the native blob.
-    let mut gd: ze_graph_desc_t = mem::zeroed();
-    gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC;
-    gd.format = ZE_GRAPH_FORMAT_NATIVE;
-    gd.inputSize = blob.len();
-    gd.pInput = blob.as_ptr();
-    let mut graph: ze_graph_handle_t = ptr::null_mut();
-    chk(pfn_create(ctx, dev.handle, &gd, &mut graph))?;
-
-    let mut gp: ze_graph_properties_t = mem::zeroed();
-    gp.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES;
-    chk(pfn_props(graph, &mut gp))?;
-
-    // Allocate a host buffer per argument, bind it, fill inputs.
-    let mut host_desc: ze_host_mem_alloc_desc_t = mem::zeroed();
-    host_desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
-    let mut mems: Vec<*mut c_void> = Vec::new();
-    let mut out_ptr: *mut c_void = ptr::null_mut();
-    let mut out_elems: usize = 0;
-    let mut input_idx: usize = 0;
-
-    for i in 0..gp.numGraphArgs {
-        let mut ap: ze_graph_argument_properties_t = mem::zeroed();
-        ap.stype = ZE_STRUCTURE_TYPE_GRAPH_ARGUMENT_PROPERTIES;
-        chk(pfn_arg(graph, i, &mut ap))?;
-
-        let mut elems: usize = 1;
-        for k in 0..(ZE_MAX_GRAPH_ARGUMENT_DIMENSIONS_SIZE as usize) {
-            let d = ap.dims[k];
-            if d > 0 {
-                elems *= d as usize;
+impl Drop for PersistentNativeGraph {
+    fn drop(&mut self) {
+        // SAFETY: each non-null handle is uniquely owned and destroyed in dependency order.
+        unsafe {
+            if !self.execute_list.is_null() {
+                (self.l.cmd_list_destroy)(self.execute_list);
             }
-        }
-        let psz: usize = match ap.devicePrecision {
-            ZE_GRAPH_ARGUMENT_PRECISION_FP32 => 4,
-            ZE_GRAPH_ARGUMENT_PRECISION_FP16 => 2,
-            ZE_GRAPH_ARGUMENT_PRECISION_INT32 | ZE_GRAPH_ARGUMENT_PRECISION_UINT32 => 4,
-            ZE_GRAPH_ARGUMENT_PRECISION_INT64 | ZE_GRAPH_ARGUMENT_PRECISION_UINT64 => 8,
-            _ => 0,
-        };
-        if psz == 0 {
-            free_all(l, ctx, &mems);
-            return Err(-4);
-        }
-        let bytes = elems * psz;
-
-        let mut mem_ptr: *mut c_void = ptr::null_mut();
-        if chk((l.mem_alloc_host)(
-            ctx,
-            &host_desc,
-            bytes,
-            4096,
-            &mut mem_ptr,
-        ))
-        .is_err()
-        {
-            free_all(l, ctx, &mems);
-            return Err(-4);
-        }
-        mems.push(mem_ptr);
-        ptr::write_bytes(mem_ptr as *mut u8, 0, bytes);
-
-        if ap.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
-            if let Some(src) = inputs.get(input_idx) {
-                let src_bytes = src.len() * core::mem::size_of::<f32>();
-                if src_bytes == bytes {
-                    ptr::copy_nonoverlapping(
-                        src.as_ptr().cast::<u8>(),
-                        mem_ptr.cast::<u8>(),
-                        bytes,
-                    );
+            if !self.queue.is_null() {
+                (self.l.cmd_queue_destroy)(self.queue);
+            }
+            for &memory in &self.memories {
+                (self.l.mem_free)(self.context, memory);
+            }
+            if !self.graph.is_null() && !self.graph_table.is_null() {
+                if let Some(destroy) = (*self.graph_table).pfnDestroy {
+                    destroy(self.graph);
                 }
             }
-            input_idx += 1;
-        } else {
-            out_ptr = mem_ptr;
-            out_elems = elems;
+            if !self.context.is_null() {
+                (self.l.context_destroy)(self.context);
+            }
         }
-
-        if chk(pfn_set(graph, i, mem_ptr)).is_err() {
-            free_all(l, ctx, &mems);
-            return Err(-5);
-        }
-    }
-
-    // Command queue + list; append graph init then execute; run and wait.
-    let mut qd: ze_command_queue_desc_t = mem::zeroed();
-    qd.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
-    qd.ordinal = 0;
-    qd.mode = ZE_COMMAND_QUEUE_MODE_DEFAULT;
-    let mut queue: ze_command_queue_handle_t = ptr::null_mut();
-    chk((l.cmd_queue_create)(ctx, dev.handle, &qd, &mut queue))?;
-
-    let mut ld: ze_command_list_desc_t = mem::zeroed();
-    ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
-    ld.commandQueueGroupOrdinal = 0;
-    let mut cl: ze_command_list_handle_t = ptr::null_mut();
-    chk((l.cmd_list_create)(ctx, dev.handle, &ld, &mut cl))?;
-
-    let mut result: Result<usize, i32> = (|| {
-        chk(pfn_init(cl, graph, ptr::null_mut(), 0, ptr::null_mut()))?;
-        chk(pfn_exec(
-            cl,
-            graph,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-        ))?;
-        chk((l.cmd_list_close)(cl))?;
-        chk((l.cmd_queue_exec)(queue, 1, &mut cl, ptr::null_mut()))?;
-        chk((l.cmd_queue_sync)(queue, u64::MAX))?;
-        Ok(0)
-    })();
-
-    // Copy the output out.
-    if result.is_ok() && !out_ptr.is_null() {
-        let n = core::cmp::min(output.len(), out_elems);
-        let src = out_ptr as *const f32;
-        for j in 0..n {
-            output[j] = *src.add(j);
-        }
-        result = Ok(n);
-    }
-
-    (l.cmd_list_destroy)(cl);
-    (l.cmd_queue_destroy)(queue);
-    free_all(l, ctx, &mems);
-    if let Some(destroy) = (*g).pfnDestroy {
-        destroy(graph);
-    }
-    result
-}
-
-unsafe fn free_all(l: &ze::ZeLib, ctx: ze_context_handle_t, mems: &[*mut c_void]) {
-    for &p in mems {
-        (l.mem_free)(ctx, p);
     }
 }

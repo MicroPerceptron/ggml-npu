@@ -8,10 +8,7 @@ use core::sync::atomic::{fence, Ordering};
 
 use crate::runtime::{Deadline, RuntimeError};
 
-use super::{
-    BoMapping, BufferInfo, BufferObject, CommandQueue, DeviceParameters, IvpuDevice,
-    MAX_DIRECT_BO_BYTES,
-};
+use super::{BoMapping, BufferInfo, BufferObject, CommandQueue, DeviceParameters, IvpuDevice};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRole {
@@ -31,12 +28,7 @@ pub struct BufferSpec {
 
 impl BufferSpec {
     pub fn validate(self) -> Result<Self, RuntimeError> {
-        let role_limit = match self.role {
-            BufferRole::Command => 1024 * 1024,
-            BufferRole::Program | BufferRole::Scratch => MAX_DIRECT_BO_BYTES,
-            BufferRole::Binding => 16 * 1024 * 1024,
-        };
-        if self.bytes == 0 || self.bytes > role_limit {
+        if self.bytes == 0 || self.bytes > usize::MAX as u64 {
             return Err(RuntimeError::ResourceLimit);
         }
         if self.role == BufferRole::Command && (!self.host_visible || self.read_only) {

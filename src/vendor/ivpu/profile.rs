@@ -85,6 +85,16 @@ static N_ARGS_OWNED: AtomicU64 = AtomicU64::new(0); // bound directly (zero copy
 static N_ARGS_BOUNCED: AtomicU64 = AtomicU64::new(0); // staged through a bounce buffer
 static BYTES_IN: AtomicU64 = AtomicU64::new(0);
 static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static ACCOUNTED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_LIMIT: AtomicU64 = AtomicU64::new(0);
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXECUTABLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static BINDING_BYTES: AtomicU64 = AtomicU64::new(0);
+static HPI_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMAND_BYTES: AtomicU64 = AtomicU64::new(0);
+static PREEMPTION_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Is profiling on? Resolves `GGML_NPU_PROFILE` once and registers the exit dump on first enable.
 pub(super) fn enabled() -> bool {
@@ -136,27 +146,62 @@ pub(super) fn record(
     }));
 }
 
+pub(super) fn event(event: MetricEvent) {
+    if enabled() {
+        PROFILE_SINK.event(event);
+    }
+}
+
 struct ProfileSink;
 static PROFILE_SINK: ProfileSink = ProfileSink;
 
 impl MetricsSink for ProfileSink {
     fn event(&self, event: MetricEvent) {
-        let MetricEvent::Dispatch(metrics) = event else {
-            return;
-        };
-        N_DISPATCH.fetch_add(1, Ordering::Relaxed);
-        T_STAGE_IN.fetch_add(metrics.stage_in_ns, Ordering::Relaxed);
-        T_SUBMIT.fetch_add(metrics.submit_ns, Ordering::Relaxed);
-        T_SYNC.fetch_add(metrics.wait_ns, Ordering::Relaxed);
-        T_DEVICE.fetch_add(
-            metrics.submit_ns.saturating_add(metrics.wait_ns),
-            Ordering::Relaxed,
-        );
-        T_COPY_OUT.fetch_add(metrics.copy_out_ns, Ordering::Relaxed);
-        N_ARGS_OWNED.fetch_add(metrics.owned_bindings, Ordering::Relaxed);
-        N_ARGS_BOUNCED.fetch_add(metrics.bounced_bindings, Ordering::Relaxed);
-        BYTES_IN.fetch_add(metrics.bytes_in, Ordering::Relaxed);
-        BYTES_OUT.fetch_add(metrics.bytes_out, Ordering::Relaxed);
+        match event {
+            MetricEvent::Dispatch(metrics) => {
+                N_DISPATCH.fetch_add(1, Ordering::Relaxed);
+                T_STAGE_IN.fetch_add(metrics.stage_in_ns, Ordering::Relaxed);
+                T_SUBMIT.fetch_add(metrics.submit_ns, Ordering::Relaxed);
+                T_SYNC.fetch_add(metrics.wait_ns, Ordering::Relaxed);
+                T_DEVICE.fetch_add(
+                    metrics.submit_ns.saturating_add(metrics.wait_ns),
+                    Ordering::Relaxed,
+                );
+                T_COPY_OUT.fetch_add(metrics.copy_out_ns, Ordering::Relaxed);
+                N_ARGS_OWNED.fetch_add(metrics.owned_bindings, Ordering::Relaxed);
+                N_ARGS_BOUNCED.fetch_add(metrics.bounced_bindings, Ordering::Relaxed);
+                BYTES_IN.fetch_add(metrics.bytes_in, Ordering::Relaxed);
+                BYTES_OUT.fetch_add(metrics.bytes_out, Ordering::Relaxed);
+            }
+            MetricEvent::MemoryState {
+                resident_bytes,
+                resident_high_water,
+                accounted_high_water,
+                resident_limit,
+            } => {
+                RESIDENT_BYTES.store(resident_bytes, Ordering::Relaxed);
+                RESIDENT_HIGH_WATER.fetch_max(resident_high_water, Ordering::Relaxed);
+                ACCOUNTED_HIGH_WATER.fetch_max(accounted_high_water, Ordering::Relaxed);
+                RESIDENT_LIMIT.store(resident_limit, Ordering::Relaxed);
+            }
+            MetricEvent::CacheEviction { bytes, .. } => {
+                EVICTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            MetricEvent::DirectMemoryBreakdown {
+                executable_bytes,
+                binding_bytes,
+                hpi_bytes,
+                command_bytes,
+                preemption_bytes,
+            } => {
+                EXECUTABLE_BYTES.store(executable_bytes, Ordering::Relaxed);
+                BINDING_BYTES.store(binding_bytes, Ordering::Relaxed);
+                HPI_BYTES.store(hpi_bytes, Ordering::Relaxed);
+                COMMAND_BYTES.store(command_bytes, Ordering::Relaxed);
+                PREEMPTION_BYTES.store(preemption_bytes, Ordering::Relaxed);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -212,7 +257,9 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
          \x20   \\- sync   (wait NPU)  : {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
          \x20 copy-out (bounce->host) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 ---- host copy total    : {:>9.3} ms  ({:.1}%)     device total: {:.3} ms ({:.1}%)\n\
-         \x20 args: {owned} owned (zero-copy) / {bounced} bounced  ({:.1}% zero-copy of {args})\n",
+         \x20 args: {owned} owned (zero-copy) / {bounced} bounced  ({:.1}% zero-copy of {args})\n\
+         \x20 direct memory: resident {:.2} MiB, resident high {:.2} MiB, accounted high {:.2} MiB, limit {:.2} MiB, evicted {:.2} MiB\n\
+         \x20 latest program: executable {:.2} MiB, bindings {:.2} MiB, HPI {:.2} MiB, command {:.2} MiB, preemption {:.2} MiB\n",
         ms(total),
         us_per(total, n),
         ms(ti),
@@ -237,6 +284,16 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         ms(td),
         pct(td, total),
         pct(owned, args.max(1)),
+        RESIDENT_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        RESIDENT_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        ACCOUNTED_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        RESIDENT_LIMIT.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        EVICTED_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        EXECUTABLE_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        BINDING_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        HPI_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        COMMAND_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        PREEMPTION_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
     );
     unsafe { write(2, s.as_ptr(), s.len()) };
 }

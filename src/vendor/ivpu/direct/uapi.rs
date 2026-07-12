@@ -2,7 +2,7 @@
 //!
 //! Source: `/usr/include/drm/ivpu_accel.h`, SPDX
 //! `GPL-2.0-only WITH Linux-syscall-note`, copyright 2020-2025 Intel. Only GET_PARAM and GEM BO
-//! ownership are represented here. Submission, command queues, and firmware packets are omitted.
+//! ownership and the stable command-queue submit envelope are represented here.
 
 #![allow(dead_code)]
 
@@ -93,7 +93,7 @@ pub struct DrmIvpuCmdqDestroy {
     pub cmdq_id: u32,
 }
 
-/// Layout only. No direct submit wrapper exists until command bytes pass the dry-run validator.
+/// Stable explicit command-queue submit envelope. Firmware command bytes are versioned separately.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DrmIvpuCmdqSubmit {

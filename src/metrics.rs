@@ -28,6 +28,23 @@ pub enum MetricEvent {
         domain: &'static str,
         bytes: u64,
     },
+    MemoryState {
+        resident_bytes: u64,
+        resident_high_water: u64,
+        accounted_high_water: u64,
+        resident_limit: u64,
+    },
+    DirectMemoryBreakdown {
+        executable_bytes: u64,
+        binding_bytes: u64,
+        hpi_bytes: u64,
+        command_bytes: u64,
+        preemption_bytes: u64,
+    },
+    CacheEviction {
+        cache: &'static str,
+        bytes: u64,
+    },
     Compiler {
         stage: &'static str,
         elapsed_ns: u64,

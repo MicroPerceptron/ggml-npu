@@ -1,0 +1,4 @@
+[submodule "third_party/intel-npu-compiler"]
+	path = third_party/intel-npu-compiler
+	url = https://github.com/MicroPerceptron/intel-npu-compiler.git
+	branch = develop

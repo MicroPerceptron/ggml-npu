@@ -18,6 +18,7 @@
 #include <openvino/op/divide.hpp>
 #include <openvino/op/group_conv.hpp>
 #include <openvino/op/gather.hpp>
+#include <openvino/op/gather_elements.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/parameter.hpp>
@@ -47,6 +48,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -102,8 +105,62 @@ static bool read_blob(const std::string& path, uint8_t** out, size_t* out_len) {
     return true;
 }
 
+static size_t cache_budget_bytes() {
+    const char* value = std::getenv("GGML_NPU_DISK_CACHE_MB");
+    if (!value || !*value) {
+        return 0;
+    }
+    char* end = nullptr;
+    unsigned long long mib = std::strtoull(value, &end, 10);
+    if (!end || *end != '\0' || mib == 0 ||
+        mib > static_cast<unsigned long long>(SIZE_MAX / (1024 * 1024))) {
+        return 0;
+    }
+    return static_cast<size_t>(mib) * 1024 * 1024;
+}
+
+static bool reserve_cache_bytes(const std::string& path, size_t incoming) {
+    const size_t budget = cache_budget_bytes();
+    if (budget == 0) {
+        return true;
+    }
+    if (incoming > budget) {
+        return false;
+    }
+    namespace fs = std::filesystem;
+    std::error_code error;
+    fs::path target(path);
+    std::vector<fs::directory_entry> blobs;
+    uintmax_t total = 0;
+    for (fs::directory_iterator it(target.parent_path(), error), end; !error && it != end;
+         it.increment(error)) {
+        if (!it->is_regular_file(error) || it->path() == target ||
+            it->path().extension() != ".blob") {
+            continue;
+        }
+        total += it->file_size(error);
+        blobs.push_back(*it);
+    }
+    std::sort(blobs.begin(), blobs.end(), [&error](const auto& left, const auto& right) {
+        return left.last_write_time(error) < right.last_write_time(error);
+    });
+    for (const auto& entry : blobs) {
+        if (total + incoming <= budget) {
+            break;
+        }
+        const uintmax_t bytes = entry.file_size(error);
+        if (fs::remove(entry.path(), error)) {
+            total = bytes > total ? 0 : total - bytes;
+        }
+    }
+    return total + incoming <= budget;
+}
+
 // Write blob bytes atomically (temp + rename) so a concurrent/aborted run never loads a partial.
 static void write_blob(const std::string& path, const void* data, size_t len) {
+    if (!reserve_cache_bytes(path, len)) {
+        return;
+    }
     std::string tmp = path + ".tmp";
     {
         std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
@@ -808,9 +865,24 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
                     if (b.get_element_type() != ov::element::i32 && b.get_element_type() != ov::element::i64) {
                         b = std::make_shared<v0::Convert>(b, ov::element::i32);
                     }
-                    b = reshape_to(b.get_node_shared_ptr(), {-1});
-                    auto axis = v0::Constant::create(ov::element::i32, {}, std::vector<int32_t>{2});
-                    result = std::make_shared<ov::op::v8::Gather>(a, b, axis);
+                    const auto& source = tensors[nd.inputs[0]];
+                    const auto& output = tensors[nd.output];
+                    if (source.ne[0] <= 0 || output.ne[0] != source.ne[0] ||
+                        elements(nd.output) != elements(nd.inputs[1]) * source.ne[0]) {
+                        return -1;
+                    }
+                    // ggml GET_ROWS selects independently for every outer index. Flattening all
+                    // indices into an opset8 Gather cross-products the token dimension (e.g.
+                    // 16 tokens x top-4 routes became 64 rows for each token). Expand each index
+                    // across the row width and gather on the reversed-layout row axis instead.
+                    auto index_shape = std::vector<int64_t>{
+                        output.ne[3], output.ne[2], output.ne[1], 1};
+                    auto per_element = reshape_output(b, index_shape);
+                    auto repeats = v0::Constant::create(
+                        ov::element::i64, {4},
+                        std::vector<int64_t>{1, 1, 1, source.ne[0]});
+                    per_element = std::make_shared<v0::Tile>(per_element, repeats);
+                    result = std::make_shared<ov::op::v6::GatherElements>(a, per_element, 2);
                     break;
                 }
                 case NPU_IR_SET_ROWS: {

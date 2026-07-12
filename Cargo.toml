@@ -12,12 +12,12 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-default = []
-# Linux intel_vpu discovery and checked UAPI wrappers. This intentionally excludes command
-# submission and firmware packet definitions.
+default = ["direct-ivpu"]
+# Linux intel_vpu discovery, checked UAPI wrappers, and release-pinned firmware command validation.
 direct-ivpu = ["dep:goblin"]
+level-zero-compat = []
 bench = ["dep:criterion", "direct-ivpu"]
-bench-hardware = ["direct-ivpu"]
+bench-hardware = ["bench", "level-zero-compat"]
 
 [dependencies]
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
@@ -50,3 +50,8 @@ required-features = ["bench"]
 name = "runtime"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "hardware"
+harness = false
+required-features = ["bench-hardware"]

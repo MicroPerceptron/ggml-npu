@@ -28,6 +28,7 @@ pub struct Operand {
     pub ptr: *mut c_void,
     pub elems: usize,
     pub dtype: crate::ffi::ggml_type,
+    #[allow(dead_code)]
     pub owned: bool,
 }
 
