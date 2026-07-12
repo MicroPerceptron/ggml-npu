@@ -775,11 +775,15 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 // `supports_op` (`graph_node_feasible`) and `graph_support` (`graph_feasible`) share the same
 // wire-op allowlist, MoE/attention env gates, input-arity ceiling, and compiler/runtime readiness
 // checks so the scheduler cannot over-claim work the lowerer will reject (#8).
+// Layout/metadata ops stay on the wire allowlist for *fused* graphs, but are never standalone
+// capability claims: OpenVINO rejects View-only (and other layout-only) programs with
+// ZE_RESULT_ERROR_UNSUPPORTED_FEATURE (#5/#8, FINDING/fail-closed-claimed-view-partition-compile).
 // ---------------------------------------------------------------------------
 
 /// Wire ops the Intel graph compiler admits today. Keep in lockstep with shim lowering.
 /// Coverage gates compare this set to `tests/coverage_matrix.csv` so claims cannot outrun proofs (#12).
 /// Env/policy gates are applied separately via `env_policy_admits` (#8).
+/// Layout ops (View/Reshape/…) remain listed for fused regions; standalone rejection is elsewhere.
 pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
     matches!(
         op,
@@ -812,6 +816,17 @@ pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
     )
 }
 
+/// True when every node is shape/layout bookkeeping (View/Reshape/Cont/Transpose/Permute).
+/// Intel's OpenVINO NPU path cannot lower these as standalone programs.
+fn graph_is_layout_only(graph: &GraphIr) -> bool {
+    !graph.nodes.is_empty()
+        && graph.nodes.iter().all(|node| {
+            node.spec
+                .ok()
+                .is_some_and(|spec| spec.traits.metadata || spec.placement == crate::graph::PlacementClass::Metadata)
+        })
+}
+
 /// Shared MoE / attention policy gates used by both per-node and whole-graph feasibility.
 fn env_policy_admits(spec: &crate::graph::OpSpec, runtime_matmul: bool) -> bool {
     if spec.traits.moe && !moe_enabled() {
@@ -828,6 +843,21 @@ fn compiler_runtime_ready() -> bool {
 }
 
 pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
+    if graph.nodes.is_empty()
+        || graph.outputs.is_empty()
+        || graph.inputs.len() > 64
+        || graph.outputs.len() > 8
+    {
+        super::profile::note("[npu ir2] rejected graph size or binding limits\n");
+        return false;
+    }
+    // Fail-closed before shim/runtime probes: layout-only partitions cannot lower (#5/#8).
+    if graph_is_layout_only(graph) {
+        super::profile::note(
+            "[npu ir2] rejected layout-only graph: OpenVINO cannot lower View/Reshape/Cont/Transpose/Permute alone\n",
+        );
+        return false;
+    }
     if !execution_runtime_available() {
         super::profile::note("[npu ir2] unavailable: selected execution runtime rejected device\n");
         return false;
@@ -838,14 +868,6 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
     };
     if s.compile_graph.is_none() {
         super::profile::note("[npu ir2] unavailable: shim lacks graph compiler symbol\n");
-        return false;
-    }
-    if graph.nodes.is_empty()
-        || graph.outputs.is_empty()
-        || graph.inputs.len() > 64
-        || graph.outputs.len() > 8
-    {
-        super::profile::note("[npu ir2] rejected graph size or binding limits\n");
         return false;
     }
     for (index, value) in graph.values.iter().enumerate() {
@@ -920,6 +942,14 @@ pub(super) unsafe fn graph_node_feasible(
     spec: &crate::graph::OpSpec,
 ) -> bool {
     if node.is_null() || !compiler_runtime_ready() || !tensor_constant_admitted(node) {
+        return false;
+    }
+    // Layout/metadata cannot execute correctly as a unitary NPU program (OpenVINO
+    // ZE_RESULT_ERROR_UNSUPPORTED_FEATURE). Keep them off `supports_op` so the scheduler
+    // places them on CPU/Vulkan instead of claiming then aborting (#5/#8). They remain on
+    // `wire_op_compile_supported` so a fused GraphIr that still contains layout nodes next to
+    // real compute can pass `graph_feasible` — layout-only graphs cannot.
+    if spec.traits.metadata || spec.placement == crate::graph::PlacementClass::Metadata {
         return false;
     }
     let input_count = (*node).src.iter().filter(|src| !src.is_null()).count();
@@ -1826,5 +1856,100 @@ mod tests {
         assert!(!spec.traits.attention);
         assert_eq!(spec.wire, crate::graph::WireOp::SetRows);
         assert_eq!(spec.placement, crate::graph::PlacementClass::Stateful);
+    }
+
+    #[test]
+    fn layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted() {
+        // View stays on the wire allowlist for fused ShortConv/FFN regions, but a disconnected
+        // View-only partition must not be claimed — OpenVINO returns UNSUPPORTED_FEATURE (#5/#8).
+        use crate::graph::{
+            Dim, GraphIr, Node, OpRegistry, OperationContract, TensorDesc, TensorRole,
+            OP_PARAM_BYTES,
+        };
+        assert!(wire_op_compile_supported(crate::graph::WireOp::View));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Reshape));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Transpose));
+
+        let view_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_VIEW,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("View must decode as Metadata");
+        assert!(view_spec.traits.metadata);
+        assert_eq!(view_spec.placement, crate::graph::PlacementClass::Metadata);
+
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(1),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 4, 4, 4],
+            role,
+            data,
+            owned: false,
+            shared: None,
+        };
+        let view_only = GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::RuntimeInput, 1),
+                tensor(TensorRole::Output, 2),
+            ],
+            nodes: alloc::vec![Node {
+                op: crate::ffi::GGML_OP_VIEW,
+                spec: Ok(view_spec),
+                inputs: alloc::vec![0],
+                output: 1,
+                op_params: [0; OP_PARAM_BYTES],
+            }],
+            inputs: alloc::vec![0],
+            outputs: alloc::vec![1],
+        };
+        assert!(graph_is_layout_only(&view_only));
+        // graph_feasible rejects before shim/runtime so CI without OpenVINO still covers this.
+        assert!(!graph_feasible(&view_only));
+
+        let mul_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_MUL_MAT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("MatMul must decode");
+        let fused = GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::Constant, 1),
+                tensor(TensorRole::RuntimeInput, 2),
+                tensor(TensorRole::Intermediate, 3),
+                tensor(TensorRole::Output, 4),
+            ],
+            nodes: alloc::vec![
+                Node {
+                    op: crate::ffi::GGML_OP_MUL_MAT,
+                    spec: Ok(mul_spec),
+                    inputs: alloc::vec![0, 1],
+                    output: 2,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: crate::ffi::GGML_OP_VIEW,
+                    spec: Ok(view_spec),
+                    inputs: alloc::vec![2],
+                    output: 3,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+            ],
+            inputs: alloc::vec![0, 1],
+            outputs: alloc::vec![3],
+        };
+        assert!(!graph_is_layout_only(&fused));
     }
 }
