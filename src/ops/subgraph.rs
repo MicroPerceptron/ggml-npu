@@ -353,17 +353,17 @@ pub unsafe fn recognize(cgraph: *mut ggml_cgraph) -> Option<Subgraph> {
 // ---------------------------------------------------------------------------
 
 /// Is `t` a SiLU unary op?
-unsafe fn is_silu(t: *const ggml_tensor) -> bool {
+pub(crate) unsafe fn is_silu(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_UNARY && (*t).op_params[0] == GGML_UNARY_OP_SILU as i32
 }
 
 /// Is `t` a fused SwiGLU `GLU` node (`glu = silu(a)*b`, the modern-model FFN activation)?
-unsafe fn is_swiglu(t: *const ggml_tensor) -> bool {
+pub(crate) unsafe fn is_swiglu(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_GLU && (*t).op_params[0] == GGML_GLU_OP_SWIGLU as i32
 }
 
 /// Is `t` an RMSNorm node?
-unsafe fn is_rms_norm(t: *const ggml_tensor) -> bool {
+pub(crate) unsafe fn is_rms_norm(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_RMS_NORM
 }
 
@@ -373,8 +373,29 @@ unsafe fn glue_2d(t: *const ggml_tensor) -> bool {
 }
 
 /// Is `t` a MUL_MAT we would claim (a bakeable constant-weight matmul)?
-unsafe fn is_claimable_matmul(t: *const ggml_tensor) -> bool {
+pub(crate) unsafe fn is_claimable_matmul(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_MUL_MAT && super::matmul::match_node(t).is_some()
+}
+
+/// Activation looks FFN-local (silu / SwiGLU / silu·up mul). Used to avoid pulling attention-side
+/// orphan matmuls that become uneconomic unitary NPU programs (#5).
+pub(crate) unsafe fn is_ffn_shaped_activation(t: *const ggml_tensor) -> bool {
+    if t.is_null() {
+        return false;
+    }
+    if is_silu(t) || is_swiglu(t) {
+        return true;
+    }
+    if (*t).op == GGML_OP_MUL {
+        let (a, b) = ((*t).src[0], (*t).src[1]);
+        return (is_silu(a) && is_claimable_matmul(b)) || (is_silu(b) && is_claimable_matmul(a));
+    }
+    false
+}
+
+/// `MUL_MAT` whose activation input is FFN-shaped (down/up/gate after silu/SwiGLU).
+pub(crate) unsafe fn is_ffn_shaped_matmul(t: *const ggml_tensor) -> bool {
+    !t.is_null() && (*t).op == GGML_OP_MUL_MAT && is_ffn_shaped_activation((*t).src[0])
 }
 
 /// Is `node` a glue op *type* (silu, mul, SwiGLU, add, or RMSNorm) — dispatched via
@@ -391,9 +412,10 @@ pub unsafe fn is_glue_op(node: *const ggml_tensor) -> bool {
 /// Should `supports_op` claim this glue node as part of a claimable FFN? Upstream structure only
 /// (per-node can't see downstream): a silu fed by a claimable matmul; a mul combining such a silu
 /// and a claimable matmul; a SwiGLU fed by two claimable matmuls (gate + up); a **residual add**
-/// combining a claimable matmul (the `down` projection) and a runtime tensor. Claiming these + the
-/// matmuls groups the FFN (+ its residual) into one NPU split. (The residual-add claim also grabs
-/// e.g. the attention residual, which then runs as a standalone 1-node add — correct, minor cost.)
+/// combining an FFN-shaped claimable matmul (the `down` projection after silu/SwiGLU) and a runtime
+/// tensor. Claiming these + the matmuls groups the FFN (+ its residual) into one NPU split.
+/// Attention residuals (matmul after norm/QKV) are intentionally not claimed — they became
+/// uneconomic unitary NPU islands under LFM pp512 (#5).
 pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
     if node.is_null() || !glue_2d(node) {
         return false;
@@ -421,9 +443,9 @@ pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
     }
     if (*node).op == GGML_OP_ADD {
         let (a, b) = ((*node).src[0], (*node).src[1]);
-        // matmul output + a runtime tensor (op != NONE) — a residual, not a const-bias add.
+        // FFN residual only: down-projection after silu/SwiGLU + a runtime tensor (not const bias).
         let residual = |mm: *const ggml_tensor, r: *const ggml_tensor| {
-            is_claimable_matmul(mm) && !r.is_null() && (*r).op != GGML_OP_NONE && glue_2d(r)
+            is_ffn_shaped_matmul(mm) && !r.is_null() && (*r).op != GGML_OP_NONE && glue_2d(r)
         };
         return residual(a, b) || residual(b, a);
     }

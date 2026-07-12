@@ -454,9 +454,12 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         BYTES_OUT.load(Ordering::Relaxed),
     );
     let bindings = direct + shared + imported + staged;
+    let (npu_programs, npu_unitary, npu_program_nodes) =
+        crate::metrics::npu_program_attribution();
 
     let s = alloc::format!(
         "\n[ggml-npu profile]  dispatches={n}   measured host+device wall={:.3} ms ({:.3} us/disp)\n\
+         \x20 npu programs: {npu_programs} total / {npu_unitary} unitary ({:.1}%); avg nodes {:.2}\n\
          \x20 stage-in (host->bounce) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 device  (submit+sync)   : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%\n\
          \x20   |- submit (exec async): {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
@@ -473,6 +476,12 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
          \x20 compressed artifacts: {:.2} MiB / {:.2} MiB input ({:.3}x), T1 {:.2} / {:.2} MiB\n",
         ms(total),
         us_per(total, n),
+        pct(npu_unitary, npu_programs.max(1)),
+        if npu_programs == 0 {
+            0.0
+        } else {
+            npu_program_nodes as f64 / npu_programs as f64
+        },
         ms(ti),
         us_per(ti, n),
         pct(ti, total),

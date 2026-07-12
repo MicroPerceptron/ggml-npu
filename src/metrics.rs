@@ -2,6 +2,31 @@
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide NPU program-size attribution for scheduler handoff work (#5).
+static NPU_PROGRAMS: AtomicU64 = AtomicU64::new(0);
+static NPU_UNITARY_PROGRAMS: AtomicU64 = AtomicU64::new(0);
+static NPU_PROGRAM_NODES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one executed NPU program (fused partition / subgraph) for handoff attribution.
+pub fn record_npu_program(nodes: u64) {
+    NPU_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+    NPU_PROGRAM_NODES.fetch_add(nodes, Ordering::Relaxed);
+    if nodes <= 1 {
+        NPU_UNITARY_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot handoff attribution counters (programs, unitaries, total nodes).
+pub fn npu_program_attribution() -> (u64, u64, u64) {
+    (
+        NPU_PROGRAMS.load(Ordering::Relaxed),
+        NPU_UNITARY_PROGRAMS.load(Ordering::Relaxed),
+        NPU_PROGRAM_NODES.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DispatchMetrics {
     pub stage_in_ns: u64,
