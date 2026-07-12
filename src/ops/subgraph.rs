@@ -395,7 +395,8 @@ pub(crate) unsafe fn is_ffn_shaped_activation(t: *const ggml_tensor) -> bool {
 
 /// `MUL_MAT` whose activation input is FFN-shaped (down/up/gate after silu/SwiGLU).
 pub(crate) unsafe fn is_ffn_shaped_matmul(t: *const ggml_tensor) -> bool {
-    !t.is_null() && (*t).op == GGML_OP_MUL_MAT && is_ffn_shaped_activation((*t).src[0])
+    // ggml MUL_MAT: src[0]=weights, src[1]=activation (same as recognize / match_node).
+    !t.is_null() && (*t).op == GGML_OP_MUL_MAT && is_ffn_shaped_activation((*t).src[1])
 }
 
 /// Is `node` a glue op *type* (silu, mul, SwiGLU, add, or RMSNorm) — dispatched via
