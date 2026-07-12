@@ -1,0 +1,38 @@
+---
+description: Do not run expensive full LFM pp512 benches by default
+alwaysApply: true
+---
+
+# Benchmark invocation
+
+Full LFM pp512 (and similarly long multi-sample locked llama-bench) runs are expensive. Do **not**
+start them by default, and never start one during ordinary coding, review, or handoff work.
+
+## When a full locked pp512 is allowed
+
+Only if one of these is true:
+
+- Explicit user request for a full-model / pp512 / “full perf” run; or
+- A PR/issue acceptance criterion that specifically requires locked pp512 evidence; or
+- A change that cannot be validated cheaper **and** is expected to move end-to-end tok/s (after
+  cheaper gates pass).
+
+## Prefer this ladder
+
+1. Unit/integration tests (`cargo test` / focused lib tests)
+2. Criterion microbenches for host-side changes (quant, cache codec, hash, async reactor)
+3. Short attribution/profile (tiny model, fewer repeats, or single warm iteration) for
+   splits/unitaries/bindings/no-copy %
+4. Single-sample or `r=1` pp512 only as a smoke — not the default “results” run
+5. Full locked pp512 (`r≥3`, flock, full feature matrix) sparingly — typically once per milestone
+   or when comparing to the published baseline (~160 tok/s develop / ~119 remediation / ~845 Vulkan)
+
+## Also
+
+- Never stack concurrent full benches; respect the global flock (`/tmp/ggml-npu-bench-global.lock`)
+- Ensure shim / `compile_graph_v3` is current before any NPU full bench (avoid multi-hour invalid
+  Vulkan-fallback runs)
+- After a full run, update related GitHub issues with evidence; do not re-run to “confirm” without
+  a code change
+- PR #15 / handoff work: prefer unitary/split/program attribution counters and short profiles over
+  another full pp512 unless the user asks
