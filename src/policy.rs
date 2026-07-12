@@ -214,7 +214,8 @@ pub(crate) unsafe fn supports_region(node: *const ggml_tensor, spec: OpSpec) -> 
     if node.is_null() {
         return false;
     }
-    let moe_enabled = crate::host::builtin().config().is_set(c"GGML_NPU_MOE");
+    // Match compile capability: only `GGML_NPU_MOE=1` opts in (not mere presence / `=0`).
+    let moe_enabled = crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_MOE");
     region_supported(
         spec,
         output_elements(&*node),

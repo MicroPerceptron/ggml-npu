@@ -959,7 +959,9 @@ pub(super) unsafe fn graph_node_feasible(
 }
 
 fn moe_enabled() -> bool {
-    crate::host::builtin().config().is_set(c"GGML_NPU_MOE")
+    // Exact `=1` only: smoke/harness export `GGML_NPU_MOE=0` to mean off; `is_set` would
+    // falsely enable MoE routing (Argsort/…) and corrupt expert ids for MUL_MAT_ID (#5/#11).
+    crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_MOE")
 }
 
 fn attention_full() -> bool {
@@ -1831,6 +1833,23 @@ mod tests {
         assert!(env_policy_admits(&dense, false));
         // Runtime-weight matmul still requires ATTENTION=full even without traits.attention.
         assert!(!env_policy_admits(&dense, true));
+    }
+
+    #[test]
+    fn moe_opt_in_rejects_zero_string_like_harness() {
+        // `_run_targeted_smoke.sh` exports GGML_NPU_MOE=0; that must disable, not enable.
+        use crate::host::ConfigService;
+        let off = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_MOE",
+            value: c"0",
+        };
+        assert!(off.is_set(c"GGML_NPU_MOE"));
+        assert!(!off.is_opt_in_one(c"GGML_NPU_MOE"));
+        let on = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_MOE",
+            value: c"1",
+        };
+        assert!(on.is_opt_in_one(c"GGML_NPU_MOE"));
     }
 
     #[test]
