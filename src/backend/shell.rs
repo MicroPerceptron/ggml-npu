@@ -102,8 +102,22 @@ fn async_enabled() -> bool {
     !unsafe { getenv(c"GGML_NPU_ASYNC".as_ptr()) }.is_null()
 }
 
+fn device_type() -> ggml_backend_dev_type {
+    let p = unsafe { getenv(c"GGML_NPU_DEVICE_CLASS".as_ptr()) };
+    if p.is_null() {
+        return GGML_BACKEND_DEVICE_TYPE_NPU;
+    }
+    match unsafe { CStr::from_ptr(p) }.to_bytes() {
+        b"accel" => GGML_BACKEND_DEVICE_TYPE_ACCEL,
+        b"gpu" => GGML_BACKEND_DEVICE_TYPE_GPU,
+        b"igpu" => GGML_BACKEND_DEVICE_TYPE_IGPU,
+        b"npu" => GGML_BACKEND_DEVICE_TYPE_NPU,
+        _ => GGML_BACKEND_DEVICE_TYPE_NPU,
+    }
+}
+
 unsafe extern "C" fn dev_get_type(_dev: ggml_backend_dev_t) -> ggml_backend_dev_type {
-    GGML_BACKEND_DEVICE_TYPE_ACCEL
+    device_type()
 }
 
 unsafe extern "C" fn dev_get_props(dev: ggml_backend_dev_t, props: *mut ggml_backend_dev_props) {
@@ -112,7 +126,7 @@ unsafe extern "C" fn dev_get_props(dev: ggml_backend_dev_t, props: *mut ggml_bac
     }
     (*props).name = dev_get_name(dev);
     (*props).description = dev_get_description(dev);
-    (*props).type_ = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    (*props).type_ = device_type();
     dev_get_memory(dev, &mut (*props).memory_free, &mut (*props).memory_total);
     (*props).device_id = ptr::null();
     (*props).caps = ggml_backend_dev_caps {
@@ -135,8 +149,9 @@ unsafe extern "C" fn dev_get_buffer_type(_dev: ggml_backend_dev_t) -> ggml_backe
 }
 
 unsafe extern "C" fn dev_supports_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
-    // Op-agnostic: the engine matches the node and asks the present vendor if it can run it.
-    crate::policy::should_pull(op) && crate::engine::supports(op)
+    // Pure correctness/capability contract. ggml remains the final scheduler; profitability must
+    // never make a semantically supported op appear unsupported.
+    crate::engine::supports(op)
 }
 
 unsafe extern "C" fn dev_supports_buft(
@@ -149,10 +164,9 @@ unsafe extern "C" fn dev_supports_buft(
 }
 
 unsafe extern "C" fn dev_offload_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
-    // The graph compiler can bake weights directly from foreign host buffers, so expensive
-    // supported supernodes remain candidates even when model placement did not pre-allocate them
-    // in NPU memory. The capability check is still conservative and keeps the vocabulary head off.
-    crate::engine::supports(op)
+    // Pull only profitable supported work from foreign buffers. Cheap unary/layout operations
+    // remain fusible capability glue and do not normally create standalone NPU dispatch islands.
+    crate::engine::supports(op) && crate::policy::should_pull(op)
 }
 
 unsafe extern "C" fn dev_event_new(dev: ggml_backend_dev_t) -> ggml_backend_event_t {

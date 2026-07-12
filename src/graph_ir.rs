@@ -5,6 +5,7 @@
 //! outputs and mutable state are explicit. Intel lowering may recognize profitable supernodes while
 //! other vendors can consume the same representation without inheriting OpenVINO semantics.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ffi::*;
@@ -40,7 +41,99 @@ pub enum WireOp {
     Swiglu = 23,
     Sigmoid = 24,
     SumRows = 25,
+    SetRows = 26,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpTraits {
+    pub metadata: bool,
+    pub stateful: bool,
+    pub attention: bool,
+    pub moe: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DTypeRule {
+    Float,
+    FloatWithI32Index,
+    AnyBitwiseCompatible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeRule {
+    Elementwise,
+    MatMul,
+    Layout,
+    Gather,
+    Scatter,
+    Reduction,
+    Attention,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryEffect {
+    Pure,
+    AliasInput,
+    WriteState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostModel {
+    Metadata,
+    Elements,
+    MatMulMacs,
+    AttentionQuadratic,
+    Stateful,
+}
+
+/// How ggml should use a correct vendor lowering. This is descriptive capability metadata:
+/// profitability remains exclusively in `policy.rs`/`offload_op`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementClass {
+    /// Expensive compute that can anchor a scheduler split.
+    Anchor,
+    /// Correct only as inexpensive glue around an anchor; do not pull it by itself.
+    FusibleOnly,
+    /// May anchor a split once the profitability policy approves its concrete shape.
+    StandaloneIfProfitable,
+    /// Shape/layout bookkeeping that should travel with an anchored split.
+    Metadata,
+    /// Reads or writes persistent model state and must preserve ordering/alias semantics.
+    Stateful,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpSpec {
+    pub wire: WireOp,
+    pub min_inputs: u8,
+    pub max_inputs: u8,
+    pub traits: OpTraits,
+    pub dtype_rule: DTypeRule,
+    pub shape_rule: ShapeRule,
+    pub memory_effect: MemoryEffect,
+    pub cost_model: CostModel,
+    pub placement: PlacementClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpReject {
+    NullTensor,
+    EmptyShape,
+    UnsupportedOp,
+    UnsupportedVariant,
+    UnsupportedDType,
+    UnsupportedAliasing,
+    InvalidArity,
+}
+
+/// One semantic contract used by scheduler probing, graph capture, vendor feasibility and tests.
+pub trait OperationContract {
+    unsafe fn decode_tensor(t: *const ggml_tensor) -> Result<OpSpec, OpReject>;
+    fn decode_node(node: &Node) -> Result<OpSpec, OpReject>;
+}
+
+pub struct OpRegistry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dim {
@@ -77,6 +170,7 @@ pub struct Node {
     /// Raw `ggml_op`. Keeping the source opcode makes the capture forward-compatible; lowerers
     /// advertise the subset and op-parameter encodings they understand.
     pub op: ggml_op,
+    pub spec: Result<OpSpec, OpReject>,
     pub inputs: Vec<ValueId>,
     pub output: ValueId,
     pub op_params: [u8; OP_PARAM_BYTES],
@@ -121,6 +215,342 @@ unsafe fn describe(t: *const ggml_tensor, role: TensorRole) -> TensorDesc {
 
 fn find_ptr(ptrs: &[usize], p: usize) -> Option<ValueId> {
     ptrs.iter().position(|&x| x == p).map(|i| i as ValueId)
+}
+
+fn traits_for(wire: WireOp) -> OpTraits {
+    OpTraits {
+        metadata: matches!(
+            wire,
+            WireOp::Reshape | WireOp::View | WireOp::Cont | WireOp::Transpose | WireOp::Permute
+        ),
+        stateful: matches!(wire, WireOp::SsmConv | WireOp::SetRows),
+        attention: matches!(
+            wire,
+            WireOp::Rope
+                | WireOp::SoftMax
+                | WireOp::Permute
+                | WireOp::FlashAttention
+                | WireOp::SetRows
+        ),
+        moe: matches!(
+            wire,
+            WireOp::Argsort | WireOp::MatMulId | WireOp::Sigmoid | WireOp::SumRows
+        ),
+    }
+}
+
+fn rules_for(
+    wire: WireOp,
+) -> (
+    DTypeRule,
+    ShapeRule,
+    MemoryEffect,
+    CostModel,
+    PlacementClass,
+) {
+    use CostModel::*;
+    use DTypeRule::*;
+    use MemoryEffect::*;
+    use ShapeRule::*;
+
+    match wire {
+        WireOp::Reshape | WireOp::View | WireOp::Transpose | WireOp::Permute => (
+            AnyBitwiseCompatible,
+            Layout,
+            AliasInput,
+            Metadata,
+            PlacementClass::Metadata,
+        ),
+        WireOp::Cont => (
+            AnyBitwiseCompatible,
+            Layout,
+            Pure,
+            Elements,
+            PlacementClass::Metadata,
+        ),
+        WireOp::Copy => (
+            AnyBitwiseCompatible,
+            Layout,
+            Pure,
+            Elements,
+            PlacementClass::FusibleOnly,
+        ),
+        WireOp::MatMul | WireOp::MatMulId => {
+            (Float, MatMul, Pure, MatMulMacs, PlacementClass::Anchor)
+        }
+        WireOp::GetRows | WireOp::Argsort => (
+            FloatWithI32Index,
+            Gather,
+            Pure,
+            Elements,
+            PlacementClass::FusibleOnly,
+        ),
+        WireOp::SetRows => (
+            FloatWithI32Index,
+            Scatter,
+            WriteState,
+            Stateful,
+            PlacementClass::Stateful,
+        ),
+        WireOp::SumRows => (
+            Float,
+            Reduction,
+            Pure,
+            Elements,
+            PlacementClass::FusibleOnly,
+        ),
+        WireOp::FlashAttention => (
+            Float,
+            Attention,
+            Pure,
+            AttentionQuadratic,
+            PlacementClass::Anchor,
+        ),
+        WireOp::Rope => (
+            Float,
+            Attention,
+            Pure,
+            AttentionQuadratic,
+            PlacementClass::StandaloneIfProfitable,
+        ),
+        WireOp::SoftMax => (
+            Float,
+            Attention,
+            Pure,
+            AttentionQuadratic,
+            PlacementClass::FusibleOnly,
+        ),
+        WireOp::SsmConv => (Float, Custom, Pure, Stateful, PlacementClass::Stateful),
+        WireOp::Concat => (Float, Custom, Pure, Elements, PlacementClass::FusibleOnly),
+        _ => (
+            Float,
+            Elementwise,
+            Pure,
+            Elements,
+            PlacementClass::FusibleOnly,
+        ),
+    }
+}
+
+fn decode_spec(
+    op: ggml_op,
+    unary_or_glu: i32,
+    softmax_max_bias: f32,
+    rope_mode: i32,
+    n_inputs: usize,
+) -> Result<OpSpec, OpReject> {
+    let (wire, min_inputs, max_inputs) = match op {
+        GGML_OP_MUL_MAT => (WireOp::MatMul, 2, 2),
+        GGML_OP_MUL => (WireOp::Mul, 2, 2),
+        GGML_OP_ADD => (WireOp::Add, 2, 2),
+        GGML_OP_RMS_NORM => (WireOp::RmsNorm, 1, 1),
+        GGML_OP_RESHAPE => (WireOp::Reshape, 1, 1),
+        GGML_OP_VIEW => (WireOp::View, 1, 1),
+        GGML_OP_CONT => (WireOp::Cont, 1, 1),
+        GGML_OP_TRANSPOSE => (WireOp::Transpose, 1, 1),
+        GGML_OP_CONCAT => (WireOp::Concat, 2, 2),
+        GGML_OP_CPY => (WireOp::Copy, 1, 2),
+        GGML_OP_SSM_CONV => (WireOp::SsmConv, 2, 2),
+        GGML_OP_ROPE if matches!(rope_mode, 0 | 2) => (WireOp::Rope, 2, 2),
+        GGML_OP_ROPE => return Err(OpReject::UnsupportedVariant),
+        GGML_OP_SOFT_MAX if softmax_max_bias == 0.0 => (WireOp::SoftMax, 1, 2),
+        GGML_OP_SOFT_MAX => return Err(OpReject::UnsupportedVariant),
+        GGML_OP_GET_ROWS => (WireOp::GetRows, 2, 2),
+        GGML_OP_SET_ROWS => (WireOp::SetRows, 3, 3),
+        GGML_OP_ARGSORT => (WireOp::Argsort, 1, 1),
+        GGML_OP_MUL_MAT_ID => (WireOp::MatMulId, 3, 3),
+        GGML_OP_DIV => (WireOp::Div, 2, 2),
+        GGML_OP_SCALE => (WireOp::Scale, 1, 1),
+        GGML_OP_CLAMP => (WireOp::Clamp, 1, 1),
+        GGML_OP_PERMUTE => (WireOp::Permute, 1, 1),
+        GGML_OP_FLASH_ATTN_EXT => (WireOp::FlashAttention, 3, 4),
+        GGML_OP_GLU if unary_or_glu == GGML_GLU_OP_SWIGLU as i32 => (WireOp::Swiglu, 2, 2),
+        GGML_OP_GLU => return Err(OpReject::UnsupportedVariant),
+        GGML_OP_SUM_ROWS => (WireOp::SumRows, 1, 1),
+        GGML_OP_UNARY if unary_or_glu == GGML_UNARY_OP_SILU as i32 => (WireOp::Silu, 1, 1),
+        GGML_OP_UNARY if unary_or_glu == GGML_UNARY_OP_SIGMOID as i32 => (WireOp::Sigmoid, 1, 1),
+        GGML_OP_UNARY => return Err(OpReject::UnsupportedVariant),
+        _ => return Err(OpReject::UnsupportedOp),
+    };
+    if n_inputs < min_inputs as usize || n_inputs > max_inputs as usize {
+        return Err(OpReject::InvalidArity);
+    }
+    let (dtype_rule, shape_rule, memory_effect, cost_model, placement) = rules_for(wire);
+    Ok(OpSpec {
+        wire,
+        min_inputs,
+        max_inputs,
+        traits: traits_for(wire),
+        dtype_rule,
+        shape_rule,
+        memory_effect,
+        cost_model,
+        placement,
+    })
+}
+
+fn is_float_type(dtype: ggml_type) -> bool {
+    matches!(dtype, GGML_TYPE_F32 | GGML_TYPE_F16)
+}
+
+fn is_index_type(dtype: ggml_type) -> bool {
+    matches!(dtype, GGML_TYPE_I32 | GGML_TYPE_I64)
+}
+
+unsafe fn validate_tensor_dtypes(tensor: &ggml_tensor, spec: OpSpec) -> Result<(), OpReject> {
+    let src_type = |index: usize| {
+        tensor
+            .src
+            .get(index)
+            .copied()
+            .filter(|src| !src.is_null())
+            .map(|src| (*src).type_)
+    };
+    let baked = |index: usize| {
+        matches!(
+            (tensor.op, index),
+            (GGML_OP_MUL_MAT, 0) | (GGML_OP_MUL_MAT_ID, 0) | (GGML_OP_SSM_CONV, 1)
+        ) && tensor.src.get(index).copied().is_some_and(|src| {
+            !src.is_null() && (*src).op == GGML_OP_NONE && !(*src).data.is_null()
+        })
+    };
+
+    let output_ok = match spec.wire {
+        WireOp::Argsort => tensor.type_ == GGML_TYPE_I32,
+        WireOp::Reshape | WireOp::View | WireOp::Cont | WireOp::Transpose | WireOp::Permute => {
+            is_float_type(tensor.type_) || is_index_type(tensor.type_)
+        }
+        _ => is_float_type(tensor.type_),
+    };
+    if !output_ok {
+        return Err(OpReject::UnsupportedDType);
+    }
+
+    for (index, src) in tensor.src.iter().copied().enumerate() {
+        if src.is_null() || baked(index) {
+            continue;
+        }
+        if !is_float_type((*src).type_) && !is_index_type((*src).type_) {
+            return Err(OpReject::UnsupportedDType);
+        }
+    }
+
+    let valid = match spec.wire {
+        WireOp::GetRows => {
+            src_type(0).is_some_and(is_float_type) && src_type(1).is_some_and(is_index_type)
+        }
+        WireOp::SetRows => {
+            src_type(0).is_some_and(is_float_type)
+                && src_type(1).is_some_and(is_index_type)
+                && src_type(2).is_some_and(is_float_type)
+        }
+        WireOp::Argsort => src_type(0).is_some_and(is_float_type),
+        WireOp::MatMulId => {
+            src_type(1).is_some_and(is_float_type) && src_type(2).is_some_and(is_index_type)
+        }
+        WireOp::Rope => {
+            src_type(0).is_some_and(is_float_type) && src_type(1).is_some_and(is_index_type)
+        }
+        WireOp::FlashAttention => tensor
+            .src
+            .iter()
+            .take(spec.max_inputs as usize)
+            .copied()
+            .filter(|src| !src.is_null())
+            .all(|src| is_float_type((*src).type_)),
+        WireOp::Reshape | WireOp::View | WireOp::Cont | WireOp::Transpose | WireOp::Permute => {
+            tensor
+                .src
+                .iter()
+                .copied()
+                .filter(|src| !src.is_null())
+                .all(|src| is_float_type((*src).type_) || is_index_type((*src).type_))
+        }
+        _ => tensor
+            .src
+            .iter()
+            .enumerate()
+            .filter(|(_, src)| !src.is_null())
+            .all(|(index, src)| baked(index) || is_float_type((*(*src)).type_)),
+    };
+    if !valid {
+        return Err(OpReject::UnsupportedDType);
+    }
+    if spec.wire == WireOp::SetRows {
+        let base = tensor.src[2];
+        if !base.is_null() && !tensor.data.is_null() && (*base).data == tensor.data {
+            return Err(OpReject::UnsupportedAliasing);
+        }
+    }
+    Ok(())
+}
+
+impl OperationContract for OpRegistry {
+    unsafe fn decode_tensor(t: *const ggml_tensor) -> Result<OpSpec, OpReject> {
+        if t.is_null() {
+            return Err(OpReject::NullTensor);
+        }
+        let x = &*t;
+        if x.ne.iter().any(|&dim| dim <= 0) {
+            return Err(OpReject::EmptyShape);
+        }
+        let n_inputs = x.src.iter().filter(|src| !src.is_null()).count();
+        if x.op == GGML_OP_ROPE
+            && (x.op_params[1] as i64 != x.ne[0] || f32::from_bits(x.op_params[7] as u32) != 0.0)
+        {
+            return Err(OpReject::UnsupportedVariant);
+        }
+        if x.op == GGML_OP_FLASH_ATTN_EXT
+            && (f32::from_bits(x.op_params[1] as u32) != 0.0
+                || f32::from_bits(x.op_params[2] as u32) != 0.0)
+        {
+            return Err(OpReject::UnsupportedVariant);
+        }
+        let subop = x.op_params[0];
+        let max_bias = f32::from_bits(x.op_params[1] as u32);
+        let rope_mode = x.op_params[2];
+        let spec = decode_spec(x.op, subop, max_bias, rope_mode, n_inputs)?;
+        validate_tensor_dtypes(x, spec)?;
+        Ok(spec)
+    }
+
+    fn decode_node(node: &Node) -> Result<OpSpec, OpReject> {
+        let subop = i32::from_ne_bytes(
+            node.op_params[..4]
+                .try_into()
+                .map_err(|_| OpReject::UnsupportedVariant)?,
+        );
+        let max_bias = f32::from_ne_bytes(
+            node.op_params[4..8]
+                .try_into()
+                .map_err(|_| OpReject::UnsupportedVariant)?,
+        );
+        let rope_mode = i32::from_ne_bytes(
+            node.op_params[8..12]
+                .try_into()
+                .map_err(|_| OpReject::UnsupportedVariant)?,
+        );
+        if node.op == GGML_OP_FLASH_ATTN_EXT
+            && (max_bias != 0.0
+                || f32::from_ne_bytes(
+                    node.op_params[8..12]
+                        .try_into()
+                        .map_err(|_| OpReject::UnsupportedVariant)?,
+                ) != 0.0)
+        {
+            return Err(OpReject::UnsupportedVariant);
+        }
+        if node.op == GGML_OP_ROPE
+            && f32::from_ne_bytes(
+                node.op_params[28..32]
+                    .try_into()
+                    .map_err(|_| OpReject::UnsupportedVariant)?,
+            ) != 0.0
+        {
+            return Err(OpReject::UnsupportedVariant);
+        }
+        decode_spec(node.op, subop, max_bias, rope_mode, node.inputs.len())
+    }
 }
 
 /// Capture a concrete scheduler split. Unsupported operations are still represented; capability
@@ -194,7 +624,16 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
         }
 
         let output = graph.values.len() as ValueId;
-        graph.values.push(describe(t, TensorRole::Intermediate));
+        let mut output_role = TensorRole::Intermediate;
+        if matches!((*t).op, GGML_OP_CPY | GGML_OP_SET_ROWS)
+            && (inputs
+                .iter()
+                .any(|&id| graph.values[id as usize].role == TensorRole::MutableState)
+                || has_name_prefix(&*t, b"cache_"))
+        {
+            output_role = TensorRole::MutableState;
+        }
+        graph.values.push(describe(t, output_role));
         value_ptrs.push(t as usize);
 
         let mut params = [0u8; OP_PARAM_BYTES];
@@ -206,6 +645,7 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
         );
         graph.nodes.push(Node {
             op: (*t).op,
+            spec: OpRegistry::decode_tensor(t),
             inputs,
             output,
             op_params: params,
@@ -213,9 +653,14 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
     }
 
     for (i, &used) in consumed.iter().enumerate() {
-        if !used {
-            let id = find_ptr(&value_ptrs, node_ptrs[i])?;
-            graph.values[id as usize].role = TensorRole::Output;
+        let id = find_ptr(&value_ptrs, node_ptrs[i])?;
+        if !used || graph.values[id as usize].role == TensorRole::MutableState {
+            if !used && graph.values[id as usize].role != TensorRole::MutableState {
+                graph.values[id as usize].role = TensorRole::Output;
+            }
+            if graph.outputs.contains(&id) {
+                continue;
+            }
             graph.outputs.push(id);
         }
     }
@@ -224,41 +669,140 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
 
 impl GraphIr {
     pub fn wire_op(node: &Node) -> Option<WireOp> {
-        Some(match node.op {
-            GGML_OP_MUL_MAT => WireOp::MatMul,
-            GGML_OP_MUL => WireOp::Mul,
-            GGML_OP_ADD => WireOp::Add,
-            GGML_OP_RMS_NORM => WireOp::RmsNorm,
-            GGML_OP_RESHAPE => WireOp::Reshape,
-            GGML_OP_VIEW => WireOp::View,
-            GGML_OP_CONT => WireOp::Cont,
-            GGML_OP_TRANSPOSE => WireOp::Transpose,
-            GGML_OP_CONCAT => WireOp::Concat,
-            GGML_OP_CPY => WireOp::Copy,
-            GGML_OP_SSM_CONV => WireOp::SsmConv,
-            GGML_OP_ROPE => WireOp::Rope,
-            GGML_OP_SOFT_MAX => WireOp::SoftMax,
-            GGML_OP_GET_ROWS => WireOp::GetRows,
-            GGML_OP_ARGSORT => WireOp::Argsort,
-            GGML_OP_MUL_MAT_ID => WireOp::MatMulId,
-            GGML_OP_DIV => WireOp::Div,
-            GGML_OP_SCALE => WireOp::Scale,
-            GGML_OP_CLAMP => WireOp::Clamp,
-            GGML_OP_PERMUTE => WireOp::Permute,
-            GGML_OP_FLASH_ATTN_EXT => WireOp::FlashAttention,
-            GGML_OP_GLU => WireOp::Swiglu,
-            GGML_OP_SUM_ROWS => WireOp::SumRows,
-            GGML_OP_UNARY => {
-                let subop = i32::from_ne_bytes(node.op_params[..4].try_into().ok()?);
-                if subop == GGML_UNARY_OP_SILU as i32 {
-                    WireOp::Silu
-                } else if subop == GGML_UNARY_OP_SIGMOID as i32 {
-                    WireOp::Sigmoid
+        let captured = *node.spec.as_ref().ok()?;
+        (OpRegistry::decode_node(node).ok() == Some(captured)).then_some(captured.wire)
+    }
+
+    /// Split a scheduler graph into independently compilable, sequential artifacts. Crossing
+    /// values retain their ggml-allocated data pointers and become an output of one partition plus
+    /// a runtime input of the next. Limiting routed expert banks is more important than raw node
+    /// count: each `MatMulId` carries a very large constant bank and must become cacheable on its
+    /// own rather than waiting for a monolithic multi-bank compile.
+    pub fn execution_partitions(&self, max_nodes: usize, max_matmul_id: usize) -> Vec<GraphIr> {
+        if self.nodes.is_empty() || max_nodes == 0 || max_matmul_id == 0 {
+            return Vec::new();
+        }
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        while start < self.nodes.len() {
+            let mut end = start;
+            let mut routed_banks = 0usize;
+            while end < self.nodes.len() {
+                let routed = Self::wire_op(&self.nodes[end]) == Some(WireOp::MatMulId);
+                if end > start
+                    && (end - start >= max_nodes || (routed && routed_banks >= max_matmul_id))
+                {
+                    break;
+                }
+                routed_banks += usize::from(routed);
+                end += 1;
+            }
+            ranges.push((start, end));
+            start = end;
+        }
+        if ranges.len() == 1 {
+            return vec![self.clone()];
+        }
+
+        ranges
+            .into_iter()
+            .filter_map(|(start, end)| self.partition_range(start, end))
+            .collect()
+    }
+
+    fn partition_range(&self, start: usize, end: usize) -> Option<GraphIr> {
+        if start >= end || end > self.nodes.len() {
+            return None;
+        }
+        let mut needed = vec![false; self.values.len()];
+        let mut produced = vec![false; self.values.len()];
+        for node in &self.nodes[start..end] {
+            for &input in &node.inputs {
+                *needed.get_mut(input as usize)? = true;
+            }
+            *needed.get_mut(node.output as usize)? = true;
+            *produced.get_mut(node.output as usize)? = true;
+        }
+
+        let mut consumed_later = vec![false; self.values.len()];
+        for node in &self.nodes[end..] {
+            for &input in &node.inputs {
+                *consumed_later.get_mut(input as usize)? = true;
+            }
+        }
+
+        let mut remap = vec![None; self.values.len()];
+        let mut values = Vec::new();
+        for (old, value) in self.values.iter().enumerate() {
+            if needed[old] {
+                remap[old] = Some(values.len() as ValueId);
+                values.push(value.clone());
+            }
+        }
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for (old, &new) in remap.iter().enumerate() {
+            let Some(new) = new else {
+                continue;
+            };
+            if self.values[old].role == TensorRole::Constant {
+                values[new as usize].role = TensorRole::Constant;
+            } else if !produced[old] {
+                values[new as usize].role = if self.values[old].role == TensorRole::MutableState {
+                    TensorRole::MutableState
                 } else {
-                    return None;
+                    TensorRole::RuntimeInput
+                };
+                inputs.push(new);
+            } else {
+                let crosses = consumed_later[old]
+                    || self.outputs.contains(&(old as ValueId))
+                    || self.values[old].role == TensorRole::MutableState;
+                values[new as usize].role = if crosses {
+                    if self.values[old].role == TensorRole::MutableState {
+                        TensorRole::MutableState
+                    } else {
+                        TensorRole::Output
+                    }
+                } else {
+                    TensorRole::Intermediate
+                };
+                if crosses {
+                    outputs.push(new);
                 }
             }
-            _ => return None,
+        }
+        if outputs.is_empty() {
+            let old = self.nodes[end - 1].output as usize;
+            let new = remap.get(old).copied().flatten()?;
+            values[new as usize].role = TensorRole::Output;
+            outputs.push(new);
+        }
+
+        let nodes = self.nodes[start..end]
+            .iter()
+            .map(|node| {
+                Some(Node {
+                    op: node.op,
+                    spec: node.spec,
+                    inputs: node
+                        .inputs
+                        .iter()
+                        .map(|&id| remap.get(id as usize).copied().flatten())
+                        .collect::<Option<Vec<_>>>()?,
+                    output: remap.get(node.output as usize).copied().flatten()?,
+                    op_params: node.op_params,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(GraphIr {
+            generation: self.generation,
+            values,
+            nodes,
+            inputs,
+            outputs,
         })
     }
 
@@ -291,59 +835,20 @@ impl GraphIr {
         }
         for &id in &self.inputs {
             let t = &self.values[id as usize];
+            h = fold(h, id as u64);
+            h = fold(h, t.role as u64);
+        }
+        for (id, t) in self.values.iter().enumerate() {
             if t.role == TensorRole::Constant {
+                h = fold(h, id as u64);
                 h = fold(h, t.data as u64);
             }
         }
+        for &id in &self.outputs {
+            h = fold(h, id as u64);
+        }
         h
     }
-}
-
-/// Per-node scheduler capability probe matching the initial Intel Graph IR lowerer. Full-graph
-/// validation still runs at `graph_compute`; this function only groups compatible nodes into a
-/// candidate split.
-pub unsafe fn wire_op_for_tensor(t: *const ggml_tensor) -> Option<WireOp> {
-    if t.is_null() {
-        return None;
-    }
-    let x = &*t;
-    // ggml deliberately emits zero-length state/gather views for empty sequence selections.
-    // They are valid CPU no-ops but cannot be represented by the static OpenVINO/NPU ABI.
-    if x.ne.iter().any(|&dim| dim <= 0) {
-        return None;
-    }
-    Some(match x.op {
-        GGML_OP_MUL_MAT => WireOp::MatMul,
-        GGML_OP_MUL => WireOp::Mul,
-        GGML_OP_ADD => WireOp::Add,
-        GGML_OP_RMS_NORM => WireOp::RmsNorm,
-        GGML_OP_RESHAPE => WireOp::Reshape,
-        GGML_OP_VIEW => WireOp::View,
-        GGML_OP_CONT => WireOp::Cont,
-        GGML_OP_TRANSPOSE => WireOp::Transpose,
-        GGML_OP_CONCAT => WireOp::Concat,
-        GGML_OP_CPY => WireOp::Copy,
-        GGML_OP_SSM_CONV => WireOp::SsmConv,
-        GGML_OP_GET_ROWS => WireOp::GetRows,
-        GGML_OP_SCALE => WireOp::Scale,
-        GGML_OP_DIV => WireOp::Div,
-        GGML_OP_CLAMP => WireOp::Clamp,
-        GGML_OP_ARGSORT => WireOp::Argsort,
-        GGML_OP_MUL_MAT_ID => WireOp::MatMulId,
-        GGML_OP_SUM_ROWS => WireOp::SumRows,
-        GGML_OP_SOFT_MAX => {
-            let max_bias = f32::from_ne_bytes(x.op_params[1].to_ne_bytes());
-            if max_bias != 0.0 {
-                return None;
-            }
-            WireOp::SoftMax
-        }
-        GGML_OP_PERMUTE => WireOp::Permute,
-        GGML_OP_GLU if x.op_params[0] == GGML_GLU_OP_SWIGLU as i32 => WireOp::Swiglu,
-        GGML_OP_UNARY if x.op_params[0] == GGML_UNARY_OP_SILU as i32 => WireOp::Silu,
-        GGML_OP_UNARY if x.op_params[0] == GGML_UNARY_OP_SIGMOID as i32 => WireOp::Sigmoid,
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
@@ -374,6 +879,7 @@ mod tests {
             ],
             nodes: vec![Node {
                 op: GGML_OP_MUL_MAT,
+                spec: decode_spec(GGML_OP_MUL_MAT, 0, 0.0, 0, 2),
                 inputs: vec![0, 1],
                 output: 2,
                 op_params: [0; OP_PARAM_BYTES],
@@ -393,6 +899,12 @@ mod tests {
             make(11, Dim::Static(4)).signature(),
             make(11, Dim::Bounded { min: 1, max: 4 }).signature()
         );
+        let mut alternate_output = make(11, Dim::Static(4));
+        alternate_output.outputs = vec![1];
+        assert_ne!(
+            make(11, Dim::Static(4)).signature(),
+            alternate_output.signature()
+        );
     }
 
     #[test]
@@ -405,5 +917,51 @@ mod tests {
             WireOp::Swiglu,
         ];
         assert!(ops.iter().all(|op| *op as i32 > 0));
+    }
+
+    #[test]
+    fn operation_contract_rejects_semantic_variants_and_bad_arity() {
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 1.0, 0, 2),
+            Err(OpReject::UnsupportedVariant)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_GLU, GGML_GLU_OP_GEGLU as i32, 0.0, 0, 2),
+            Err(OpReject::UnsupportedVariant)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_MUL_MAT, 0, 0.0, 0, 1),
+            Err(OpReject::InvalidArity)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3)
+                .map(|spec| (spec.wire, spec.traits.stateful)),
+            Ok((WireOp::SetRows, true))
+        );
+    }
+
+    #[test]
+    fn operation_contract_assigns_explicit_placement_classes() {
+        assert_eq!(
+            decode_spec(GGML_OP_MUL_MAT, 0, 0.0, 0, 2).map(|spec| spec.placement),
+            Ok(PlacementClass::Anchor)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_UNARY, GGML_UNARY_OP_SILU as i32, 0.0, 0, 1)
+                .map(|spec| spec.placement),
+            Ok(PlacementClass::FusibleOnly)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_ROPE, 0, 0.0, 0, 2).map(|spec| spec.placement),
+            Ok(PlacementClass::StandaloneIfProfitable)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_VIEW, 0, 0.0, 0, 1).map(|spec| spec.placement),
+            Ok(PlacementClass::Metadata)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SSM_CONV, 0, 0.0, 0, 2).map(|spec| spec.placement),
+            Ok(PlacementClass::Stateful)
+        );
     }
 }

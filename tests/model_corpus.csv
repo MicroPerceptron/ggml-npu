@@ -1,7 +1,7 @@
 family,representative_architecture,graph_pattern,policy,status
-LFM,LFM2 dense,ShortConv recurrent block,NPU candidate,implemented-unvalidated
-LFM,LFM2.5-8B-A1B,sparse top-4 MoE,opt-in spike,implemented-unvalidated
-LFM,LFM2.5-8B-A1B,GQA attention,NPU QKV plus GPU attention,partial
+LFM,LFM2 dense,ShortConv recurrent block,NPU candidate,numerically-validated
+LFM,LFM2.5-8B-A1B,sparse top-4 MoE,opt-in full graph,numerically-validated
+LFM,LFM2.5-8B-A1B,GQA attention,opt-in full graph,numerically-validated
 Llama,Llama 3,dense SwiGLU block,NPU candidate,implemented
 Llama,Llama 3,GQA attention,GPU default,QKV-only
 Qwen,Qwen2/3,dense SwiGLU block,NPU candidate,implemented

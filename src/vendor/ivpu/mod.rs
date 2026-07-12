@@ -20,7 +20,7 @@ use core::ptr::NonNull;
 
 use crate::hal::{BufFlags, NpuHal};
 use crate::ops::{Op, Operand};
-use crate::vendor::{DeviceInfo, Vendor};
+use crate::vendor::{DeviceInfo, LoweringSupport, Vendor};
 
 pub use ze::Device as IvpuDevice;
 
@@ -90,16 +90,28 @@ impl Vendor for IvpuVendor {
         lower::subgraph::run(sg)
     }
 
-    fn can_lower_graph(&self, graph: &crate::graph_ir::GraphIr) -> bool {
-        lower::graph::can_lower(graph)
+    fn graph_support(&self, graph: &crate::graph_ir::GraphIr) -> LoweringSupport {
+        if lower::graph::can_lower(graph) {
+            LoweringSupport::Supported
+        } else {
+            LoweringSupport::Unsupported("Intel graph compiler rejected split")
+        }
     }
 
     fn run_graph(&self, graph: &crate::graph_ir::GraphIr) -> bool {
         lower::graph::run(graph)
     }
 
-    fn can_lower_graph_node(&self, node: *const crate::ffi::ggml_tensor) -> bool {
-        unsafe { compile::graph_node_feasible(node) }
+    unsafe fn node_support(
+        &self,
+        node: *const crate::ffi::ggml_tensor,
+        spec: &crate::graph_ir::OpSpec,
+    ) -> LoweringSupport {
+        if compile::graph_node_feasible(node, spec) {
+            LoweringSupport::Supported
+        } else {
+            LoweringSupport::Unsupported("Intel node lowering or policy rejected operation")
+        }
     }
 
     fn synchronize(&self) -> bool {
@@ -123,11 +135,15 @@ impl Vendor for IvpuVendor {
 /// feeding `input` (f32) and writing the first output into `output` (f32). Returns the
 /// number of outputs written, or a negative error. Scaffold for the submit path.
 pub fn run_blob_selftest(blob: &[u8], input: &[f32], output: &mut [f32]) -> i32 {
+    run_blob_selftest_multi(blob, &[input], output)
+}
+
+pub fn run_blob_selftest_multi(blob: &[u8], inputs: &[&[f32]], output: &mut [f32]) -> i32 {
     let devices = <IvpuHal as NpuHal>::probe();
     let Some(dev) = devices.first() else {
         return -100;
     };
-    match graph::run_native_blob(dev, blob, &[input], output) {
+    match graph::run_native_blob(dev, blob, inputs, output) {
         Ok(n) => n as i32,
         Err(code) if code > 0 => -code,
         Err(0) => -1,

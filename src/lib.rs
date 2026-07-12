@@ -173,3 +173,41 @@ pub extern "C" fn ggml_npu_ivpu_selftest(
     let output = unsafe { core::slice::from_raw_parts_mut(output, output_cap) };
     vendor::ivpu::run_blob_selftest(blob, input, output)
 }
+
+/// Multi-input variant used by graph-coverage tests. Input lengths are in 32-bit words, allowing
+/// integer tensors to use the same byte-preserving binding path.
+#[no_mangle]
+pub extern "C" fn ggml_npu_ivpu_selftest_multi(
+    blob: *const u8,
+    blob_len: usize,
+    input_ptrs: *const *const c_void,
+    input_lens: *const usize,
+    n_inputs: usize,
+    output: *mut f32,
+    output_cap: usize,
+) -> c_int {
+    if blob.is_null()
+        || input_ptrs.is_null()
+        || input_lens.is_null()
+        || output.is_null()
+        || n_inputs == 0
+    {
+        return -1;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(blob, blob_len) };
+    let ptrs = unsafe { core::slice::from_raw_parts(input_ptrs, n_inputs) };
+    let lens = unsafe { core::slice::from_raw_parts(input_lens, n_inputs) };
+    let mut inputs = alloc::vec::Vec::with_capacity(n_inputs);
+    for (&ptr, &len) in ptrs.iter().zip(lens) {
+        if ptr.is_null() && len != 0 {
+            return -1;
+        }
+        inputs.push(if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(ptr.cast::<f32>(), len) }
+        });
+    }
+    let output = unsafe { core::slice::from_raw_parts_mut(output, output_cap) };
+    vendor::ivpu::run_blob_selftest_multi(blob, &inputs, output)
+}

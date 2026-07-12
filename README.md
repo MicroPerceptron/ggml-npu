@@ -4,9 +4,9 @@ A universal NPU backend for [ggml](https://github.com/ggml-org/ggml) / llama.cpp
 targeting Intel (Level Zero), AMD (XRT/XDNA), and Qualcomm (Hexagon/QNN) client NPUs
 behind one runtime seam, with CPU fallback for everything it does not claim.
 
-**Status: Intel prototype, moving toward graph coverage.** The backend registers as a
-dynamically-loaded ggml `ACCEL` device and currently accelerates constant-weight matmuls plus
-recognized fused subgraphs (SwiGLU FFN, RMSNorm, residual glue) on Intel Lunar Lake. It
+**Status: Intel graph-compiler prototype.** The backend registers as a dynamically-loaded ggml
+`NPU` device and currently lowers dense FFN, LFM ShortConv/state writes, RoPE, runtime attention,
+FlashAttention, and sparse routed-expert graphs on Intel Lunar Lake. It
 re-quantizes model weights, compiles OpenVINO models with low-bit weights baked as Constants,
 loads the native artifacts through the Level Zero graph extension, and dispatches scheduler
 splits from Rust. Unsupported operations remain on CPU/GPU.
@@ -84,7 +84,9 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 - `GGML_NPU_PROFILE=1` reports stage-in, submit, device/sync, and copy-out time at process exit.
 - `GGML_NPU_DEBUG=1` enables failure-path notes.
 - `GGML_NPU_BITS=4|8|16` overrides the host-side requant width for quality/performance studies.
-- `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV graph candidates; the default keeps
+- `GGML_NPU_DEVICE_CLASS=npu|igpu|gpu|accel` overrides the scheduler identity. `npu` is the
+  default; `igpu` is an experiment that permits whole-layer model placement.
+- `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV and FlashAttention candidates; the default keeps
   attention on GPU while allowing constant-weight/QKV projections.
 - `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path.
 - `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
@@ -92,6 +94,13 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
   any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.
 - `GGML_NPU_LFM_SHORTCONV=1` opts into ancestry-based placement of LFM convolution segments while
   leaving sequence gather/write setup and unrelated attention/MoE glue on CPU/GPU.
+
+Run the mandatory operation/capability gate with `./tests/run_coverage_gate.sh`. Set `MODEL` to
+also run two fresh-process, timeout- and memory-guarded LFM prefill/decode checks with MoE,
+ShortConv, and full attention enabled. The default keeps model placement on CPU (`NGL=0`) and pulls
+eligible NPU splits; `NPU_ONLY=1 NPU_DEVICE_CLASS=igpu` remains an explicit experiment. Whole-layer
+placement previously reached only 1.84 prompt tok/s versus roughly 53 tok/s for Vulkan+NPU
+enumeration, and cold compilation of large routed-expert graphs can exceed the default timeout.
 
 ## Roadmap
 

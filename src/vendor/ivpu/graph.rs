@@ -110,8 +110,14 @@ unsafe fn run_inner(
         let psz: usize = match ap.devicePrecision {
             ZE_GRAPH_ARGUMENT_PRECISION_FP32 => 4,
             ZE_GRAPH_ARGUMENT_PRECISION_FP16 => 2,
+            ZE_GRAPH_ARGUMENT_PRECISION_INT32 | ZE_GRAPH_ARGUMENT_PRECISION_UINT32 => 4,
+            ZE_GRAPH_ARGUMENT_PRECISION_INT64 | ZE_GRAPH_ARGUMENT_PRECISION_UINT64 => 8,
             _ => 0,
         };
+        if psz == 0 {
+            free_all(l, ctx, &mems);
+            return Err(-4);
+        }
         let bytes = elems * psz;
 
         let mut mem_ptr: *mut c_void = ptr::null_mut();
@@ -131,14 +137,14 @@ unsafe fn run_inner(
         ptr::write_bytes(mem_ptr as *mut u8, 0, bytes);
 
         if ap.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
-            if psz == 4 {
-                if let Some(src) = inputs.get(input_idx) {
-                    if src.len() == elems {
-                        let dst = mem_ptr as *mut f32;
-                        for j in 0..elems {
-                            *dst.add(j) = src[j];
-                        }
-                    }
+            if let Some(src) = inputs.get(input_idx) {
+                let src_bytes = src.len() * core::mem::size_of::<f32>();
+                if src_bytes == bytes {
+                    ptr::copy_nonoverlapping(
+                        src.as_ptr().cast::<u8>(),
+                        mem_ptr.cast::<u8>(),
+                        bytes,
+                    );
                 }
             }
             input_idx += 1;

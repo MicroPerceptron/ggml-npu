@@ -2,7 +2,7 @@
  *
  * Mimics ggml's dynamic-backend loader (dlopen + ggml_backend_init + api_version
  * check) WITHOUT building all of llama.cpp, then walks the four vtables to confirm
- * the backend registers as an ACCEL device and safely rejects a null operation probe.
+ * the backend registers as the requested device class and safely rejects a null operation probe.
  *
  * Build (needs the llama.cpp headers; -rdynamic so our stub ggml symbol is visible
  * to the dlopened .so under RTLD_NOW, exactly as a real host exports ggml's symbols):
@@ -14,6 +14,8 @@
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -87,6 +89,8 @@ int main(int argc, char ** argv) {
     printf("device desc   = %s\n", dev->iface.get_description(dev));
     int dtype = (int) dev->iface.get_type(dev);
     printf("device type   = %d\n", dtype);
+    struct ggml_backend_dev_props props;
+    dev->iface.get_props(dev, &props);
     int sop = dev->iface.supports_op(dev, NULL) ? 1 : 0;
     printf("supports_op   = %d\n", sop);
 
@@ -100,7 +104,13 @@ int main(int argc, char ** argv) {
     printf("\nassertions:\n");
     CHECK(reg->api_version == GGML_BACKEND_API_VERSION, "api_version == GGML_BACKEND_API_VERSION (2)");
     CHECK(ndev == 1, "exactly one device");
-    CHECK(dtype == GGML_BACKEND_DEVICE_TYPE_ACCEL, "device type is ACCEL");
+    const char * device_class = getenv("GGML_NPU_DEVICE_CLASS");
+    int expected_type = GGML_BACKEND_DEVICE_TYPE_NPU;
+    if (device_class && strcmp(device_class, "accel") == 0) expected_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    if (device_class && strcmp(device_class, "gpu") == 0)   expected_type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    if (device_class && strcmp(device_class, "igpu") == 0)  expected_type = GGML_BACKEND_DEVICE_TYPE_IGPU;
+    CHECK(dtype == expected_type, "device type matches native/override class");
+    CHECK((int) props.type == dtype, "get_props type matches get_type");
     CHECK(sop == 0, "supports_op(NULL) safely returns false");
     CHECK(buft != NULL, "get_buffer_type is non-null");
     if (buft) {

@@ -6,6 +6,7 @@
 use core::ffi::{c_char, CStr};
 
 use crate::ffi::*;
+use crate::graph_ir::{OpRegistry, OperationContract, PlacementClass};
 
 extern "C" {
     fn getenv(name: *const c_char) -> *const c_char;
@@ -70,24 +71,25 @@ unsafe fn is_shortconv_candidate(t: *const ggml_tensor) -> bool {
         && has_shortconv_ancestor(t, 6)
 }
 
-fn coarse_graph_op(op: ggml_op) -> bool {
-    matches!(
-        op,
-        GGML_OP_MUL_MAT
-            | GGML_OP_SSM_CONV
-            | GGML_OP_MUL
-            | GGML_OP_ADD
-            | GGML_OP_RMS_NORM
-            | GGML_OP_UNARY
-            | GGML_OP_GLU
-            | GGML_OP_RESHAPE
-            | GGML_OP_VIEW
-            | GGML_OP_CONT
-            | GGML_OP_TRANSPOSE
-            | GGML_OP_CONCAT
-            | GGML_OP_PERMUTE
-            | GGML_OP_SOFT_MAX
-    )
+unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            let anchored = OpRegistry::decode_tensor(src).is_ok_and(|spec| {
+                matches!(
+                    spec.placement,
+                    PlacementClass::Anchor
+                        | PlacementClass::StandaloneIfProfitable
+                        | PlacementClass::Stateful
+                )
+            });
+            anchored || has_anchor_ancestor(src, depth - 1)
+        })
 }
 
 pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
@@ -95,17 +97,24 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         return false;
     }
     let x = &*node;
+    let Ok(spec) = OpRegistry::decode_tensor(node) else {
+        return false;
+    };
     if !getenv(c"GGML_NPU_LFM_SHORTCONV".as_ptr()).is_null()
-        && coarse_graph_op(x.op)
+        && (spec.placement != PlacementClass::Stateful || x.op == GGML_OP_SSM_CONV)
         && is_shortconv_candidate(node)
     {
         return true;
     }
     if !getenv(c"GGML_NPU_FORCE_GRAPH".as_ptr()).is_null() {
-        // Pull compute and metadata that can form a profitable contiguous segment, but keep
-        // sequence-index gather/write setup on CPU. Driver initialization for those state-only
-        // graphs is not reliable, and transferring them independently only adds boundaries.
-        return coarse_graph_op(x.op);
+        // Anchors may start a split. Cheap glue/layout may only extend a split downstream from an
+        // anchor; this prevents embedding gathers or isolated unary nodes from becoming NPU
+        // dispatches merely because force mode was requested.
+        return match spec.placement {
+            PlacementClass::Anchor | PlacementClass::StandaloneIfProfitable => true,
+            PlacementClass::Stateful => x.op == GGML_OP_SSM_CONV,
+            PlacementClass::FusibleOnly | PlacementClass::Metadata => has_anchor_ancestor(node, 6),
+        };
     }
     let min_work = env_u64(c"GGML_NPU_MIN_OFFLOAD_WORK", 4_000_000);
     let work = match x.op {

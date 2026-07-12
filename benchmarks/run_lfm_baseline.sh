@@ -5,11 +5,35 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA_ROOT="${LLAMA_ROOT:-$ROOT/../llama.cpp}"
-BENCH="${LLAMA_BENCH:-$LLAMA_ROOT/build/bin/llama-bench}"
+OPENVINO_DIR="${OPENVINO_DIR:-/opt/intel/openvino_2026.2.1}"
 MODEL="${MODEL:-}"
-MODE="${MODE:-cpu}" # cpu | vulkan | npu
+MODE="${MODE:-cpu-native}" # cpu-native | cpu-openblas | cpu-flexiblas | cpu-mkl | vulkan | npu
+THREADS="${THREADS:-$(nproc)}"
+case "$MODE" in
+    cpu|cpu-native) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-native/bin/llama-bench" ;;
+    cpu-openblas) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-openblas/bin/llama-bench" ;;
+    cpu-flexiblas) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-flexiblas/bin/llama-bench" ;;
+    cpu-mkl) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-mkl/bin/llama-bench" ;;
+    *) DEFAULT_BENCH="$LLAMA_ROOT/build-dl/bin/llama-bench" ;;
+esac
+BENCH="${LLAMA_BENCH:-$DEFAULT_BENCH}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$ROOT/benchmarks/results/${STAMP}-${MODE}"
+
+clear_npu_environment() {
+    unset GGML_BACKEND_PATH GGML_NPU_OVC GGML_NPU_DEVICE_CLASS GGML_NPU_MEMORY_LIMIT
+    unset GGML_NPU_PROFILE GGML_NPU_TRACE GGML_NPU_DEBUG GGML_NPU_ASYNC
+    unset GGML_NPU_BITS GGML_NPU_ATTENTION GGML_NPU_MOE GGML_NPU_LFM_SHORTCONV
+    unset GGML_NPU_FORCE_GRAPH GGML_NPU_MIN_OFFLOAD_WORK
+}
+
+if [[ "$MODE" == cpu || "$MODE" == cpu-* ]]; then
+    clear_npu_environment
+    : "${OMP_NUM_THREADS:=$THREADS}"
+    : "${OPENBLAS_NUM_THREADS:=$THREADS}"
+    : "${MKL_NUM_THREADS:=$THREADS}"
+    export OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS
+fi
 
 if [[ -z "$MODEL" || ! -f "$MODEL" ]]; then
     echo "MODEL must name an existing LFM GGUF" >&2
@@ -33,20 +57,25 @@ mkdir -p "$OUT"
     echo "attention_placement=${ATTENTION_PLACEMENT:-qkv}"
     echo "npu_bits=${GGML_NPU_BITS:-auto}"
     echo "npu_async=${GGML_NPU_ASYNC:-0}"
+    echo "npu_device_class=${NPU_DEVICE_CLASS:-npu}"
+    echo "npu_only=${NPU_ONLY:-0}"
+    echo "npu_cache=${GGML_NPU_CACHE:-default}"
+    echo "npu_timeout=${NPU_TIMEOUT:-180s}"
     echo "lfm_shortconv=${GGML_NPU_LFM_SHORTCONV:-0}"
     echo "flash_attention=${FLASH_ATTENTION:-auto}"
     echo "prompt_tokens=${PROMPT_TOKENS:-512}"
     echo "generated_tokens=${GEN_TOKENS:-128}"
     echo "repetitions=${REPETITIONS:-5}"
+    echo "threads=$THREADS"
     echo "backend_git_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
     uname -a
     free -b
 } > "$OUT/environment.txt"
 
 args=(-m "$MODEL" -p "${PROMPT_TOKENS:-512}" -n "${GEN_TOKENS:-128}" -r "${REPETITIONS:-5}"
-    -fa "${FLASH_ATTENTION:-auto}")
+    -fa "${FLASH_ATTENTION:-auto}" -t "$THREADS")
 case "$MODE" in
-    cpu)
+    cpu|cpu-native|cpu-openblas|cpu-flexiblas|cpu-mkl)
         args+=(-ngl 0)
         ;;
     vulkan)
@@ -55,15 +84,23 @@ case "$MODE" in
     npu)
         : "${GGML_BACKEND_PATH:=$ROOT/target/release/libggml_npu.so}"
         : "${GGML_NPU_OVC:=$ROOT/shim/libggml_npu_ovc.so}"
-        export GGML_BACKEND_PATH GGML_NPU_OVC
+        : "${GGML_NPU_DEVICE_CLASS:=${NPU_DEVICE_CLASS:-npu}}"
+        export GGML_BACKEND_PATH GGML_NPU_OVC GGML_NPU_DEVICE_CLASS
+        export LD_LIBRARY_PATH="$OPENVINO_DIR/runtime/lib/intel64:${LD_LIBRARY_PATH:-}"
         export GGML_NPU_PROFILE=1 GGML_NPU_TRACE=1
         if [[ "${ATTENTION_PLACEMENT:-qkv}" == full ]]; then
             export GGML_NPU_ATTENTION=full
         fi
-        args+=(-ngl "${NGL:-0}")
+        if [[ "${NPU_ONLY:-0}" == 1 ]]; then
+            : "${GGML_NPU_MEMORY_LIMIT:=8589934592}"
+            export GGML_NPU_MEMORY_LIMIT
+            args+=(-ngl 999 -dev NPU -sm none)
+        else
+            args+=(-ngl "${NGL:-0}")
+        fi
         ;;
     *)
-        echo "MODE must be cpu, vulkan, or npu" >&2
+        echo "MODE must be cpu-native, cpu-openblas, cpu-flexiblas, cpu-mkl, vulkan, or npu" >&2
         exit 2
         ;;
 esac
@@ -82,7 +119,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-/usr/bin/time -v "$BENCH" "${args[@]}" > "$OUT/stdout.txt" 2> "$OUT/stderr.txt" &
+runner=()
+if [[ "$MODE" == npu ]]; then
+    runner=(timeout --signal=TERM --kill-after=10s "${NPU_TIMEOUT:-180s}")
+fi
+/usr/bin/time -v "${runner[@]}" "$BENCH" "${args[@]}" > "$OUT/stdout.txt" 2> "$OUT/stderr.txt" &
 bench_pid=$!
 
 if [[ "$MODE" == npu ]]; then

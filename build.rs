@@ -86,6 +86,10 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        inc.join("ggml-backend.h").display()
+    );
     println!("cargo:rerun-if-changed={}", ze_header.display());
     println!("cargo:rerun-if-env-changed=GGML_DIR");
     println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");

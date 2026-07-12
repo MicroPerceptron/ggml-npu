@@ -31,6 +31,7 @@ use crate::ops::Operand;
 
 extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlerror() -> *const c_char;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn getenv(name: *const c_char) -> *const c_char;
 }
@@ -157,6 +158,13 @@ unsafe fn load_shim() -> Option<Shim> {
         dlopen(env, RTLD_NOW)
     };
     if h.is_null() {
+        let error = dlerror();
+        if !error.is_null() {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] shim dlopen failed: {}\n",
+                CStr::from_ptr(error).to_string_lossy()
+            ));
+        }
         return None;
     }
     let compile_const = dlsym(h, c"ggml_npu_ov_compile_matmul_const".as_ptr());
@@ -358,11 +366,39 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
         super::profile::note("[npu ir2] unavailable: shim lacks graph compiler symbol\n");
         return false;
     }
-    if graph.nodes.is_empty() || graph.outputs.is_empty() {
-        super::profile::note("[npu ir2] rejected empty graph or output set\n");
+    if graph.nodes.is_empty()
+        || graph.outputs.is_empty()
+        || graph.inputs.len() > 64
+        || graph.outputs.len() > 8
+    {
+        super::profile::note("[npu ir2] rejected graph size or binding limits\n");
         return false;
     }
+    for (index, value) in graph.values.iter().enumerate() {
+        if value.role != TensorRole::Constant
+            && !matches!(
+                value.dtype,
+                crate::ffi::GGML_TYPE_F32
+                    | crate::ffi::GGML_TYPE_F16
+                    | crate::ffi::GGML_TYPE_I32
+                    | crate::ffi::GGML_TYPE_I64
+            )
+        {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] value {index} rejected: unsupported runtime dtype {}\n",
+                value.dtype
+            ));
+            return false;
+        }
+    }
     for (index, node) in graph.nodes.iter().enumerate() {
+        let Ok(spec) = node.spec else {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected by operation contract: {:?}\n",
+                node.spec
+            ));
+            return false;
+        };
         let Some(op) = GraphIr::wire_op(node) else {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected: unmapped ggml op {}\n",
@@ -370,16 +406,21 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
             ));
             return false;
         };
-        if matches!(
-            op,
-            crate::graph_ir::WireOp::MatMulId
-                | crate::graph_ir::WireOp::Argsort
-                | crate::graph_ir::WireOp::Sigmoid
-                | crate::graph_ir::WireOp::SumRows
-        ) && !moe_enabled()
-        {
+        if spec.traits.moe && !moe_enabled() {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected: MoE op {op:?} requires GGML_NPU_MOE=1\n"
+            ));
+            return false;
+        }
+        let runtime_matmul = op == crate::graph_ir::WireOp::MatMul
+            && node
+                .inputs
+                .first()
+                .and_then(|&id| graph.values.get(id as usize))
+                .is_some_and(|value| value.role != TensorRole::Constant);
+        if (spec.traits.attention || runtime_matmul) && !attention_full() {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected: attention op {op:?} requires GGML_NPU_ATTENTION=full\n"
             ));
             return false;
         }
@@ -397,7 +438,9 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 | crate::graph_ir::WireOp::Concat
                 | crate::graph_ir::WireOp::Copy
                 | crate::graph_ir::WireOp::SsmConv
+                | crate::graph_ir::WireOp::Rope
                 | crate::graph_ir::WireOp::GetRows
+                | crate::graph_ir::WireOp::SetRows
                 | crate::graph_ir::WireOp::Scale
                 | crate::graph_ir::WireOp::Div
                 | crate::graph_ir::WireOp::Clamp
@@ -406,6 +449,7 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 | crate::graph_ir::WireOp::Sigmoid
                 | crate::graph_ir::WireOp::SumRows
                 | crate::graph_ir::WireOp::SoftMax
+                | crate::graph_ir::WireOp::FlashAttention
                 | crate::graph_ir::WireOp::Permute
                 | crate::graph_ir::WireOp::Swiglu
         );
@@ -420,8 +464,11 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
     true
 }
 
-pub(super) unsafe fn graph_node_feasible(node: *const crate::ffi::ggml_tensor) -> bool {
-    let op = crate::graph_ir::wire_op_for_tensor(node);
+pub(super) unsafe fn graph_node_feasible(
+    node: *const crate::ffi::ggml_tensor,
+    spec: &crate::graph_ir::OpSpec,
+) -> bool {
+    let op = Some(spec.wire);
     let moe_only = matches!(
         op,
         Some(
@@ -519,6 +566,8 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
                     1
                 } else if t.dtype == crate::ffi::GGML_TYPE_I64 {
                     2
+                } else if t.dtype == crate::ffi::GGML_TYPE_F16 {
+                    3
                 } else {
                     0
                 },
@@ -561,12 +610,28 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
         .collect();
 
     let mut h = 0xcbf2_9ce4_8422_2325u64;
+    h = fnv1a(h, &FORMAT_VERSION.to_le_bytes());
     for node in &nodes {
         h = fnv1a(h, &node.op.to_le_bytes());
         h = fnv1a(h, &node.output.to_le_bytes());
         for &input in node.inputs.iter().take(node.n_inputs as usize) {
             h = fnv1a(h, &input.to_le_bytes());
         }
+    }
+    for tensor in &tensors {
+        h = fnv1a(h, &tensor.role.to_le_bytes());
+        h = fnv1a(h, &tensor.dtype.to_le_bytes());
+        for dim in tensor.ne {
+            h = fnv1a(h, &dim.to_le_bytes());
+        }
+        h = fnv1a(h, &tensor.bits.to_le_bytes());
+        h = fnv1a(h, &tensor.group.to_le_bytes());
+    }
+    for &id in &runtime_inputs {
+        h = fnv1a(h, &id.to_le_bytes());
+    }
+    for &id in &graph.outputs {
+        h = fnv1a(h, &id.to_le_bytes());
     }
     for rq in &requants {
         h = fnv1a(h, &rq.weight);
@@ -601,7 +666,7 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
 
 /// Format version folded into the disk-cache key so a shim/requant/format change invalidates
 /// stale blobs automatically.
-const FORMAT_VERSION: u64 = 1;
+const FORMAT_VERSION: u64 = 6;
 
 fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {

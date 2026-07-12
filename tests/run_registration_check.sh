@@ -27,4 +27,7 @@ CC="${CC:-cc}"
 "$CC" -rdynamic -Wall -I"$GGML/ggml/include" -I"$GGML/ggml/src" \
     "$CRATE/tests/registration_check.c" -o "$OUTDIR/registration_check" -ldl
 
-exec "$OUTDIR/registration_check" "$SO"
+env -u GGML_NPU_DEVICE_CLASS "$OUTDIR/registration_check" "$SO"
+for cls in accel gpu igpu npu; do
+    GGML_NPU_DEVICE_CLASS="$cls" "$OUTDIR/registration_check" "$SO"
+done

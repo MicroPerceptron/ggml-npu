@@ -21,13 +21,25 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use crate::ffi::ggml_tensor;
-use crate::graph_ir::GraphIr;
+use crate::graph_ir::{GraphIr, OpSpec};
 use crate::ops::subgraph::Subgraph;
 use crate::ops::{Op, Operand};
 
 /// A discovered NPU device — the agnostic view used for the ggml device description.
 pub struct DeviceInfo {
     pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoweringSupport {
+    Supported,
+    Unsupported(&'static str),
+}
+
+impl LoweringSupport {
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
 }
 
 /// A compiled-in NPU vendor: probe for devices, decide whether it can lower an op (compiling
@@ -51,8 +63,8 @@ pub trait Vendor: Sync {
 
     /// Whether this vendor can compile the complete captured scheduler split. The default keeps
     /// existing per-op vendors working while Graph IR v2 lowerings are brought up incrementally.
-    fn can_lower_graph(&self, _graph: &GraphIr) -> bool {
-        false
+    fn graph_support(&self, _graph: &GraphIr) -> LoweringSupport {
+        LoweringSupport::Unsupported("vendor has no graph compiler")
     }
 
     /// Compile/cache and execute a complete Graph IR split. Called only after
@@ -62,8 +74,8 @@ pub trait Vendor: Sync {
     }
 
     /// Cheap per-node scheduler probe used to form candidate Graph IR splits.
-    fn can_lower_graph_node(&self, _node: *const ggml_tensor) -> bool {
-        false
+    unsafe fn node_support(&self, _node: *const ggml_tensor, _spec: &OpSpec) -> LoweringSupport {
+        LoweringSupport::Unsupported("vendor has no node lowering")
     }
 
     fn synchronize(&self) -> bool {
