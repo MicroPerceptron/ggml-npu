@@ -31,6 +31,28 @@ pub enum MetricEvent {
     CacheMiss {
         cache: &'static str,
     },
+    CacheBypass {
+        cache: &'static str,
+        reason: &'static str,
+        bytes: u64,
+    },
+    CacheCorruption {
+        cache: &'static str,
+    },
+    CacheLatency {
+        operation: &'static str,
+        elapsed_ns: u64,
+        bytes: u64,
+    },
+    CompressionRatio {
+        uncompressed_bytes: u64,
+        compressed_bytes: u64,
+    },
+    CacheBytes {
+        cache: &'static str,
+        current_bytes: u64,
+        budget_bytes: u64,
+    },
     Allocation {
         domain: &'static str,
         bytes: u64,
@@ -48,6 +70,7 @@ pub enum MetricEvent {
     },
     CacheEviction {
         cache: &'static str,
+        reason: &'static str,
         bytes: u64,
     },
     Compiler {

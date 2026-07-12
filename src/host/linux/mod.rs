@@ -1,5 +1,6 @@
 //! Built-in Linux host provider and explicit Linux extension modules.
 
+pub(crate) mod cache;
 pub(crate) mod dmabuf;
 pub(crate) mod drm;
 pub(crate) mod file;
@@ -10,6 +11,7 @@ mod process;
 pub(crate) use process::LinuxLibrary as BuiltinLibrary;
 
 use super::HostEnvironment;
+use cache::{LinuxArtifactStore, LinuxCompression, LinuxWait};
 use file::LinuxFiles;
 use process::{
     LinuxAllocator, LinuxArtifacts, LinuxClock, LinuxConfig, LinuxDiagnostics, LinuxLibraries,
@@ -28,6 +30,9 @@ pub(crate) struct BuiltinHost {
     diagnostics: LinuxDiagnostics,
     allocator: LinuxAllocator,
     libraries: LinuxLibraries,
+    compression: LinuxCompression,
+    artifact_cache: LinuxArtifactStore,
+    wait: LinuxWait,
 }
 
 impl HostEnvironment for BuiltinHost {
@@ -40,6 +45,9 @@ impl HostEnvironment for BuiltinHost {
     type Diagnostics = LinuxDiagnostics;
     type Allocator = LinuxAllocator;
     type Libraries = LinuxLibraries;
+    type Compression = LinuxCompression;
+    type ArtifactCache = LinuxArtifactStore;
+    type Wait = LinuxWait;
 
     fn files(&self) -> &Self::Files {
         &self.files
@@ -76,6 +84,18 @@ impl HostEnvironment for BuiltinHost {
     fn libraries(&self) -> &Self::Libraries {
         &self.libraries
     }
+
+    fn compression(&self) -> &Self::Compression {
+        &self.compression
+    }
+
+    fn artifact_cache(&self) -> &Self::ArtifactCache {
+        &self.artifact_cache
+    }
+
+    fn wait_provider(&self) -> &Self::Wait {
+        &self.wait
+    }
 }
 
 static BUILTIN: BuiltinHost = BuiltinHost {
@@ -88,6 +108,9 @@ static BUILTIN: BuiltinHost = BuiltinHost {
     diagnostics: LinuxDiagnostics,
     allocator: LinuxAllocator,
     libraries: LinuxLibraries,
+    compression: LinuxCompression,
+    artifact_cache: LinuxArtifactStore::from_environment(),
+    wait: LinuxWait,
 };
 
 pub(crate) const fn builtin() -> &'static BuiltinHost {

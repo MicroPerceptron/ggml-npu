@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "criterion_version": "0.8.2",
+  "units": "nanoseconds",
+  "confidence_level": 0.95,
+  "estimates": [
+    {"artifact":"ir2-2fc11a4f22b54cfc-n3.blob","input_bytes":69782,"operation":"zstd-level-1-compress","mean":27538.2820393268,"lower":27113.433979628197,"upper":27971.534876352398},
+    {"artifact":"ir2-2fc11a4f22b54cfc-n3.blob","input_bytes":69782,"operation":"zstd-level-1-promote","mean":33936.31576992715,"lower":32973.59546058941,"upper":35265.986233382704},
+    {"artifact":"ir2-2fc11a4f22b54cfc-n3.blob","input_bytes":69782,"operation":"record-header-parse","mean":365.47644261358084,"lower":336.2217716106328,"upper":394.457591263984},
+    {"artifact":"ir2-25db148dace09539-n8.blob","input_bytes":1634468,"operation":"zstd-level-1-compress","mean":1655543.2369444445,"lower":1616093.7205208333,"upper":1695455.4416666662},
+    {"artifact":"ir2-25db148dace09539-n8.blob","input_bytes":1634468,"operation":"zstd-level-1-promote","mean":1581749.0929332012,"lower":1547146.2328277945,"upper":1618924.0456589782},
+    {"artifact":"ir2-25db148dace09539-n8.blob","input_bytes":1634468,"operation":"record-header-parse","mean":286.4020663034772,"lower":285.4045126354101,"upper":287.4851864350468},
+    {"artifact":"ir2-082d22694112e163-n8.blob","input_bytes":8425629,"operation":"zstd-level-1-compress","mean":9098706.822638888,"lower":8813868.444583334,"upper":9467106.700173609},
+    {"artifact":"ir2-082d22694112e163-n8.blob","input_bytes":8425629,"operation":"zstd-level-1-promote","mean":8710285.242230158,"lower":8383684.105574405,"upper":9146656.703046827},
+    {"artifact":"ir2-082d22694112e163-n8.blob","input_bytes":8425629,"operation":"record-header-parse","mean":319.45065992989896,"lower":310.10560292149773,"upper":328.68847395677324},
+    {"artifact":"ir2-27d892a231afd50b-n8.blob","input_bytes":51998870,"operation":"zstd-level-1-compress","mean":60906829.966230154,"lower":60245632.18416667,"upper":61498176.12039683},
+    {"artifact":"ir2-27d892a231afd50b-n8.blob","input_bytes":51998870,"operation":"zstd-level-1-promote","mean":73348680.70492062,"lower":70074240.2747619,"upper":76832914.75392856},
+    {"artifact":"ir2-27d892a231afd50b-n8.blob","input_bytes":51998870,"operation":"record-header-parse","mean":362.072103832867,"lower":350.8803163702325,"upper":372.7949041639618},
+    {"artifact":"ir2-00ca97ae85b4313b-n3.blob","input_bytes":122200221,"operation":"zstd-level-1-compress","mean":127764295.1,"lower":127267694.88125,"upper":128237426.7},
+    {"artifact":"ir2-00ca97ae85b4313b-n3.blob","input_bytes":122200221,"operation":"zstd-level-1-promote","mean":127153800.9,"lower":125232907.75,"upper":129208334.9},
+    {"artifact":"ir2-00ca97ae85b4313b-n3.blob","input_bytes":122200221,"operation":"record-header-parse","mean":346.96373953907766,"lower":339.4619268580623,"upper":353.577920545275}
+  ]
+}
