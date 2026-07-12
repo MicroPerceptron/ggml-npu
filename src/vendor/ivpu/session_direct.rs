@@ -354,6 +354,9 @@ fn copy_output(program: &PreparedInference<'_>, index: usize, output: &Operand) 
         ));
         return false;
     }
+    if program.output_is_direct(index) {
+        return true;
+    }
     // SAFETY: output storage is live and at least `bytes` long.
     let target = unsafe { core::slice::from_raw_parts_mut(output.ptr.cast::<u8>(), bytes) };
     match program.copy_output(index, target) {
@@ -414,7 +417,7 @@ fn dispatch(
         return false;
     }
 
-    let prof = profile::enabled();
+    let prof = profile::enabled() || crate::trace::perf_enabled();
     let t0 = if prof { profile::now_ns() } else { 0 };
     if let Err(error) = program.write_inputs(&input_bytes) {
         profile::note(&alloc::format!(
@@ -466,12 +469,21 @@ fn dispatch(
     let t3 = if prof { profile::now_ns() } else { 0 };
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     if prof {
-        let bytes_in: u64 = input_bytes.iter().map(|bytes| bytes.len() as u64).sum();
+        let bytes_in: u64 = input_bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !program.input_is_direct(*index))
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
         let bytes_out: u64 = outputs
             .iter()
-            .filter_map(|output| operand_storage_bytes(output))
+            .enumerate()
+            .filter(|(index, _)| !program.output_is_direct(*index))
+            .filter_map(|(_, output)| operand_storage_bytes(output))
             .map(|bytes| bytes as u64)
             .sum();
+        let imported = program.direct_binding_count() as u64;
+        let staged = (inputs.len() + outputs.len()) as u64 - imported;
         profile::record(
             t0,
             t1,
@@ -480,11 +492,23 @@ fn dispatch(
             t3,
             0,
             0,
-            0,
-            (inputs.len() + outputs.len()) as u64,
+            imported,
+            staged,
             bytes_in.saturating_add(bytes_out),
             bytes_in,
             bytes_out,
+        );
+        crate::trace::perf(
+            "dispatch",
+            &alloc::format!(
+                ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":{},\"copy_out_ns\":{},\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":{bytes_out}",
+                t1.saturating_sub(t0),
+                tmid.saturating_sub(t1),
+                t2.saturating_sub(tmid),
+                t3.saturating_sub(t2),
+                imported,
+                staged,
+            ),
         );
     }
     true
@@ -637,13 +661,16 @@ fn prepare_candidate(
     let resident_bytes = prepared.total_user_bo_bytes;
     let accounted_bytes = prepared.total_accounted_bytes;
     for binding in &prepared.bindings {
-        profile::event(MetricEvent::StagingAllocation {
-            allocation: binding
-                .bo
-                .shared_identity()
-                .map_or(binding.bo.vpu_address(), |identity| identity.object),
-            bytes: binding.logical_bytes,
-        });
+        let allocation = binding
+            .bo
+            .shared_identity()
+            .map_or(binding.bo.vpu_address(), |identity| identity.object);
+        if !binding.direct {
+            profile::event(MetricEvent::StagingAllocation {
+                allocation,
+                bytes: binding.logical_bytes,
+            });
+        }
     }
     profile::record_direct_memory_breakdown(
         prepared.executable_bo_bytes,
