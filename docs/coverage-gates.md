@@ -56,3 +56,18 @@ unless explicitly requested.
 `benchmarks/summarize.py` labels NPU runs without submission proof as `npu-unproven`. Use
 `--require-baseline-proof` when aggregating results that will be cited as baselines: CPU/Vulkan
 modes and proven direct / Level Zero NPU runs pass; `npu-unproven` fails.
+
+## Claim / unclaim / fail-closed
+
+Capability placement must not reintroduce soft fallback or layout-only over-claim (issues #5/#8,
+PR #32/#35). Contract:
+
+1. **Unclaim** — `supports_op` / `offload_op` false (or refuse the split) so ggml places elsewhere.
+   Prefer this for layout-only Metadata ops (`View`/`Reshape`/`Cont`/`Transpose`/`Permute`) that
+   OpenVINO cannot lower alone; keep them on the fused wire allowlist only.
+2. **Fail-closed after claim** — once NPU claimed a split, compile/exec failure returns
+   `GGML_STATUS_FAILED` with `claimed_execution_failure` attribution — never silent success.
+3. **Proof-gated benches** — do not cite `npu-unproven` as an NPU baseline.
+
+Agent rule: `.cursor/rules/npu-claim-fallback.mdc`. ADR: `ADR/capability-contract-fail-closed` in
+`.cursor/project-memory.md`.

@@ -1,0 +1,49 @@
+---
+description: NPU claim vs unclaim vs fail-closed contract (no soft fallback)
+globs: src/engine.rs,src/policy.rs,src/backend/shell.rs,src/vendor/ivpu/compile.rs,src/vendor/ivpu/session*.rs,src/ops/subgraph.rs,benchmarks/**/*.py,benchmarks/**/*.sh
+alwaysApply: false
+---
+
+# NPU claim / unclaim / fail-closed
+
+Three distinct outcomes — do not collapse them.
+
+## 1. Unclaim (preferred for work we cannot lower)
+
+`supports_op` / `offload_op` return false, or refuse to take the scheduler split so ggml places
+the work on Vulkan/BLAS/CPU.
+
+Use this for:
+
+- Layout-only glue OpenVINO cannot lower alone (lone `View` / `Reshape` / `Cont` / `Transpose` /
+  `Permute` and other `PlacementClass::Metadata` / `traits.metadata` nodes).
+- Ops outside the shared wire allowlist, MoE/attention env gates, or compiler/runtime readiness.
+
+Layout ops may remain on `wire_op_compile_supported` for **fused** graphs next to real compute;
+standalone layout-only graphs must fail `graph_feasible` / `graph_node_feasible` up front
+(PR #35, issues #5/#8).
+
+## 2. Fail-closed after claim
+
+Only when we asserted NPU would execute (`supports_op` true and the split was assigned) and truly
+cannot complete: return `GGML_STATUS_FAILED` / `engine::compute → false` with attributable
+`claimed_execution_failure` traces. Never soft-success, skip, or “leave outputs untouched.”
+
+## 3. Never silent success after NPU compile/exec failure
+
+Compile miss, shim rejection, runtime submit/sync failure, unknown claimed nodes, and zero-node
+claimed splits must all surface as failure. ggml may reschedule elsewhere only after explicit
+`FAILED`, not after a fake `SUCCESS`.
+
+## 4. Benchmarks stay proof-gated
+
+`npu-unproven` must not enter cited baselines. Use `benchmarks/summarize.py --require-baseline-proof`
+(and related harness checks). Do not treat scheduler/Vulkan fallback tok/s as NPU proof (#8).
+
+## When changing capability
+
+- Keep `supports_op` (`graph_node_feasible`) and `graph_feasible` on the **same** wire/env/readiness
+  contract; `policy::supports_region` / `should_pull` are profitability only — never gate claim.
+- Prefer unclaim over claim-then-abort for layout-only / known-unlowerable partitions.
+- Add hermetic tests that lock: layout-only alone → not feasible; claimed runtime failure → not
+  success. Update `tests/coverage_matrix.csv` proofs when compile claims change (#12).

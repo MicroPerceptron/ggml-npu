@@ -4,10 +4,10 @@ Mul,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_cl
 Add,yes,hermetic,"contract:OpRegistry;test:graph::partition_policy_fuses_connected_graphs_larger_than_eight_nodes",residual / elementwise glue
 RmsNorm,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout",FFN / attention norm glue
 Silu,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout",FFN activation glue
-Reshape,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
-View,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
-Cont,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
-Transpose,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
+Reshape,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",layout metadata; fused-only claim
+View,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",layout metadata; fused-only claim
+Cont,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",layout metadata; fused-only claim
+Transpose,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",layout metadata; fused-only claim
 Concat,yes,hermetic,"contract:OpRegistry",fusible layout / packing
 Copy,yes,hermetic,"contract:OpRegistry",fusible copy glue
 SsmConv,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",ShortConv numerical check (#9)
@@ -19,7 +19,7 @@ MatMulId,yes,opt_in_hw,"contract:OpRegistry;test:graph::partition_policy_limits_
 Div,yes,hermetic,"contract:OpRegistry",elementwise
 Scale,yes,hermetic,"contract:OpRegistry",elementwise
 Clamp,yes,hermetic,"contract:OpRegistry",elementwise
-Permute,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",attention layout metadata
+Permute,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",attention layout metadata; fused-only claim
 FlashAttention,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",GQA FlashAttention numerical (#10)
 Swiglu,yes,hermetic,"contract:OpRegistry",GLU / SwiGLU dense block
 Sigmoid,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE gating; GGML_NPU_MOE=1

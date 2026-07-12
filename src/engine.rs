@@ -322,3 +322,136 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
 pub fn synchronize() -> bool {
     vendor::present().is_none_or(|v| v.synchronize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{
+        Dim, Node, OpRegistry, OperationContract, TensorDesc, TensorRole, OP_PARAM_BYTES,
+    };
+    use crate::ops::{Op, Operand};
+    use crate::vendor::{DeviceInfo, LoweringSupport, Vendor};
+    use alloc::vec::Vec;
+    use core::ffi::c_void;
+
+    /// Vendor that claims every graph and then fails execution — models claim-then-abort.
+    struct ClaimThenFailVendor;
+
+    impl Vendor for ClaimThenFailVendor {
+        fn name(&self) -> &'static str {
+            "claim-then-fail"
+        }
+        fn probe(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+        fn can_lower(&self, _op: Op, _inputs: &[Operand]) -> bool {
+            true
+        }
+        fn run(&self, _op: Op, _inputs: &[Operand], _output: &Operand) -> bool {
+            false
+        }
+        fn run_subgraph(&self, _sg: &crate::ops::subgraph::Subgraph) -> bool {
+            false
+        }
+        fn graph_support(&self, _graph: &GraphIr) -> LoweringSupport {
+            LoweringSupport::Supported
+        }
+        fn run_graph(&self, _graph: &GraphIr) -> bool {
+            false
+        }
+        unsafe fn alloc_host(&self, _size: usize) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe fn free_host(&self, _ptr: *mut c_void, _size: usize) {}
+    }
+
+    /// Vendor that refuses every graph — models honest unclaim / feasibility rejection.
+    struct UnclaimVendor;
+
+    impl Vendor for UnclaimVendor {
+        fn name(&self) -> &'static str {
+            "unclaim"
+        }
+        fn probe(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+        fn can_lower(&self, _op: Op, _inputs: &[Operand]) -> bool {
+            false
+        }
+        fn run(&self, _op: Op, _inputs: &[Operand], _output: &Operand) -> bool {
+            false
+        }
+        fn run_subgraph(&self, _sg: &crate::ops::subgraph::Subgraph) -> bool {
+            false
+        }
+        fn graph_support(&self, _graph: &GraphIr) -> LoweringSupport {
+            LoweringSupport::Unsupported("layout_only_unclaimed")
+        }
+        fn run_graph(&self, _graph: &GraphIr) -> bool {
+            // Must never be reached after an honest unclaim; if it is, fail loud.
+            false
+        }
+        unsafe fn alloc_host(&self, _size: usize) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe fn free_host(&self, _ptr: *mut c_void, _size: usize) {}
+    }
+
+    fn single_matmul_graph() -> GraphIr {
+        let mul_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_MUL_MAT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("MatMul must decode");
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(4),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 16, 16, 16],
+            role,
+            data,
+            owned: false,
+            shared: None,
+        };
+        GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::Constant, 1),
+                tensor(TensorRole::RuntimeInput, 2),
+                tensor(TensorRole::Output, 3),
+            ],
+            nodes: alloc::vec![Node {
+                op: crate::ffi::GGML_OP_MUL_MAT,
+                spec: Ok(mul_spec),
+                inputs: alloc::vec![0, 1],
+                output: 2,
+                op_params: [0; OP_PARAM_BYTES],
+            }],
+            inputs: alloc::vec![0, 1],
+            outputs: alloc::vec![2],
+        }
+    }
+
+    #[test]
+    fn claimed_partition_runtime_failure_is_not_success() {
+        // After claim, compile/exec failure must not soft-succeed (#8).
+        let graph = single_matmul_graph();
+        assert!(!run_partitions(&ClaimThenFailVendor, &graph));
+    }
+
+    #[test]
+    fn unclaim_rejects_graph_without_pretending_success() {
+        // Feasibility refusal is not a claimed success — run_partitions returns false so the
+        // backend can map to GGML_STATUS_FAILED rather than silent SUCCESS (#8).
+        let graph = single_matmul_graph();
+        assert!(feasible_partitions(&graph, &UnclaimVendor).is_err());
+        assert!(!run_partitions(&UnclaimVendor, &graph));
+    }
+}

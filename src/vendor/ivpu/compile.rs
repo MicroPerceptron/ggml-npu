@@ -1860,26 +1860,45 @@ mod tests {
 
     #[test]
     fn layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted() {
-        // View stays on the wire allowlist for fused ShortConv/FFN regions, but a disconnected
-        // View-only partition must not be claimed — OpenVINO returns UNSUPPORTED_FEATURE (#5/#8).
+        // Layout ops stay on the wire allowlist for fused ShortConv/FFN regions, but a disconnected
+        // layout-only partition must not be claimed — OpenVINO returns UNSUPPORTED_FEATURE (#5/#8).
         use crate::graph::{
-            Dim, GraphIr, Node, OpRegistry, OperationContract, TensorDesc, TensorRole,
-            OP_PARAM_BYTES,
+            Dim, GraphIr, Node, OpRegistry, OperationContract, PlacementClass, TensorDesc,
+            TensorRole, OP_PARAM_BYTES,
         };
-        assert!(wire_op_compile_supported(crate::graph::WireOp::View));
-        assert!(wire_op_compile_supported(crate::graph::WireOp::Reshape));
-        assert!(wire_op_compile_supported(crate::graph::WireOp::Transpose));
-
-        let view_spec = OpRegistry::decode_node(&Node {
-            op: crate::ffi::GGML_OP_VIEW,
-            spec: Err(crate::graph::OpReject::UnsupportedOp),
-            inputs: alloc::vec![0],
-            output: 1,
-            op_params: [0; OP_PARAM_BYTES],
-        })
-        .expect("View must decode as Metadata");
-        assert!(view_spec.traits.metadata);
-        assert_eq!(view_spec.placement, crate::graph::PlacementClass::Metadata);
+        let layout_ops = [
+            (
+                crate::ffi::GGML_OP_VIEW,
+                crate::graph::WireOp::View,
+                "View",
+            ),
+            (
+                crate::ffi::GGML_OP_RESHAPE,
+                crate::graph::WireOp::Reshape,
+                "Reshape",
+            ),
+            (
+                crate::ffi::GGML_OP_CONT,
+                crate::graph::WireOp::Cont,
+                "Cont",
+            ),
+            (
+                crate::ffi::GGML_OP_TRANSPOSE,
+                crate::graph::WireOp::Transpose,
+                "Transpose",
+            ),
+            (
+                crate::ffi::GGML_OP_PERMUTE,
+                crate::graph::WireOp::Permute,
+                "Permute",
+            ),
+        ];
+        for &(_, wire, name) in &layout_ops {
+            assert!(
+                wire_op_compile_supported(wire),
+                "{name} must remain fused-wire allowlisted"
+            );
+        }
 
         let tensor = |role, data| TensorDesc {
             dtype: crate::ffi::GGML_TYPE_F32,
@@ -1895,25 +1914,51 @@ mod tests {
             owned: false,
             shared: None,
         };
-        let view_only = GraphIr {
-            generation: 1,
-            values: alloc::vec![
-                tensor(TensorRole::RuntimeInput, 1),
-                tensor(TensorRole::Output, 2),
-            ],
-            nodes: alloc::vec![Node {
-                op: crate::ffi::GGML_OP_VIEW,
-                spec: Ok(view_spec),
+
+        let mut view_spec = None;
+        for &(ggml_op, wire, name) in &layout_ops {
+            let spec = OpRegistry::decode_node(&Node {
+                op: ggml_op,
+                spec: Err(crate::graph::OpReject::UnsupportedOp),
                 inputs: alloc::vec![0],
                 output: 1,
                 op_params: [0; OP_PARAM_BYTES],
-            }],
-            inputs: alloc::vec![0],
-            outputs: alloc::vec![1],
-        };
-        assert!(graph_is_layout_only(&view_only));
-        // graph_feasible rejects before shim/runtime so CI without OpenVINO still covers this.
-        assert!(!graph_feasible(&view_only));
+            })
+            .unwrap_or_else(|_| panic!("{name} must decode as Metadata"));
+            assert_eq!(spec.wire, wire);
+            assert!(spec.traits.metadata, "{name} must be traits.metadata");
+            assert_eq!(spec.placement, PlacementClass::Metadata);
+            if ggml_op == crate::ffi::GGML_OP_VIEW {
+                view_spec = Some(spec);
+            }
+
+            let alone = GraphIr {
+                generation: 1,
+                values: alloc::vec![
+                    tensor(TensorRole::RuntimeInput, 1),
+                    tensor(TensorRole::Output, 2),
+                ],
+                nodes: alloc::vec![Node {
+                    op: ggml_op,
+                    spec: Ok(spec),
+                    inputs: alloc::vec![0],
+                    output: 1,
+                    op_params: [0; OP_PARAM_BYTES],
+                }],
+                inputs: alloc::vec![0],
+                outputs: alloc::vec![1],
+            };
+            assert!(
+                graph_is_layout_only(&alone),
+                "{name}-only graph must classify as layout-only"
+            );
+            // graph_feasible rejects before shim/runtime so CI without OpenVINO still covers this.
+            assert!(
+                !graph_feasible(&alone),
+                "{name}-only graph must not be claimed / graph_feasible"
+            );
+        }
+        let view_spec = view_spec.expect("View spec");
 
         let mul_spec = OpRegistry::decode_node(&Node {
             op: crate::ffi::GGML_OP_MUL_MAT,

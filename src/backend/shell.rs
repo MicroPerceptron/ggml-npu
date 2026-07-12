@@ -324,8 +324,11 @@ unsafe extern "C" fn backend_graph_compute(
     _backend: ggml_backend_t,
     cgraph: *mut ggml_cgraph,
 ) -> ggml_status {
-    // Fail closed: a claimed split that did not execute on NPU must never report SUCCESS (#8).
-    // ggml may then reschedule elsewhere; that fallback is explicit FAILED, not silent success.
+    // Fail closed after claim: never soft-SUCCESS on NPU compile/exec failure (#8).
+    // Prefer unclaim (`supports_op` false) for layout-only glue we cannot lower (PR #35) so this
+    // path is not reached for lone View/Reshape/Cont/Transpose/Permute. When we did claim the
+    // split, ggml may reschedule elsewhere only after explicit FAILED — not silent success.
+    // See `.cursor/rules/npu-claim-fallback.mdc`.
     if crate::engine::compute(cgraph) {
         GGML_STATUS_SUCCESS
     } else {
