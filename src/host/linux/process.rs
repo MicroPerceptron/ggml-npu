@@ -64,8 +64,31 @@ impl crate::runtime::async_runtime::MonotonicClock for LinuxClock {
     }
 }
 
+impl crate::artifact_cache::CacheClock for LinuxClock {
+    fn now_ns(&self) -> u64 {
+        self.monotonic_now_ns().unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LinuxMemoryStatus;
+
+fn read_decimal_file(path: &CStr) -> Result<Option<u64>, HostError> {
+    let file = open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|error| HostError(i64::from(error.raw_os_error())))?;
+    let mut buffer = [0u8; 64];
+    let length =
+        read(&file, &mut buffer).map_err(|error| HostError(i64::from(error.raw_os_error())))?;
+    let bytes = buffer[..length]
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .ok_or(HostError(22))?;
+    if bytes == b"max" {
+        return Ok(None);
+    }
+    let text = core::str::from_utf8(bytes).map_err(|_| HostError(84))?;
+    text.parse::<u64>().map(Some).map_err(|_| HostError(22))
+}
 
 impl MemoryStatusService for LinuxMemoryStatus {
     fn available_memory_bytes(&self) -> Result<u64, HostError> {
@@ -90,6 +113,19 @@ impl MemoryStatusService for LinuxMemoryStatus {
             .parse::<u64>()
             .map_err(|_| HostError(22))?;
         kib.checked_mul(1024).ok_or(HostError(75))
+    }
+
+    fn constrained_available_memory_bytes(&self) -> Result<u64, HostError> {
+        let available = self.available_memory_bytes()?;
+        let limit = match read_decimal_file(c"/sys/fs/cgroup/memory.max") {
+            Ok(Some(limit)) => limit,
+            Ok(None) | Err(_) => return Ok(available),
+        };
+        let current = read_decimal_file(c"/sys/fs/cgroup/memory.current")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        Ok(available.min(limit.saturating_sub(current)))
     }
 }
 

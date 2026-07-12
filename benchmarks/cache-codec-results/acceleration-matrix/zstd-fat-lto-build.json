@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "variant": "zstd-fat-lto",
+  "features": [
+    "bundled-zstd",
+    "structured-simd",
+    "zrip-simd",
+    "lz4-safe",
+    "zstd-fat-lto"
+  ],
+  "rustc": "rustc 1.99.0-nightly (f10db292a 2026-07-07), LLVM 22.1.8",
+  "cc": "gcc 16.1.1 20260515",
+  "linker": "rust-lld",
+  "result": "build-failed",
+  "failure": "The GCC LTO archive could not be consumed by Rust's LLVM linker; ZSTD_* symbols were undefined at final link.",
+  "assessment": "zstd-sys cross-language fat-lto/thin-lto requires a compatible Clang/LLVM linker-plugin-LTO toolchain. It is not a portable production feature for this GCC-based build and was excluded from performance results."
+}

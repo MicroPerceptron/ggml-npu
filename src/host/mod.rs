@@ -11,7 +11,10 @@ use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
 
 use crate::runtime::async_runtime::AtomicWait;
+use crate::artifact_cache::{ArtifactStore, CompressionProvider, WaitProvider};
 use crate::runtime::Deadline;
+
+pub(crate) mod artifact_cache;
 
 pub(crate) const ERROR_DOMAIN: u32 = u32::from_be_bytes(*b"HOST");
 
@@ -123,6 +126,10 @@ pub(crate) trait ClockService {
 
 pub(crate) trait MemoryStatusService {
     fn available_memory_bytes(&self) -> Result<u64, HostError>;
+
+    fn constrained_available_memory_bytes(&self) -> Result<u64, HostError> {
+        self.available_memory_bytes()
+    }
 }
 
 pub(crate) trait MathService {
@@ -204,6 +211,9 @@ pub(crate) trait HostEnvironment {
     type AtomicWait: AtomicWait;
     type ReactorFactory: ReactorFactory;
     type BlockingExecutorFactory: BlockingExecutorFactory;
+    type Compression: CompressionProvider;
+    type ArtifactCache: ArtifactStore;
+    type Wait: WaitProvider;
 
     fn files(&self) -> &Self::Files;
     fn clock(&self) -> &Self::Clock;
@@ -217,6 +227,9 @@ pub(crate) trait HostEnvironment {
     fn atomic_wait(&self) -> &Self::AtomicWait;
     fn reactor_factory(&self) -> &Self::ReactorFactory;
     fn blocking_executor_factory(&self) -> &Self::BlockingExecutorFactory;
+    fn compression(&self) -> &Self::Compression;
+    fn artifact_cache(&self) -> &Self::ArtifactCache;
+    fn wait_provider(&self) -> &Self::Wait;
 }
 
 #[cfg(target_os = "linux")]
