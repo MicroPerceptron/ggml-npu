@@ -7,10 +7,101 @@
 
 use crate::ffi::*;
 use crate::graph::{
-    ExecutionPartition, GraphIr, OpRegistry, OperationContract, PartitionPolicy, PartitionReason,
+    ExecutionPartition, GraphIr, Node, OpRegistry, OperationContract, PartitionPolicy,
+    PartitionReason, WireOp,
 };
 use crate::vendor::{LoweringSupport, Vendor};
 use crate::{ops, vendor};
+
+/// Host-realize layout metadata that landed inside a claimed multi-op split.
+///
+/// View/Reshape/Transpose/Permute are aliasing header ops — ggml already configured the
+/// destination tensor when the node was created, so compute is a no-op. Cont materializes a
+/// contiguous copy on the host because OpenVINO cannot lower layout-only programs alone.
+fn host_realize_layout_graph(graph: &GraphIr) -> Result<(), &'static str> {
+    for node in &graph.nodes {
+        match GraphIr::wire_op(node) {
+            Some(WireOp::View | WireOp::Reshape | WireOp::Transpose | WireOp::Permute) => {}
+            Some(WireOp::Cont) => host_realize_cont(graph, node)?,
+            Some(_) => return Err("non_layout_in_layout_glue"),
+            None => return Err("unmapped_layout_glue_node"),
+        }
+    }
+    Ok(())
+}
+
+fn tensor_logical_nbytes(desc: &crate::graph::TensorDesc) -> Option<usize> {
+    let traits = unsafe { ggml_get_type_traits(desc.dtype) };
+    if traits.is_null() {
+        return None;
+    }
+    let type_size = unsafe { (*traits).type_size };
+    let block = usize::try_from(unsafe { (*traits).blck_size }).ok()?;
+    let mut elements = 1usize;
+    for dim in desc.dims {
+        let crate::graph::Dim::Static(n) = dim else {
+            return None;
+        };
+        elements = elements.checked_mul(n.max(0) as usize)?;
+    }
+    elements.checked_div(block)?.checked_mul(type_size)
+}
+
+fn host_realize_cont(graph: &GraphIr, node: &Node) -> Result<(), &'static str> {
+    let Some(&src_id) = node.inputs.first() else {
+        return Err("cont_missing_input");
+    };
+    let src = graph
+        .values
+        .get(src_id as usize)
+        .ok_or("cont_bad_input")?;
+    let dst = graph
+        .values
+        .get(node.output as usize)
+        .ok_or("cont_bad_output")?;
+    if src.data == 0 || dst.data == 0 {
+        return Err("cont_null_data");
+    }
+    let nbytes = tensor_logical_nbytes(dst).ok_or("cont_nbytes")?;
+    if tensor_logical_nbytes(src) != Some(nbytes) {
+        return Err("cont_size_mismatch");
+    }
+    if src.data == dst.data {
+        return Ok(());
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.data as *const u8, dst.data as *mut u8, nbytes);
+    }
+    Ok(())
+}
+
+fn layout_glue_partition(
+    parent: &GraphIr,
+    region: &ExecutionPartition,
+    start: usize,
+    end: usize,
+) -> Option<ExecutionPartition> {
+    let graph = region.graph.partition_range(start, end)?;
+    if !parent.has_lowerable_compute() || !graph.is_layout_only() {
+        return None;
+    }
+    Some(ExecutionPartition {
+        graph,
+        reason: PartitionReason::LayoutGlueHost,
+        start: region.start + start,
+    })
+}
+
+fn leading_layout_only_end(graph: &GraphIr, start: usize) -> Option<usize> {
+    if start >= graph.nodes.len() || !GraphIr::node_is_layout_metadata(&graph.nodes[start]) {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < graph.nodes.len() && GraphIr::node_is_layout_metadata(&graph.nodes[end]) {
+        end += 1;
+    }
+    Some(end)
+}
 
 fn feasible_partitions(
     graph: &GraphIr,
@@ -22,18 +113,38 @@ fn feasible_partitions(
     }
     let mut result = alloc::vec::Vec::new();
     for region in semantic_regions {
+        // Layout-only region beside real compute in the same claimed split: host-realize as
+        // glue. Standalone layout-only splits stay rejected (prefer unclaim via supports_op).
+        if let Some(glue) = layout_glue_partition(graph, &region, 0, region.graph.nodes.len()) {
+            result.push(glue);
+            continue;
+        }
         if vendor.graph_support(&region.graph).is_supported() {
             result.push(region);
             continue;
         }
         let mut start = 0usize;
         while start < region.graph.nodes.len() {
+            if let Some(end) = leading_layout_only_end(&region.graph, start) {
+                let Some(glue) = layout_glue_partition(graph, &region, start, end) else {
+                    return Err("layout_only_unclaimed");
+                };
+                start = end;
+                result.push(glue);
+                continue;
+            }
             let mut chosen = None;
             let mut last_rejection = "vendor_rejected_region";
             for end in ((start + 1)..=region.graph.nodes.len()).rev() {
                 let Some(candidate) = region.graph.partition_range(start, end) else {
                     continue;
                 };
+                if candidate.is_layout_only() {
+                    // Do not ask the vendor to compile layout-only prefixes; peel them as glue
+                    // when the parent split has compute, otherwise refuse (standalone unclaim).
+                    last_rejection = "layout_only_unclaimed";
+                    continue;
+                }
                 match vendor.graph_support(&candidate) {
                     LoweringSupport::Supported => {
                         chosen = Some(ExecutionPartition {
@@ -76,6 +187,31 @@ fn run_partitions(vendor: &dyn Vendor, graph: &GraphIr) -> bool {
     }
     // Capability is preflighted for every partition before the first state mutation or output.
     for (index, partition) in partitions.iter().enumerate() {
+        vendor.debug_note(&alloc::format!(
+            "[npu ir2] partition {index}: nodes={} inputs={} outputs={} reason={}\n",
+            partition.graph.nodes.len(),
+            partition.graph.inputs.len(),
+            partition.graph.outputs.len(),
+            partition.reason.as_str(),
+        ));
+        if partition.reason == PartitionReason::LayoutGlueHost {
+            match host_realize_layout_graph(&partition.graph) {
+                Ok(()) => {
+                    vendor.debug_note(&alloc::format!(
+                        "[npu ir2] host-realized layout glue: index={index} nodes={}\n",
+                        partition.graph.nodes.len()
+                    ));
+                    continue;
+                }
+                Err(reason) => {
+                    vendor.debug_note(&alloc::format!(
+                        "[npu ir2] claimed layout glue failed: index={index} reason={reason}\n"
+                    ));
+                    crate::trace::graph("graph_runtime_failure", &partition.graph, reason);
+                    return false;
+                }
+            }
+        }
         let nodes = partition.graph.nodes.len() as u64;
         crate::metrics::record_npu_program(nodes);
         crate::trace::perf(
@@ -86,13 +222,6 @@ fn run_partitions(vendor: &dyn Vendor, graph: &GraphIr) -> bool {
                 partition.reason.as_str(),
             ),
         );
-        vendor.debug_note(&alloc::format!(
-            "[npu ir2] partition {index}: nodes={} inputs={} outputs={} reason={}\n",
-            partition.graph.nodes.len(),
-            partition.graph.inputs.len(),
-            partition.graph.outputs.len(),
-            partition.reason.as_str(),
-        ));
         if !vendor.run_graph(&partition.graph) {
             vendor.debug_note(&alloc::format!(
                 "[npu ir2] claimed partition execution failed: index={index} reason=runtime_failure\n"
@@ -439,6 +568,155 @@ mod tests {
         }
     }
 
+    /// Supports only graphs that contain real compute — refuses layout-only the way OpenVINO does.
+    struct ComputeOnlyVendor {
+        ran: core::sync::atomic::AtomicUsize,
+    }
+
+    impl Vendor for ComputeOnlyVendor {
+        fn name(&self) -> &'static str {
+            "compute-only"
+        }
+        fn probe(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+        fn can_lower(&self, _op: Op, _inputs: &[Operand]) -> bool {
+            true
+        }
+        fn run(&self, _op: Op, _inputs: &[Operand], _output: &Operand) -> bool {
+            true
+        }
+        fn run_subgraph(&self, _sg: &crate::ops::subgraph::Subgraph) -> bool {
+            true
+        }
+        fn graph_support(&self, graph: &GraphIr) -> LoweringSupport {
+            if graph.is_layout_only() {
+                LoweringSupport::Unsupported("layout_only_unclaimed")
+            } else if graph.has_lowerable_compute() {
+                LoweringSupport::Supported
+            } else {
+                LoweringSupport::Unsupported("empty_or_unknown")
+            }
+        }
+        fn run_graph(&self, graph: &GraphIr) -> bool {
+            assert!(
+                !graph.is_layout_only(),
+                "vendor must not be asked to run layout-only glue"
+            );
+            self.ran
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        unsafe fn alloc_host(&self, _size: usize) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe fn free_host(&self, _ptr: *mut c_void, _size: usize) {}
+    }
+
+    fn matmul_plus_disconnected_views_graph() -> GraphIr {
+        let mul_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_MUL_MAT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("MatMul must decode");
+        let view_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_VIEW,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("View must decode");
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(4),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 16, 16, 16],
+            role,
+            data,
+            owned: false,
+            shared: None,
+        };
+        // MatMul on values 0/1→2, then a disconnected View on independent values 3→4.
+        // Models the LFM claimed split that partitions into compute + layout-only regions.
+        GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::Constant, 1),
+                tensor(TensorRole::RuntimeInput, 2),
+                tensor(TensorRole::Output, 3),
+                tensor(TensorRole::RuntimeInput, 4),
+                tensor(TensorRole::Output, 5),
+            ],
+            nodes: alloc::vec![
+                Node {
+                    op: crate::ffi::GGML_OP_MUL_MAT,
+                    spec: Ok(mul_spec),
+                    inputs: alloc::vec![0, 1],
+                    output: 2,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: crate::ffi::GGML_OP_VIEW,
+                    spec: Ok(view_spec),
+                    inputs: alloc::vec![3],
+                    output: 4,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+            ],
+            inputs: alloc::vec![0, 1, 3],
+            outputs: alloc::vec![2, 4],
+        }
+    }
+
+    fn view_only_graph() -> GraphIr {
+        let view_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_VIEW,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("View must decode");
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(1),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 4, 4, 4],
+            role,
+            data,
+            owned: false,
+            shared: None,
+        };
+        GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::RuntimeInput, 1),
+                tensor(TensorRole::Output, 2),
+            ],
+            nodes: alloc::vec![Node {
+                op: crate::ffi::GGML_OP_VIEW,
+                spec: Ok(view_spec),
+                inputs: alloc::vec![0],
+                output: 1,
+                op_params: [0; OP_PARAM_BYTES],
+            }],
+            inputs: alloc::vec![0],
+            outputs: alloc::vec![1],
+        }
+    }
+
     #[test]
     fn claimed_partition_runtime_failure_is_not_success() {
         // After claim, compile/exec failure must not soft-succeed (#8).
@@ -453,5 +731,55 @@ mod tests {
         let graph = single_matmul_graph();
         assert!(feasible_partitions(&graph, &UnclaimVendor).is_err());
         assert!(!run_partitions(&UnclaimVendor, &graph));
+    }
+
+    #[test]
+    fn layout_glue_inside_claimed_split_is_host_realized() {
+        // Mixed claimed split with a disconnected layout-only region must not abort the whole
+        // graph as "rejected layout-only" — host-realize glue and still run compute (#5/#8).
+        let graph = matmul_plus_disconnected_views_graph();
+        assert!(graph.has_lowerable_compute());
+        assert!(!graph.is_layout_only());
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert!(
+            regions.len() >= 2,
+            "expected disconnected compute + layout regions"
+        );
+        assert!(regions.iter().any(|r| r.graph.is_layout_only()));
+        assert!(regions.iter().any(|r| r.graph.has_lowerable_compute()));
+
+        let vendor = ComputeOnlyVendor {
+            ran: core::sync::atomic::AtomicUsize::new(0),
+        };
+        let parts = feasible_partitions(&graph, &vendor).expect("mixed split must partition");
+        assert!(
+            parts
+                .iter()
+                .any(|p| p.reason == PartitionReason::LayoutGlueHost),
+            "layout-only region must be scheduled as host glue"
+        );
+        assert!(
+            parts.iter().any(|p| p.graph.has_lowerable_compute()),
+            "compute region must remain"
+        );
+        assert!(run_partitions(&vendor, &graph));
+        assert_eq!(
+            vendor.ran.load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "vendor should run exactly the compute partition"
+        );
+    }
+
+    #[test]
+    fn standalone_layout_only_split_stays_unclaimed() {
+        // Lone View/Reshape/… partitions must still refuse — prefer unclaim, no soft success.
+        let graph = view_only_graph();
+        assert!(graph.is_layout_only());
+        let vendor = ComputeOnlyVendor {
+            ran: core::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(feasible_partitions(&graph, &vendor).is_err());
+        assert!(!run_partitions(&vendor, &graph));
+        assert_eq!(vendor.ran.load(core::sync::atomic::Ordering::Relaxed), 0);
     }
 }

@@ -264,6 +264,10 @@ pub enum PartitionReason {
     MutableStateBoundary,
     ExpertBankLimit,
     FeasibilityLimit,
+    /// Layout-only region inside a claimed split that also has real compute. OpenVINO cannot
+    /// lower View/Reshape/Cont/Transpose/Permute alone, so the engine host-realizes them as
+    /// glue rather than rejecting the whole claimed multi-op split (#5/#8).
+    LayoutGlueHost,
 }
 
 impl PartitionReason {
@@ -274,6 +278,7 @@ impl PartitionReason {
             Self::MutableStateBoundary => "mutable_state_boundary",
             Self::ExpertBankLimit => "expert_bank_limit",
             Self::FeasibilityLimit => "feasibility_limit",
+            Self::LayoutGlueHost => "layout_glue_host",
         }
     }
 }
@@ -786,6 +791,24 @@ impl GraphIr {
     pub fn wire_op(node: &Node) -> Option<WireOp> {
         let captured = *node.spec.as_ref().ok()?;
         (OpRegistry::decode_node(node).ok() == Some(captured)).then_some(captured.wire)
+    }
+
+    /// True when a node is shape/layout bookkeeping (View/Reshape/Cont/Transpose/Permute).
+    pub fn node_is_layout_metadata(node: &Node) -> bool {
+        node.spec.ok().is_some_and(|spec| {
+            spec.traits.metadata || spec.placement == PlacementClass::Metadata
+        })
+    }
+
+    /// True when every node is layout metadata. Standalone layout-only graphs must not be
+    /// claimed for NPU compile; the same nodes may still appear as glue beside compute.
+    pub fn is_layout_only(&self) -> bool {
+        !self.nodes.is_empty() && self.nodes.iter().all(Self::node_is_layout_metadata)
+    }
+
+    /// True when at least one node is real compute (not layout metadata).
+    pub fn has_lowerable_compute(&self) -> bool {
+        self.nodes.iter().any(|node| !Self::node_is_layout_metadata(node))
     }
 
     /// Plan the largest semantically connected regions before vendor feasibility is considered.

@@ -819,12 +819,7 @@ pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
 /// True when every node is shape/layout bookkeeping (View/Reshape/Cont/Transpose/Permute).
 /// Intel's OpenVINO NPU path cannot lower these as standalone programs.
 fn graph_is_layout_only(graph: &GraphIr) -> bool {
-    !graph.nodes.is_empty()
-        && graph.nodes.iter().all(|node| {
-            node.spec
-                .ok()
-                .is_some_and(|spec| spec.traits.metadata || spec.placement == crate::graph::PlacementClass::Metadata)
-        })
+    graph.is_layout_only()
 }
 
 /// Shared MoE / attention policy gates used by both per-node and whole-graph feasibility.
@@ -1996,5 +1991,9 @@ mod tests {
             outputs: alloc::vec![3],
         };
         assert!(!graph_is_layout_only(&fused));
+        assert!(fused.has_lowerable_compute());
+        // Mixed compute+layout must not be classified as layout-only; graph_feasible still needs
+        // the OpenVINO shim for a full Supported probe, but classification is hermetic.
+        assert!(!fused.is_layout_only());
     }
 }
