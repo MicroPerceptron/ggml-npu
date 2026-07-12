@@ -1,10 +1,8 @@
 //! Queried and user-configurable direct-runtime memory budgets.
 
-use core::ffi::{c_char, CStr};
+use core::ffi::CStr;
 
-use rustix::fs::{open, Mode, OFlags};
-use rustix::io::read;
-
+use crate::host::{ConfigService, HostEnvironment, MemoryStatusService};
 use crate::runtime::RuntimeError;
 
 use super::prepare::PreparationBudget;
@@ -12,10 +10,6 @@ use super::DeviceParameters;
 
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_HOST_FLOOR_MIB: u64 = 4096;
-
-extern "C" {
-    fn getenv(name: *const c_char) -> *const c_char;
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeBudget {
@@ -68,45 +62,28 @@ impl RuntimeBudget {
 }
 
 fn env_mib(name: &CStr) -> Option<u64> {
-    // SAFETY: getenv returns either null or a process-lifetime NUL-terminated environment value.
-    let value = unsafe { getenv(name.as_ptr()) };
-    if value.is_null() {
+    let value = crate::host::builtin().config().value(name)?;
+    let mut parsed = 0u64;
+    let bytes = value.to_bytes();
+    if bytes.is_empty() || bytes.len() > 20 {
         return None;
     }
-    let mut parsed = 0u64;
-    let mut length = 0usize;
-    loop {
-        // SAFETY: scanning one byte at a time until the required terminating NUL.
-        let byte = unsafe { *value.add(length) as u8 };
-        if byte == 0 {
-            break;
-        }
-        if !byte.is_ascii_digit() || length >= 20 {
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
             return None;
         }
         parsed = parsed
             .checked_mul(10)?
             .checked_add(u64::from(byte - b'0'))?;
-        length += 1;
     }
-    (length != 0).then_some(parsed)
+    Some(parsed)
 }
 
 fn host_available_bytes() -> Option<u64> {
-    let file = open(
-        c"/proc/meminfo",
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    let mut buffer = [0u8; 4096];
-    let length = read(&file, &mut buffer).ok()?;
-    let text = core::str::from_utf8(&buffer[..length]).ok()?;
-    let line = text
-        .split('\n')
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let kib = line.split_ascii_whitespace().nth(1)?.parse::<u64>().ok()?;
-    kib.checked_mul(1024)
+    crate::host::builtin()
+        .memory()
+        .available_memory_bytes()
+        .ok()
 }
 
 #[cfg(test)]

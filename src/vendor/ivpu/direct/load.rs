@@ -7,8 +7,8 @@
 use alloc::vec::Vec;
 use core::ptr;
 
+use crate::host::MemoryMapping;
 use crate::identity::{SemanticDigest, SemanticHasher};
-use crate::os::MemoryMapping;
 use crate::runtime::RuntimeError;
 
 use super::elf::ParsedIntelElf;
@@ -354,9 +354,6 @@ pub fn stage_program<'device>(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "bench-hardware")]
-    use std::io::Read;
-
-    #[cfg(feature = "bench-hardware")]
     use super::super::elf::parse_intel_elf;
     #[cfg(feature = "bench-hardware")]
     use super::super::hpi::inspect_hpi_requirements;
@@ -371,24 +368,16 @@ mod tests {
     #[cfg(feature = "bench-hardware")]
     #[ignore = "bounded section staging and static linking only; no queue or submit"]
     fn stage_existing_tiny_intel_artifact() {
-        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
         const MAX_ARTIFACT: usize = 1024 * 1024;
-        let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
-        assert!(length <= MAX_ARTIFACT);
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).unwrap();
-        bytes.resize(length, 0);
-        std::fs::File::open(PATH)
-            .unwrap()
-            .read_exact(&mut bytes)
-            .unwrap();
+        let bytes = super::super::load_test_artifact(MAX_ARTIFACT);
         let elf = parse_intel_elf(&bytes).unwrap();
         let device = IvpuDevice::open_first().unwrap();
         let parameters = device.parameters().unwrap();
         let hpi = inspect_hpi_requirements(&elf, &parameters).unwrap();
         let staged = stage_program(&device, &elf, &hpi, 64 * 1024 * 1024).unwrap();
         std::println!(
-            "artifact={PATH} sections={} total_bo_bytes={} entry_address={:#x} entry_bytes={} jit_relocations={} plan_digest={} linked_digest={}",
+            "artifact={} sections={} total_bo_bytes={} entry_address={:#x} entry_bytes={} jit_relocations={} plan_digest={} linked_digest={}",
+            super::super::test_artifact_location().to_string_lossy(),
             staged.sections().len(),
             staged.total_bo_bytes,
             staged.entry_address,

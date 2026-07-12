@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use super::super::{compile, session};
-use crate::graph_ir::{GraphIr, TensorRole};
+use crate::graph::{GraphIr, TensorRole};
 use crate::ops::Operand;
 
 pub fn can_lower(graph: &GraphIr) -> bool {
@@ -21,8 +21,8 @@ pub fn run(graph: &GraphIr) -> bool {
             (t.role != TensorRole::Constant).then_some(Operand {
                 ptr: t.data as *mut c_void,
                 elems: t.dims.iter().try_fold(1usize, |a, d| match d {
-                    crate::graph_ir::Dim::Static(x) if *x > 0 => a.checked_mul(*x as usize),
-                    crate::graph_ir::Dim::Bounded { max, .. } if *max > 0 => {
+                    crate::graph::Dim::Static(x) if *x > 0 => a.checked_mul(*x as usize),
+                    crate::graph::Dim::Bounded { max, .. } if *max > 0 => {
                         a.checked_mul(*max as usize)
                     }
                     _ => None,
@@ -40,8 +40,8 @@ pub fn run(graph: &GraphIr) -> bool {
             Some(Operand {
                 ptr: t.data as *mut c_void,
                 elems: t.dims.iter().try_fold(1usize, |a, d| match d {
-                    crate::graph_ir::Dim::Static(x) if *x > 0 => a.checked_mul(*x as usize),
-                    crate::graph_ir::Dim::Bounded { max, .. } if *max > 0 => {
+                    crate::graph::Dim::Static(x) if *x > 0 => a.checked_mul(*x as usize),
+                    crate::graph::Dim::Bounded { max, .. } if *max > 0 => {
                         a.checked_mul(*max as usize)
                     }
                     _ => None,

@@ -46,11 +46,15 @@ ignored query/BO/CMDQ/direct-submit tests and one serial Criterion comparison us
 45,192-byte vector-add artifact:
 
 ```sh
+export GGML_NPU_TEST_ARTIFACT=./artifacts/bounded-vector-add.blob
 cargo test --features bench-hardware -- --ignored --test-threads=1 --nocapture
 timeout --signal=TERM --kill-after=3s 60s \
   env CARGO_TARGET_DIR=target \
   cargo bench --bench hardware --features bench-hardware -- --noplot
 ```
+
+The opt-in artifact path has no machine-specific default. `GGML_NPU_BENCH_BACKEND` can similarly
+override the repository-relative release backend used by the Criterion fixture.
 
 The hardware benchmark compares the same artifact, inputs, 32-element FP32 output, and two-second
 device timeout for direct IVPU and Level Zero. Level Zero uses a reusable fixture: context, native

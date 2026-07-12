@@ -1,5 +1,8 @@
 # Direct runtime foundation
 
+The dependency and promotion rules for this implementation are defined in
+[`architecture-boundaries.md`](architecture-boundaries.md).
+
 This milestone introduces an OS-neutral runtime contract and a Linux implementation without
 replacing the working OpenVINO + Level Zero path. `rustix` supplies syscall mechanics only; it does
 not define Intel firmware commands, graph formats, queue semantics, or compiler behavior.
@@ -8,11 +11,13 @@ not define Intel firmware commands, graph formats, queue semantics, or compiler 
 
 - `src/runtime/`: fallible lifecycle traits for device, memory, program, immutable bindings,
   queue, event, deadlines, unload, and destruction.
-- `src/runtime/artifact.rs`: a versioned pointer-free artifact envelope containing a target
-  fingerprint, native payload kind, binding ABI, payload length, and resident-byte requirement.
-- `src/os/`: OS ownership, mapping, polling, and monotonic-time traits.
-- `src/os/linux.rs`: `rustix` owned-FD, `open`, `mmap`/`munmap`, `poll`, and monotonic-clock
-  implementation. Dynamic loading remains a separate compatibility concern.
+- `src/runtime/artifact.rs`: a versioned pointer-free artifact envelope containing an opaque target
+  identity, opaque format identifier, binding ABI, payload length, and resident-byte requirement.
+- `src/host/`: focused host services and the single compile-time platform-selection point. Linux
+  uses rustix where available; process allocation, environment, loader, exit, and C-math ABI calls
+  remain isolated in the Linux host implementation.
+- `src/host/linux/`: `rustix` owned files, mappings, polling, DMA-BUF, DRM PRIME/GEM, typed ioctl,
+  process, loader, and monotonic-clock implementation modules.
 - `src/vendor/ivpu/direct/`: feature-gated Linux UAPI subset for discovery, parameters, bounded
   GEM BO ownership, explicit command queues, validated submit, and finite BO waits.
 - `src/vendor/ivpu/direct/elf.rs`: Goblin-backed NPU ELF preflight and zero-copy section, symbol,
@@ -81,7 +86,8 @@ Build the foundation with:
 ```sh
 cargo check --features direct-ivpu
 cargo test --features direct-ivpu
-cargo test --lib --features bench-hardware \
+GGML_NPU_TEST_ARTIFACT=./artifacts/bounded-vector-add.blob \
+  cargo test --lib --features bench-hardware \
   vendor::ivpu::direct::tests::tiny_known_answer_direct_submission \
   -- --ignored --exact --nocapture --test-threads=1
 ```

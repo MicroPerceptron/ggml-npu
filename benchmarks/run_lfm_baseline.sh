@@ -5,7 +5,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA_ROOT="${LLAMA_ROOT:-$ROOT/../llama.cpp}"
-OPENVINO_DIR="${OPENVINO_DIR:-/opt/intel/openvino_2026.2.1}"
 MODEL="${MODEL:-}"
 MODE="${MODE:-cpu-native}" # cpu-native | cpu-openblas | cpu-flexiblas | cpu-mkl | vulkan | npu
 THREADS="${THREADS:-$(nproc)}"
@@ -18,7 +17,38 @@ case "$MODE" in
 esac
 BENCH="${LLAMA_BENCH:-$DEFAULT_BENCH}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="$ROOT/benchmarks/results/${STAMP}-${MODE}"
+RESULTS_ROOT="${RESULTS_ROOT:-$ROOT/benchmarks/results}"
+OUT="${BENCHMARK_OUTPUT_DIR:-$RESULTS_ROOT/${STAMP}-${MODE}}"
+TIME_BIN="${TIME_BIN:-$(type -P time || true)}"
+
+path_label() {
+    local value="${1%/}"
+    printf '%s\n' "${value##*/}"
+}
+
+configure_openvino_runtime_path() {
+    local runtime_lib="${OPENVINO_RUNTIME_LIB_DIR:-}"
+    if [[ -z "$runtime_lib" && -n "${OPENVINO_DIR:-}" ]]; then
+        local candidate
+        for candidate in \
+            "$OPENVINO_DIR/runtime/lib/intel64" \
+            "$OPENVINO_DIR/runtime/lib" \
+            "$OPENVINO_DIR/lib64" \
+            "$OPENVINO_DIR/lib"; do
+            if [[ -d "$candidate" ]]; then
+                runtime_lib="$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -n "$runtime_lib" ]]; then
+        [[ -d "$runtime_lib" ]] || {
+            echo "OpenVINO runtime library directory not found at $runtime_lib" >&2
+            return 1
+        }
+        export LD_LIBRARY_PATH="$runtime_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+}
 
 clear_npu_environment() {
     unset GGML_BACKEND_PATH GGML_NPU_OVC GGML_NPU_DEVICE_CLASS GGML_NPU_MEMORY_LIMIT
@@ -43,23 +73,31 @@ if [[ ! -x "$BENCH" ]]; then
     echo "llama-bench not found at $BENCH (set LLAMA_BENCH)" >&2
     exit 2
 fi
+if [[ -z "$TIME_BIN" || ! -x "$TIME_BIN" ]]; then
+    echo "GNU time executable not found (set TIME_BIN)" >&2
+    exit 2
+fi
 if [[ "$MODE" == npu && "${RUN_NPU:-0}" != 1 ]]; then
     echo "NPU runs require RUN_NPU=1 acknowledgement" >&2
     exit 2
 fi
 
+npu_cache_label=default
+if [[ -n "${GGML_NPU_CACHE:-}" ]]; then
+    npu_cache_label="$(path_label "$GGML_NPU_CACHE")"
+fi
 mkdir -p "$OUT"
 {
     echo "timestamp_utc=$STAMP"
     echo "mode=$MODE"
-    echo "model=$MODEL"
-    echo "bench=$BENCH"
+    echo "model=$(path_label "$MODEL")"
+    echo "bench=$(path_label "$BENCH")"
     echo "attention_placement=${ATTENTION_PLACEMENT:-qkv}"
     echo "npu_bits=${GGML_NPU_BITS:-auto}"
     echo "npu_async=${GGML_NPU_ASYNC:-0}"
     echo "npu_device_class=${NPU_DEVICE_CLASS:-npu}"
     echo "npu_only=${NPU_ONLY:-0}"
-    echo "npu_cache=${GGML_NPU_CACHE:-default}"
+    echo "npu_cache=$npu_cache_label"
     echo "npu_timeout=${NPU_TIMEOUT:-180s}"
     echo "lfm_shortconv=${GGML_NPU_LFM_SHORTCONV:-0}"
     echo "npu_moe=${GGML_NPU_MOE:-0}"
@@ -89,7 +127,7 @@ case "$MODE" in
         : "${GGML_NPU_OVC:=$ROOT/shim/libggml_npu_ovc.so}"
         : "${GGML_NPU_DEVICE_CLASS:=${NPU_DEVICE_CLASS:-npu}}"
         export GGML_BACKEND_PATH GGML_NPU_OVC GGML_NPU_DEVICE_CLASS
-        export LD_LIBRARY_PATH="$OPENVINO_DIR/runtime/lib/intel64:${LD_LIBRARY_PATH:-}"
+        configure_openvino_runtime_path
         [[ "${NPU_PROFILE:-1}" == 1 ]] && export GGML_NPU_PROFILE=1
         [[ "${NPU_TRACE:-0}" == 1 ]] && export GGML_NPU_TRACE=1
         if [[ "${ATTENTION_PLACEMENT:-qkv}" == full ]]; then
@@ -139,7 +177,7 @@ if [[ "$MODE" == npu ]]; then
 fi
 # One process group makes timeout, memory-guard, interrupt, and shell-exit cleanup reach every
 # descendant (the old wrapper-only kill could leave llama-bench running after its parent exited).
-setsid /usr/bin/time -f \
+setsid "$TIME_BIN" -f \
     '{"wall_seconds":%e,"user_seconds":%U,"system_seconds":%S,"max_rss_kib":%M,"exit_status":%x}' \
     -o "$OUT/process.json" "${runner[@]}" "$BENCH" "${args[@]}" \
     > "$OUT/result.jsonl" 2> "$OUT/stderr.txt" &

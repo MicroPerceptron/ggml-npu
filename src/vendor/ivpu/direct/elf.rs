@@ -8,7 +8,11 @@
 
 use goblin::elf::{header, section_header, Elf};
 
-use crate::runtime::artifact::{ArtifactEnvelope, NativePayloadKind, TargetFingerprint};
+use crate::address::{Alignment, ByteLen};
+use crate::runtime::artifact::{ArtifactEnvelope, TargetIdentity};
+
+use super::super::address::{FileOffset, FileRange, SectionOffset, SectionRange};
+use super::super::artifact::IVPU_ELF_FORMAT;
 
 const ELF64_HEADER_BYTES: usize = goblin::elf64::header::SIZEOF_EHDR;
 const ELF64_PROGRAM_HEADER_BYTES: usize = goblin::elf64::program_header::SIZEOF_PHDR;
@@ -123,13 +127,13 @@ pub struct BindingMetadata {
 pub struct ArtifactInspection {
     pub elf: ElfInspection,
     pub bindings: BindingMetadata,
-    pub target: TargetFingerprint,
+    pub target: TargetIdentity,
 }
 
 pub struct ParsedIntelArtifact<'a> {
     pub elf: ParsedIntelElf<'a>,
     pub bindings: BindingMetadata,
-    pub target: TargetFingerprint,
+    pub target: TargetIdentity,
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ElfError> {
@@ -150,28 +154,60 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ElfError> {
 }
 
 fn table_range(
-    offset: u64,
+    offset: FileOffset,
     count: usize,
     entry_bytes: usize,
     file_bytes: usize,
 ) -> Result<core::ops::Range<usize>, ElfError> {
-    let offset = usize::try_from(offset).map_err(|_| ElfError::InvalidTable)?;
-    let bytes = count
-        .checked_mul(entry_bytes)
+    let count = u64::try_from(count).map_err(|_| ElfError::InvalidTable)?;
+    let bytes = ByteLen::try_from_usize(entry_bytes)
+        .map_err(|_| ElfError::InvalidTable)?
+        .checked_mul(count)
         .ok_or(ElfError::InvalidTable)?;
-    let end = offset.checked_add(bytes).ok_or(ElfError::InvalidTable)?;
-    if end > file_bytes {
+    let range = FileRange::from_start_len(offset, bytes).map_err(|_| ElfError::InvalidTable)?;
+    let range = range
+        .try_usize_range()
+        .map_err(|_| ElfError::InvalidTable)?;
+    if range.end > file_bytes {
         return Err(ElfError::InvalidTable);
     }
-    Ok(offset..end)
+    Ok(range)
 }
 
-fn validate_file_range(offset: u64, bytes: u64, file_bytes: usize) -> Result<(), ElfError> {
-    let end = offset.checked_add(bytes).ok_or(ElfError::InvalidRange)?;
-    if end > file_bytes as u64 {
+fn validate_file_range(
+    offset: FileOffset,
+    bytes: ByteLen,
+    file_bytes: usize,
+) -> Result<(), ElfError> {
+    let available = FileRange::from_start_len(
+        FileOffset::new(0),
+        ByteLen::try_from_usize(file_bytes).map_err(|_| ElfError::InvalidRange)?,
+    )
+    .map_err(|_| ElfError::InvalidRange)?;
+    let requested = FileRange::from_start_len(offset, bytes).map_err(|_| ElfError::InvalidRange)?;
+    if !available.contains_range(requested) {
         return Err(ElfError::InvalidRange);
     }
     Ok(())
+}
+
+fn validate_elf_alignment(value: u64) -> Result<Alignment, ElfError> {
+    Alignment::new(value.max(1)).map_err(|_| ElfError::InvalidAlignment)
+}
+
+fn indexed_file_offset(
+    base: FileOffset,
+    index: usize,
+    entry_bytes: u64,
+) -> Result<usize, ElfError> {
+    let index = u64::try_from(index).map_err(|_| ElfError::InvalidTable)?;
+    let delta = ByteLen::new(entry_bytes)
+        .checked_mul(index)
+        .ok_or(ElfError::InvalidTable)?;
+    base.checked_add_len(delta)
+        .ok_or(ElfError::InvalidTable)?
+        .try_usize()
+        .map_err(|_| ElfError::InvalidTable)
 }
 
 fn section_has_file_data(section_type: u32) -> bool {
@@ -246,8 +282,8 @@ fn inspect_elf_with_limits(
         return Err(ElfError::InvalidTable);
     }
 
-    let phdrs = table_range(phoff, phnum, phentsize, bytes.len())?;
-    let shdrs = table_range(shoff, shnum, shentsize, bytes.len())?;
+    let phdrs = table_range(FileOffset::new(phoff), phnum, phentsize, bytes.len())?;
+    let shdrs = table_range(FileOffset::new(shoff), shnum, shentsize, bytes.len())?;
     let mut loadable_file_bytes = 0u64;
     let mut loadable_memory_bytes = 0u64;
     for index in 0..phnum {
@@ -259,10 +295,12 @@ fn inspect_elf_with_limits(
         if file_size > memory_size {
             return Err(ElfError::InvalidRange);
         }
-        if alignment > 1 && !alignment.is_power_of_two() {
-            return Err(ElfError::InvalidAlignment);
-        }
-        validate_file_range(offset, file_size, bytes.len())?;
+        validate_elf_alignment(alignment)?;
+        validate_file_range(
+            FileOffset::new(offset),
+            ByteLen::new(file_size),
+            bytes.len(),
+        )?;
         loadable_file_bytes = loadable_file_bytes
             .checked_add(file_size)
             .ok_or(ElfError::InvalidRange)?;
@@ -281,11 +319,9 @@ fn inspect_elf_with_limits(
         let size = read_u64(bytes, base + 32)?;
         let alignment = read_u64(bytes, base + 48)?;
         let entry_size = read_u64(bytes, base + 56)?;
-        if alignment > 1 && !alignment.is_power_of_two() {
-            return Err(ElfError::InvalidAlignment);
-        }
+        validate_elf_alignment(alignment)?;
         if section_has_file_data(section_type) {
-            validate_file_range(offset, size, bytes.len())?;
+            validate_file_range(FileOffset::new(offset), ByteLen::new(size), bytes.len())?;
         }
         if read_u64(bytes, base + 8)?
             & (u64::from(section_header::SHF_ALLOC) | VPU_SHF_USER_RESIDENT)
@@ -349,13 +385,11 @@ fn inspect_elf_with_limits(
 }
 
 fn section_header_offset(parsed_header: &header::Header, index: usize) -> Result<usize, ElfError> {
-    let base = usize::try_from(parsed_header.e_shoff).map_err(|_| ElfError::InvalidTable)?;
-    base.checked_add(
-        index
-            .checked_mul(parsed_header.e_shentsize as usize)
-            .ok_or(ElfError::InvalidTable)?,
+    indexed_file_offset(
+        FileOffset::new(parsed_header.e_shoff),
+        index,
+        u64::from(parsed_header.e_shentsize),
     )
-    .ok_or(ElfError::InvalidTable)
 }
 
 fn section_data<'a>(
@@ -370,14 +404,14 @@ fn section_data<'a>(
     if !section_has_file_data(read_u32(bytes, base + 4)?) {
         return Ok(None);
     }
-    let offset =
-        usize::try_from(read_u64(bytes, base + 24)?).map_err(|_| ElfError::InvalidRange)?;
-    let size = usize::try_from(read_u64(bytes, base + 32)?).map_err(|_| ElfError::InvalidRange)?;
-    let end = offset.checked_add(size).ok_or(ElfError::InvalidRange)?;
-    bytes
-        .get(offset..end)
-        .map(Some)
-        .ok_or(ElfError::InvalidRange)
+    let range = FileRange::from_start_len(
+        FileOffset::new(read_u64(bytes, base + 24)?),
+        ByteLen::new(read_u64(bytes, base + 32)?),
+    )
+    .map_err(|_| ElfError::InvalidRange)?
+    .try_usize_range()
+    .map_err(|_| ElfError::InvalidRange)?;
+    bytes.get(range).map(Some).ok_or(ElfError::InvalidRange)
 }
 
 fn string_at(bytes: &[u8], offset: usize) -> Option<&str> {
@@ -407,8 +441,9 @@ fn platform_architecture(bytes: &[u8], parsed_header: &header::Header) -> Result
         {
             return Err(ElfError::MissingPlatformInfo);
         }
-        let data_offset =
-            usize::try_from(read_u64(data, 0)?).map_err(|_| ElfError::MissingPlatformInfo)?;
+        let data_offset = SectionOffset::new(read_u64(data, 0)?)
+            .try_usize()
+            .map_err(|_| ElfError::MissingPlatformInfo)?;
         architecture = Some(read_u64(data, data_offset)?);
     }
     architecture.ok_or(ElfError::MissingPlatformInfo)
@@ -422,8 +457,7 @@ fn validate_symbol_relocation_bounds(
     for index in 0..section_count {
         let base = section_header_offset(parsed_header, index)?;
         let section_type = read_u32(bytes, base + 4)?;
-        let section_offset =
-            usize::try_from(read_u64(bytes, base + 24)?).map_err(|_| ElfError::InvalidRange)?;
+        let section_offset = FileOffset::new(read_u64(bytes, base + 24)?);
         let section_size = read_u64(bytes, base + 32)?;
         let linked = read_u32(bytes, base + 40)? as usize;
         let target = read_u32(bytes, base + 44)? as usize;
@@ -435,7 +469,8 @@ fn validate_symbol_relocation_bounds(
             let strings =
                 section_data(bytes, parsed_header, linked)?.ok_or(ElfError::InvalidSymbol)?;
             for symbol in 0..(section_size / entry_size) as usize {
-                let symbol_base = section_offset + symbol * entry_size as usize;
+                let symbol_base = indexed_file_offset(section_offset, symbol, entry_size)
+                    .map_err(|_| ElfError::InvalidSymbol)?;
                 let name = read_u32(bytes, symbol_base)? as usize;
                 let section_index = read_u16(bytes, symbol_base + 6)? as usize;
                 if name >= strings.len()
@@ -466,14 +501,21 @@ fn validate_symbol_relocation_bounds(
             let symbols = symbol_bytes / symbol_entry;
             let target_base = section_header_offset(parsed_header, target)?;
             let target_bytes = read_u64(bytes, target_base + 32)?;
+            let target_range =
+                SectionRange::from_start_len(SectionOffset::new(0), ByteLen::new(target_bytes))
+                    .map_err(|_| ElfError::InvalidRelocation)?;
             for relocation in 0..(section_size / entry_size) as usize {
-                let relocation_base = section_offset + relocation * entry_size as usize;
+                let relocation_base = indexed_file_offset(section_offset, relocation, entry_size)
+                    .map_err(|_| ElfError::InvalidRelocation)?;
                 let offset = read_u64(bytes, relocation_base)?;
                 let info = read_u64(bytes, relocation_base + 8)?;
-                if info >> 32 >= symbols
-                    || offset.checked_add(8).is_none()
-                    || offset + 8 > target_bytes
-                {
+                let Ok(write_range) = SectionRange::from_start_len_non_empty(
+                    SectionOffset::new(offset),
+                    ByteLen::new(8),
+                ) else {
+                    return Err(ElfError::InvalidRelocation);
+                };
+                if info >> 32 >= symbols || !target_range.contains_range(write_range) {
                     return Err(ElfError::InvalidRelocation);
                 }
             }
@@ -537,9 +579,13 @@ impl<'a> ParsedIntelElf<'a> {
             let data = if !section_has_file_data(section.sh_type) {
                 None
             } else {
-                let start = section.sh_offset as usize;
-                let end = start + section.sh_size as usize;
-                self.bytes.get(start..end)
+                FileRange::from_start_len(
+                    FileOffset::new(section.sh_offset),
+                    ByteLen::new(section.sh_size),
+                )
+                .ok()
+                .and_then(|range| range.try_usize_range().ok())
+                .and_then(|range| self.bytes.get(range))
             };
             visitor(DeviceSection {
                 index,
@@ -576,7 +622,12 @@ impl<'a> ParsedIntelElf<'a> {
                 .ok_or(ElfError::InvalidSymbol)?;
             let count = section.sh_size / ELF64_SYMBOL_BYTES;
             for index in 0..count as usize {
-                let base = section.sh_offset as usize + index * ELF64_SYMBOL_BYTES as usize;
+                let base = indexed_file_offset(
+                    FileOffset::new(section.sh_offset),
+                    index,
+                    ELF64_SYMBOL_BYTES,
+                )
+                .map_err(|_| ElfError::InvalidSymbol)?;
                 let name_offset = read_u32(self.bytes, base)? as usize;
                 let info = *self.bytes.get(base + 4).ok_or(ElfError::InvalidSymbol)?;
                 let visibility = *self.bytes.get(base + 5).ok_or(ElfError::InvalidSymbol)?;
@@ -624,7 +675,12 @@ impl<'a> ParsedIntelElf<'a> {
             let is_rela = section.sh_type == section_header::SHT_RELA;
             let count = section.sh_size / section.sh_entsize;
             for index in 0..count as usize {
-                let base = section.sh_offset as usize + index * section.sh_entsize as usize;
+                let base = indexed_file_offset(
+                    FileOffset::new(section.sh_offset),
+                    index,
+                    section.sh_entsize,
+                )
+                .map_err(|_| ElfError::InvalidRelocation)?;
                 let info = read_u64(self.bytes, base + 8)?;
                 visitor(DeviceRelocation {
                     relocation_section,
@@ -668,9 +724,20 @@ impl<'a> ParsedIntelElf<'a> {
                 table.sh_type,
                 section_header::SHT_SYMTAB | section_header::SHT_DYNSYM
             ) || relocation.symbol as u64 >= table.sh_size / ELF64_SYMBOL_BYTES
-                || relocation.offset.checked_add(8).is_none()
-                || relocation.offset + 8 > target.sh_size
             {
+                invalid = true;
+                return;
+            }
+            let target_range =
+                SectionRange::from_start_len(SectionOffset::new(0), ByteLen::new(target.sh_size));
+            let relocation_range = SectionRange::from_start_len_non_empty(
+                SectionOffset::new(relocation.offset),
+                ByteLen::new(8),
+            );
+            if !matches!(
+                (target_range, relocation_range),
+                (Ok(target), Ok(relocation)) if target.contains_range(relocation)
+            ) {
                 invalid = true;
             }
         })?;
@@ -693,7 +760,7 @@ pub fn inspect_artifact(artifact: &ArtifactEnvelope<'_>) -> Result<ArtifactInspe
 pub fn parse_intel_artifact<'a>(
     artifact: &ArtifactEnvelope<'a>,
 ) -> Result<ParsedIntelArtifact<'a>, ElfError> {
-    if artifact.header().payload_kind != NativePayloadKind::INTEL_IVPU_ELF {
+    if artifact.header().format != IVPU_ELF_FORMAT {
         return Err(ElfError::WrongPayloadKind);
     }
     if artifact.header().resident_bytes > MAX_INTEL_RESIDENT_BYTES {
@@ -720,9 +787,6 @@ pub fn parse_intel_artifact<'a>(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "bench-hardware")]
-    use std::io::Read;
-
     use super::*;
 
     fn minimal_elf() -> [u8; 64] {
@@ -828,18 +892,9 @@ mod tests {
     #[cfg(feature = "bench-hardware")]
     #[ignore = "local cached Intel artifact inspection only; never loads or submits"]
     fn parse_existing_tiny_intel_artifact() {
-        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
         const MAX_TEST_ARTIFACT: usize = 1024 * 1024;
-        let metadata = std::fs::metadata(PATH).unwrap();
-        let length = usize::try_from(metadata.len()).unwrap();
-        assert!(length <= MAX_TEST_ARTIFACT);
-        let mut bytes = alloc::vec::Vec::new();
-        bytes.try_reserve_exact(length).unwrap();
-        bytes.resize(length, 0);
-        std::fs::File::open(PATH)
-            .unwrap()
-            .read_exact(&mut bytes)
-            .unwrap();
+        let bytes = super::super::load_test_artifact(MAX_TEST_ARTIFACT);
+        let length = bytes.len();
         let parsed = parse_intel_elf(&bytes).unwrap();
         let mut firmware_api = [0u64; 8];
         firmware_api[super::super::firmware::JOB_CMD_API_INDEX] =
@@ -890,7 +945,8 @@ mod tests {
             placement_bytes += placement.bytes;
         });
         std::println!(
-            "artifact={PATH} bytes={length} sections={} symbols={} relocations={} resident_bytes={} placements={placements} placement_bytes={placement_bytes} inputs={} outputs={} cmx_slice_bytes={} slices={} barriers={} loader={}.{}.{} nnrt={}.{}.{} entry_section={} entry_bytes={} link_operations={link_operations} jit_operations={jit_operations} controlled_link={link_status:?}",
+            "artifact={} bytes={length} sections={} symbols={} relocations={} resident_bytes={} placements={placements} placement_bytes={placement_bytes} inputs={} outputs={} cmx_slice_bytes={} slices={} barriers={} loader={}.{}.{} nnrt={}.{}.{} entry_section={} entry_bytes={} link_operations={link_operations} jit_operations={jit_operations} controlled_link={link_status:?}",
+            super::super::test_artifact_location().to_string_lossy(),
             parsed.inspection().section_headers,
             parsed.inspection().symbol_count,
             parsed.inspection().relocation_count,

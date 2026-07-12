@@ -39,7 +39,7 @@ src/engine.rs           scheduler split recognition and graph dispatch
 src/ops/                matmul, graph-pattern IR, and host requantization
 src/hal.rs              legacy five-verb compatibility façade
 src/runtime/            portable fallible runtime lifecycle + artifact envelope
-src/os/                 OS service traits; rustix Linux implementation
+src/host/               host contracts, mock provider, and rustix Linux implementation
 src/vendor/stub.rs      CPU-echo NpuHal (no hardware)
 src/vendor/ivpu/        Intel NPU (Level Zero + OpenVINO); level_zero/ vendored headers   <- active
 src/vendor/ivpu/direct/ feature-gated Linux intel_vpu discovery/resource UAPI (no submit)

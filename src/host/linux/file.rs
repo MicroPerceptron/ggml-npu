@@ -1,4 +1,4 @@
-//! Linux syscall implementation backed by rustix.
+//! Linux owned files, mappings, polling, and monotonic deadline conversion.
 
 use core::ffi::{c_void, CStr};
 use core::ptr::{self, NonNull};
@@ -9,18 +9,18 @@ use rustix::fs::{open, Mode, OFlags};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use rustix::time::{clock_gettime, ClockId};
 
-use super::{
-    MapOptions, MemoryMapping, OpenAccess, OpenOptions, OsError, OsServices, OwnedDeviceFile,
-    Ready, WaitInterest,
+use super::super::{
+    FileError, FileService, MapOptions, MemoryMapping, OpenAccess, OpenOptions, OwnedFile, Ready,
+    WaitInterest,
 };
 use crate::runtime::Deadline;
 
-fn os_error(error: rustix::io::Errno) -> OsError {
-    OsError(error.raw_os_error())
+fn file_error(error: rustix::io::Errno) -> FileError {
+    FileError(error.raw_os_error())
 }
 
-pub struct LinuxFile {
-    fd: OwnedFd,
+pub(crate) struct LinuxFile {
+    pub(super) fd: OwnedFd,
 }
 
 impl LinuxFile {
@@ -29,13 +29,13 @@ impl LinuxFile {
     }
 }
 
-impl OwnedDeviceFile for LinuxFile {
-    fn raw_handle(&self) -> i64 {
-        self.fd.as_raw_fd() as i64
+impl OwnedFile for LinuxFile {
+    fn diagnostic_id(&self) -> i64 {
+        i64::from(self.fd.as_raw_fd())
     }
 }
 
-pub struct LinuxMapping {
+pub(crate) struct LinuxMapping {
     address: NonNull<u8>,
     bytes: usize,
 }
@@ -52,21 +52,26 @@ impl MemoryMapping for LinuxMapping {
 
 impl Drop for LinuxMapping {
     fn drop(&mut self) {
-        // SAFETY: this object uniquely owns the exact mapping returned by mmap, and no references
-        // can outlive `drop` through the portable Mapping trait.
+        // SAFETY: this object uniquely owns the exact mapping returned by mmap.
         let _ = unsafe { munmap(self.address.as_ptr().cast::<c_void>(), self.bytes) };
     }
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct LinuxOs;
+pub(crate) struct LinuxFiles;
 
-impl LinuxOs {
-    fn timeout(&self, deadline: Deadline) -> Result<Option<Timespec>, OsError> {
+impl LinuxFiles {
+    fn timeout(&self, deadline: Deadline) -> Result<Option<Timespec>, FileError> {
         let Deadline::MonotonicNs(deadline) = deadline else {
             return Ok(None);
         };
-        let now = self.monotonic_now_ns()?;
+        let value = clock_gettime(ClockId::Monotonic);
+        let seconds = u64::try_from(value.tv_sec).map_err(|_| FileError(75))?;
+        let nanos = u64::try_from(value.tv_nsec).map_err(|_| FileError(75))?;
+        let now = seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|base| base.checked_add(nanos))
+            .ok_or(FileError(75))?;
         let remaining = deadline.saturating_sub(now);
         Ok(Some(Timespec {
             tv_sec: (remaining / 1_000_000_000) as i64,
@@ -75,11 +80,11 @@ impl LinuxOs {
     }
 }
 
-impl OsServices for LinuxOs {
+impl FileService for LinuxFiles {
     type File = LinuxFile;
     type Mapping = LinuxMapping;
 
-    fn open_device(&self, path: &CStr, options: OpenOptions) -> Result<Self::File, OsError> {
+    fn open_device(&self, path: &CStr, options: OpenOptions) -> Result<Self::File, FileError> {
         let mut flags = OFlags::CLOEXEC;
         flags |= match options.access {
             OpenAccess::ReadOnly => OFlags::RDONLY,
@@ -90,15 +95,17 @@ impl OsServices for LinuxOs {
         }
         open(path, flags, Mode::empty())
             .map(|fd| LinuxFile { fd })
-            .map_err(os_error)
+            .map_err(file_error)
     }
 
-    fn map_file(&self, file: &Self::File, options: MapOptions) -> Result<Self::Mapping, OsError> {
+    fn map_file(&self, file: &Self::File, options: MapOptions) -> Result<Self::Mapping, FileError> {
         if options.bytes == 0
             || (!options.readable && !options.writable)
-            || options.offset % rustix::param::page_size() as u64 != 0
+            || !options
+                .offset
+                .is_multiple_of(rustix::param::page_size() as u64)
         {
-            return Err(OsError(22));
+            return Err(FileError(22));
         }
         let mut protection = ProtFlags::empty();
         if options.readable {
@@ -112,8 +119,7 @@ impl OsServices for LinuxOs {
         } else {
             MapFlags::PRIVATE
         };
-        // SAFETY: a null address asks the kernel to select a non-overlapping range. LinuxFile
-        // remains open for the call; LinuxMapping exclusively owns the returned range.
+        // SAFETY: null lets the kernel select a range; the returned owner retains exact length.
         let raw = unsafe {
             mmap(
                 ptr::null_mut(),
@@ -124,8 +130,8 @@ impl OsServices for LinuxOs {
                 options.offset,
             )
         }
-        .map_err(os_error)?;
-        let address = NonNull::new(raw.cast::<u8>()).ok_or(OsError(12))?;
+        .map_err(file_error)?;
+        let address = NonNull::new(raw.cast::<u8>()).ok_or(FileError(12))?;
         Ok(LinuxMapping {
             address,
             bytes: options.bytes,
@@ -137,7 +143,7 @@ impl OsServices for LinuxOs {
         file: &Self::File,
         interest: WaitInterest,
         deadline: Deadline,
-    ) -> Result<Ready, OsError> {
+    ) -> Result<Ready, FileError> {
         let events = match interest {
             WaitInterest::Readable => PollFlags::IN,
             WaitInterest::Writable => PollFlags::OUT,
@@ -145,7 +151,7 @@ impl OsServices for LinuxOs {
         };
         let mut descriptor = [PollFd::new(&file.fd, events)];
         let timeout = self.timeout(deadline)?;
-        poll(&mut descriptor, timeout.as_ref()).map_err(os_error)?;
+        poll(&mut descriptor, timeout.as_ref()).map_err(file_error)?;
         let ready = descriptor[0].revents();
         Ok(Ready {
             readable: ready.contains(PollFlags::IN),
@@ -154,16 +160,6 @@ impl OsServices for LinuxOs {
             hung_up: ready.contains(PollFlags::HUP),
         })
     }
-
-    fn monotonic_now_ns(&self) -> Result<u64, OsError> {
-        let value = clock_gettime(ClockId::Monotonic);
-        let seconds = u64::try_from(value.tv_sec).map_err(|_| OsError(75))?;
-        let nanos = u64::try_from(value.tv_nsec).map_err(|_| OsError(75))?;
-        seconds
-            .checked_mul(1_000_000_000)
-            .and_then(|base| base.checked_add(nanos))
-            .ok_or(OsError(75))
-    }
 }
 
 #[cfg(test)]
@@ -171,17 +167,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monotonic_clock_moves_forward() {
-        let os = LinuxOs;
-        let first = os.monotonic_now_ns().unwrap();
-        let second = os.monotonic_now_ns().unwrap();
-        assert!(second >= first);
-    }
-
-    #[test]
-    fn invalid_mapping_is_rejected_before_syscall() {
-        let os = LinuxOs;
-        assert!(os
+    fn invalid_device_open_is_reported() {
+        assert!(LinuxFiles
             .open_device(
                 c"/definitely/not/a/device",
                 OpenOptions {

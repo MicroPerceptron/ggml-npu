@@ -4,10 +4,9 @@
 //! recognizes constant-weight matmuls and fused subgraphs, compiles them through OpenVINO, and
 //! submits native graphs through Level Zero. Unsupported work remains on other ggml backends.
 //!
-//! `no_std` by design: a ggml backend is always `dlopen`'d into a full libc host, so the
-//! allocator and `abort` resolve from the host at load time (`RTLD_NOW`). There is no
-//! unwinding runtime — a panic in any vtable entry hits [`on_panic`] and aborts, which is
-//! UB-free across the C ABI (the `no_std` replacement for a `catch_unwind` firewall).
+//! `no_std` by design. The selected built-in host provider supplies process allocation,
+//! diagnostics, dynamic loading, and termination. There is no unwinding runtime — a panic in any
+//! vtable entry hits [`on_panic`] and aborts, which is UB-free across the C ABI.
 //!
 //! Load it with `GGML_BACKEND_PATH=/abs/path/libggml_npu.so`.
 #![no_std]
@@ -37,37 +36,29 @@ pub(crate) mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+pub(crate) mod address;
 mod backend;
 mod engine;
-mod graph_ir;
+mod graph;
 mod hal;
+mod host;
 pub mod identity;
+pub mod interop;
 pub mod metrics;
 mod ops;
-pub mod os;
 mod policy;
 pub mod runtime;
 mod trace;
 mod vendor;
 
-#[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
+#[cfg(feature = "direct-ivpu")]
 pub use vendor::ivpu::direct as direct_ivpu;
 #[cfg(feature = "bench-hardware")]
 pub use vendor::ivpu::LevelZeroBenchmarkFixture;
 
-// ---------------------------------------------------------------------------
-// Host runtime glue. These symbols resolve from the host process at dlopen.
-// ---------------------------------------------------------------------------
-extern "C" {
-    fn malloc(size: usize) -> *mut c_void;
-    fn free(ptr: *mut c_void);
-    fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> c_int;
-    #[cfg(not(any(test, feature = "bench")))]
-    fn abort() -> !;
-}
+use crate::host::{AllocationService, HostEnvironment};
 
-/// The host libc allocator: `malloc`/`free` (`max_align_t`-aligned, 16 on our targets;
-/// over-aligned requests go through `posix_memalign`). Serves as **both** the global hook
+/// The selected host allocator. Serves as **both** the global hook
 /// ([`GlobalAlloc`]) and a first-class allocator value ([`Allocator`]) so owning types can be
 /// constructed with an explicit allocator — `Vec::new_in(HostAlloc)` — rather than the implicit
 /// `Global` (issue #1). A zero-size ZST, so passing it by value is free.
@@ -76,20 +67,11 @@ pub(crate) struct HostAlloc;
 
 unsafe impl GlobalAlloc for HostAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.align() <= 16 {
-            malloc(layout.size()) as *mut u8
-        } else {
-            let mut p: *mut c_void = core::ptr::null_mut();
-            if posix_memalign(&mut p, layout.align(), layout.size()) == 0 {
-                p as *mut u8
-            } else {
-                core::ptr::null_mut()
-            }
-        }
+        unsafe { host::builtin().allocator().allocate(layout) }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        free(ptr as *mut c_void);
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { host::builtin().allocator().deallocate(ptr, layout) };
     }
 }
 
@@ -121,7 +103,7 @@ static HOST_ALLOC: HostAlloc = HostAlloc;
 #[panic_handler]
 fn on_panic(_info: &PanicInfo) -> ! {
     // no_std: no unwinding. Abort rather than let a panic cross the C ABI.
-    unsafe { abort() }
+    host::builtin().allocator().abort()
 }
 
 // The precompiled `core`/`alloc` are built with unwinding and reference these symbols,
@@ -136,7 +118,7 @@ extern "C" fn rust_eh_personality() {}
 #[no_mangle]
 #[cfg(not(any(test, feature = "bench")))]
 extern "C" fn _Unwind_Resume() -> ! {
-    unsafe { abort() }
+    host::builtin().allocator().abort()
 }
 
 // ---------------------------------------------------------------------------

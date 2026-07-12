@@ -2,34 +2,45 @@
 
 #![allow(dead_code)]
 
+use core::num::NonZeroU32;
+
 pub const ARTIFACT_MAGIC: [u8; 8] = *b"GGNPUART";
 pub const ARTIFACT_ABI_MAJOR: u16 = 1;
 pub const MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_RESIDENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Opaque target identity words. The artifact format's adapter owns their schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
-pub struct TargetFingerprint {
-    pub vendor_id: u32,
-    pub device_id: u32,
-    pub revision: u32,
-    pub architecture: u32,
-    pub firmware_api: [u32; 8],
+pub struct TargetIdentity {
+    words: [u32; 12],
 }
 
+impl TargetIdentity {
+    pub const fn new(words: [u32; 12]) -> Self {
+        Self { words }
+    }
+
+    pub const fn words(self) -> [u32; 12] {
+        self.words
+    }
+}
+
+/// Opaque nonzero artifact format identifier. Concrete constants live in compiler/vendor adapters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct NativePayloadKind(pub u32);
+pub struct ArtifactFormat(NonZeroU32);
 
-impl NativePayloadKind {
-    pub const INTEL_LEVEL_ZERO_GRAPH: Self = Self(1);
-    pub const INTEL_IVPU_ELF: Self = Self(2);
-    pub const AMD_XCLBIN: Self = Self(3);
-    pub const QUALCOMM_CONTEXT_BINARY: Self = Self(4);
-    pub const CANONICAL_MLIR_BYTECODE: Self = Self(5);
+impl ArtifactFormat {
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
 
-    pub const fn is_known(self) -> bool {
-        self.0 >= Self::INTEL_LEVEL_ZERO_GRAPH.0 && self.0 <= Self::CANONICAL_MLIR_BYTECODE.0
+    pub const fn get(self) -> u32 {
+        self.0.get()
     }
 }
 
@@ -52,8 +63,8 @@ pub struct ArtifactHeader {
     pub envelope_minor: u16,
     pub header_bytes: u32,
     pub module_id: u64,
-    pub target: TargetFingerprint,
-    pub payload_kind: NativePayloadKind,
+    pub target: TargetIdentity,
+    pub format: ArtifactFormat,
     pub binding_abi: BindingAbi,
     pub payload_bytes: u64,
     pub resident_bytes: u64,
@@ -71,7 +82,6 @@ pub enum CompatibilityError {
     ResidentLimitExceeded,
     TargetMismatch,
     BindingAbiMismatch,
-    PayloadKindUnsupported,
 }
 
 pub struct ArtifactEnvelope<'a> {
@@ -105,9 +115,6 @@ impl<'a> ArtifactEnvelope<'a> {
         if header.resident_bytes > MAX_RESIDENT_BYTES {
             return Err(CompatibilityError::ResidentLimitExceeded);
         }
-        if !header.payload_kind.is_known() {
-            return Err(CompatibilityError::PayloadKindUnsupported);
-        }
         Ok(Self { header, payload })
     }
 
@@ -119,7 +126,7 @@ impl<'a> ArtifactEnvelope<'a> {
         self.payload
     }
 
-    pub fn ensure_target(&self, target: &TargetFingerprint) -> Result<(), CompatibilityError> {
+    pub fn ensure_target(&self, target: &TargetIdentity) -> Result<(), CompatibilityError> {
         if self.header.target == *target {
             Ok(())
         } else {
@@ -139,14 +146,8 @@ mod tests {
             envelope_minor: 0,
             header_bytes: core::mem::size_of::<ArtifactHeader>() as u32,
             module_id: 1,
-            target: TargetFingerprint {
-                vendor_id: 0x8086,
-                device_id: 0x643e,
-                revision: 0,
-                architecture: 40,
-                firmware_api: [0; 8],
-            },
-            payload_kind: NativePayloadKind::INTEL_IVPU_ELF,
+            target: TargetIdentity::new([0; 12]),
+            format: ArtifactFormat::new(1).unwrap(),
             binding_abi: BindingAbi {
                 major: 1,
                 minor: 0,
@@ -174,5 +175,14 @@ mod tests {
         let envelope = ArtifactEnvelope::new(header(1), &[7]).unwrap();
         assert_eq!(envelope.header().module_id, 1);
         assert_eq!(envelope.payload(), &[7]);
+    }
+
+    #[test]
+    fn opaque_format_and_target_preserve_wire_layout() {
+        assert!(ArtifactFormat::new(0).is_none());
+        assert_eq!(core::mem::size_of::<ArtifactFormat>(), 4);
+        assert_eq!(core::mem::size_of::<TargetIdentity>(), 48);
+        assert_eq!(core::mem::align_of::<TargetIdentity>(), 4);
+        assert_eq!(core::mem::size_of::<ArtifactHeader>(), 112);
     }
 }

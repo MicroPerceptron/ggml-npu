@@ -104,7 +104,7 @@ unsafe extern "C" fn buffer_free_buffer(buffer: ggml_backend_buffer_t) {
         return;
     }
     if let Some(v) = crate::vendor::present() {
-        v.free_host(base);
+        v.free_host(base, (*buffer).size);
     }
     ALLOCATED_BYTES.fetch_sub((*buffer).size, Ordering::AcqRel);
     BUFFER_GENERATION.fetch_add(1, Ordering::AcqRel);

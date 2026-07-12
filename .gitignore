@@ -3,6 +3,7 @@
 *.so
 
 /target
+/shim/build/
 /tests/registration_check
 /benchmarks/results/
 

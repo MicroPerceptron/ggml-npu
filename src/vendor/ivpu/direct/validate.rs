@@ -2,8 +2,11 @@
 
 #![allow(dead_code)]
 
+use crate::address::{ByteLen, RangeError};
 use crate::runtime::{MemoryId, SubmissionBindings, MAX_BINDINGS};
 
+use super::super::address::{BindingOffset, BindingRange, IvpuAddr, IvpuOffset, IvpuRange};
+use super::super::artifact::IvpuTargetIdentity;
 use super::elf::ArtifactInspection;
 use super::firmware::*;
 use super::transport::{BufferRole, QueueSpec};
@@ -47,14 +50,16 @@ pub struct MemoryRange {
 }
 
 impl MemoryRange {
-    fn contains(self, address: u64, bytes: u64) -> bool {
-        let Some(range_end) = self.vpu_address.checked_add(self.bytes) else {
-            return false;
-        };
-        let Some(end) = address.checked_add(bytes) else {
-            return false;
-        };
-        address >= self.vpu_address && end <= range_end
+    fn checked_range(self) -> Result<IvpuRange, RangeError> {
+        IvpuRange::from_start_len_non_empty(
+            IvpuAddr::new(self.vpu_address),
+            ByteLen::new(self.bytes),
+        )
+    }
+
+    fn contains(self, address: IvpuAddr, bytes: ByteLen) -> bool {
+        self.checked_range()
+            .is_ok_and(|range| range.contains_non_empty(address, bytes))
     }
 }
 
@@ -132,7 +137,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ValidationError> {
     ]))
 }
 
-fn in_any_range(ranges: &[MemoryRange], address: u64, bytes: u64) -> bool {
+fn in_any_range(ranges: &[MemoryRange], address: IvpuAddr, bytes: ByteLen) -> bool {
     ranges.iter().any(|range| range.contains(address, bytes))
 }
 
@@ -168,8 +173,8 @@ fn validate_handles(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
     if plan.command_handle == 0 || plan.handles[0] != plan.command_handle {
         return Err(ValidationError::InvalidHandle);
     }
-    let command_bytes =
-        u64::try_from(plan.command.bytes.len()).map_err(|_| ValidationError::InvalidRange)?;
+    let command_bytes = ByteLen::try_from_usize(plan.command.bytes.len())
+        .map_err(|_| ValidationError::InvalidRange)?;
     let Some(command_range) = plan
         .ranges
         .iter()
@@ -178,7 +183,7 @@ fn validate_handles(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidRange);
     };
     if command_range.role != BufferRole::Command
-        || !command_range.contains(plan.command.vpu_address, command_bytes)
+        || !command_range.contains(IvpuAddr::new(plan.command.vpu_address), command_bytes)
     {
         return Err(ValidationError::InvalidRange);
     }
@@ -221,11 +226,18 @@ fn validate_bindings(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
         else {
             return Err(ValidationError::BindingMismatch);
         };
-        let end = binding
-            .offset
-            .checked_add(binding.bytes)
-            .ok_or(ValidationError::ArithmeticOverflow)?;
-        if end > memory.range.bytes || !plan.handles.contains(&memory.range.handle) {
+        let allocation =
+            BindingRange::from_start_len(BindingOffset::new(0), ByteLen::new(memory.range.bytes))
+                .map_err(|_| ValidationError::ArithmeticOverflow)?;
+        let binding = BindingRange::from_start_len_non_empty(
+            BindingOffset::new(binding.offset),
+            ByteLen::new(binding.bytes),
+        )
+        .map_err(|error| match error {
+            RangeError::Overflow => ValidationError::ArithmeticOverflow,
+            RangeError::Empty | RangeError::Reversed => ValidationError::BindingMismatch,
+        })?;
+        if !allocation.contains_range(binding) || !plan.handles.contains(&memory.range.handle) {
             return Err(ValidationError::BindingMismatch);
         }
     }
@@ -233,13 +245,14 @@ fn validate_bindings(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
 }
 
 fn validate_artifact(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
-    if plan.artifact.target.vendor_id != INTEL_VENDOR_ID
-        || plan.artifact.target.device_id != LUNAR_LAKE_DEVICE_ID
-        || plan.artifact.target.revision != LUNAR_LAKE_REVISION
-        || (plan.artifact.target.firmware_api[JOB_CMD_API_INDEX] != 0
-            && plan.artifact.target.firmware_api[JOB_CMD_API_INDEX] != JOB_CMD_API_WORD)
-        || (plan.artifact.target.firmware_api[NNRT_API_INDEX] != 0
-            && plan.artifact.target.firmware_api[NNRT_API_INDEX] != NNRT_API_WORD)
+    let target = IvpuTargetIdentity::decode(plan.artifact.target);
+    if target.vendor_id != INTEL_VENDOR_ID
+        || target.device_id != LUNAR_LAKE_DEVICE_ID
+        || target.revision != LUNAR_LAKE_REVISION
+        || (target.firmware_api[JOB_CMD_API_INDEX] != 0
+            && target.firmware_api[JOB_CMD_API_INDEX] != JOB_CMD_API_WORD)
+        || (target.firmware_api[NNRT_API_INDEX] != 0
+            && target.firmware_api[NNRT_API_INDEX] != NNRT_API_WORD)
     {
         return Err(ValidationError::WrongDevice);
     }
@@ -250,9 +263,11 @@ fn validate_artifact(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
         .ranges
         .iter()
         .filter(|range| matches!(range.role, BufferRole::Program | BufferRole::Scratch))
-        .try_fold(0u64, |sum, range| sum.checked_add(range.bytes))
+        .try_fold(ByteLen::ZERO, |sum, range| {
+            sum.checked_add(ByteLen::new(range.bytes))
+        })
         .ok_or(ValidationError::ArithmeticOverflow)?;
-    if resident < plan.artifact.bindings.resident_bytes {
+    if resident.get() < plan.artifact.bindings.resident_bytes {
         return Err(ValidationError::ResidentBytesExceeded);
     }
     if plan.artifact.bindings.inputs as usize + plan.artifact.bindings.outputs as usize
@@ -266,35 +281,38 @@ fn validate_artifact(plan: &SubmissionPlan<'_>) -> Result<(), ValidationError> {
 fn validate_copy_descriptors(
     image: CommandImage<'_>,
     ranges: &[MemoryRange],
-    descriptor_heap: u64,
-    descriptor_offset: u64,
+    descriptor_heap: IvpuAddr,
+    descriptor_offset: IvpuOffset,
     count: u32,
 ) -> Result<(), ValidationError> {
     if count == 0 || count > MAX_COPY_DESCRIPTORS {
         return Err(ValidationError::InvalidCommandLength);
     }
     let start = descriptor_heap
-        .checked_add(descriptor_offset)
+        .checked_add_offset(descriptor_offset)
         .ok_or(ValidationError::ArithmeticOverflow)?;
-    let bytes = u64::from(count)
+    let bytes = ByteLen::new(u64::from(count))
         .checked_mul(COPY_DESCRIPTOR_40XX_BYTES)
         .ok_or(ValidationError::ArithmeticOverflow)?;
     if !in_any_range(ranges, start, bytes) {
         return Err(ValidationError::InvalidRange);
     }
     let image_offset = start
-        .checked_sub(image.vpu_address)
-        .and_then(|offset| usize::try_from(offset).ok())
+        .checked_sub_addr(IvpuAddr::new(image.vpu_address))
+        .and_then(|offset| offset.try_usize().ok())
         .ok_or(ValidationError::InvalidRange)?;
     for index in 0..count as usize {
-        let base = image_offset
-            .checked_add(index * COPY_DESCRIPTOR_40XX_BYTES as usize)
+        let descriptor_offset = index
+            .checked_mul(COPY_DESCRIPTOR_40XX_BYTES as usize)
             .ok_or(ValidationError::ArithmeticOverflow)?;
-        let size = read_u32(image.bytes, base + 24)? as u64;
-        let source = read_u64(image.bytes, base + 40)?;
-        let destination = read_u64(image.bytes, base + 48)?;
-        if size == 0
-            || size > MAX_MEMORY_FILL_BYTES
+        let base = image_offset
+            .checked_add(descriptor_offset)
+            .ok_or(ValidationError::ArithmeticOverflow)?;
+        let size = ByteLen::new(u64::from(read_u32(image.bytes, base + 24)?));
+        let source = IvpuAddr::new(read_u64(image.bytes, base + 40)?);
+        let destination = IvpuAddr::new(read_u64(image.bytes, base + 48)?);
+        if size.is_zero()
+            || size.get() > MAX_MEMORY_FILL_BYTES
             || !in_any_range(ranges, source, size)
             || !in_any_range(ranges, destination, size)
         {
@@ -316,9 +334,9 @@ pub fn validate_command_image(
     let command_offset = read_u32(image.bytes, header + 4)? as usize;
     let api = read_u32(image.bytes, header + 8)?;
     let reserved = read_u32(image.bytes, header + 12)?;
-    let descriptor_heap = read_u64(image.bytes, header + 16)?;
-    let fence_heap = read_u64(image.bytes, header + 32)?;
-    let context_save = read_u64(image.bytes, header + 40)?;
+    let descriptor_heap = IvpuAddr::new(read_u64(image.bytes, header + 16)?);
+    let fence_heap = IvpuAddr::new(read_u64(image.bytes, header + 32)?);
+    let context_save = IvpuAddr::new(read_u64(image.bytes, header + 40)?);
     if api != JOB_CMD_API_WORD || reserved != 0 || total < 48 || command_offset < 48 {
         return Err(ValidationError::InvalidCommandHeader);
     }
@@ -328,13 +346,16 @@ pub fn validate_command_image(
     let mut cursor = header
         .checked_add(command_offset)
         .ok_or(ValidationError::ArithmeticOverflow)?;
-    if end > image.bytes.len() || cursor > end || !in_any_range(ranges, context_save, 64) {
+    if end > image.bytes.len()
+        || cursor > end
+        || !in_any_range(ranges, context_save, ByteLen::new(64))
+    {
         return Err(ValidationError::InvalidRange);
     }
-    if descriptor_heap != 0 && !in_any_range(ranges, descriptor_heap, 1) {
+    if descriptor_heap.get() != 0 && !in_any_range(ranges, descriptor_heap, ByteLen::new(1)) {
         return Err(ValidationError::InvalidRange);
     }
-    if fence_heap != 0 && !in_any_range(ranges, fence_heap, 8) {
+    if fence_heap.get() != 0 && !in_any_range(ranges, fence_heap, ByteLen::new(8)) {
         return Err(ValidationError::InvalidRange);
     }
 
@@ -368,24 +389,28 @@ pub fn validate_command_image(
         }
         match command_type {
             VPU_CMD_TIMESTAMP => {
-                if !in_any_range(ranges, read_u64(image.bytes, cursor + 8)?, 8) {
+                if !in_any_range(
+                    ranges,
+                    IvpuAddr::new(read_u64(image.bytes, cursor + 8)?),
+                    ByteLen::new(8),
+                ) {
                     return Err(ValidationError::InvalidRange);
                 }
             }
             VPU_CMD_FENCE_WAIT | VPU_CMD_FENCE_SIGNAL => {
-                let offset = read_u64(image.bytes, cursor + 8)?;
+                let offset = IvpuOffset::new(read_u64(image.bytes, cursor + 8)?);
                 let address = fence_heap
-                    .checked_add(offset)
+                    .checked_add_offset(offset)
                     .ok_or(ValidationError::ArithmeticOverflow)?;
-                if !in_any_range(ranges, address, 8) {
+                if !in_any_range(ranges, address, ByteLen::new(8)) {
                     return Err(ValidationError::InvalidRange);
                 }
             }
             VPU_CMD_MEMORY_FILL => {
-                let address = read_u64(image.bytes, cursor + 8)?;
-                let bytes = read_u64(image.bytes, cursor + 16)?;
-                if bytes == 0
-                    || bytes > MAX_MEMORY_FILL_BYTES
+                let address = IvpuAddr::new(read_u64(image.bytes, cursor + 8)?);
+                let bytes = ByteLen::new(read_u64(image.bytes, cursor + 16)?);
+                if bytes.is_zero()
+                    || bytes.get() > MAX_MEMORY_FILL_BYTES
                     || !in_any_range(ranges, address, bytes)
                 {
                     return Err(ValidationError::InvalidRange);
@@ -395,14 +420,14 @@ pub fn validate_command_image(
                 image,
                 ranges,
                 descriptor_heap,
-                read_u64(image.bytes, cursor + 8)?,
+                IvpuOffset::new(read_u64(image.bytes, cursor + 8)?),
                 read_u32(image.bytes, cursor + 16)?,
             )?,
             VPU_CMD_INFERENCE_EXECUTE => {
-                let address = read_u64(image.bytes, cursor + 16)?;
-                let bytes = read_u32(image.bytes, cursor + 24)? as u64;
+                let address = IvpuAddr::new(read_u64(image.bytes, cursor + 16)?);
+                let bytes = ByteLen::new(u64::from(read_u32(image.bytes, cursor + 24)?));
                 if read_u32(image.bytes, cursor + 28)? != 0
-                    || bytes == 0
+                    || bytes.is_zero()
                     || !in_any_range(ranges, address, bytes)
                 {
                     return Err(ValidationError::InvalidRange);
@@ -435,8 +460,7 @@ pub fn validate_submission<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::artifact::TargetFingerprint;
-    use crate::runtime::{Binding, BindingAccess};
+    use crate::runtime::{AccessMode, Binding};
 
     use super::super::elf::{BindingMetadata, ElfInspection};
     use super::*;
@@ -487,13 +511,14 @@ mod tests {
                 scratch: 0,
                 resident_bytes: 4096,
             },
-            target: TargetFingerprint {
+            target: IvpuTargetIdentity {
                 vendor_id: INTEL_VENDOR_ID,
                 device_id: LUNAR_LAKE_DEVICE_ID,
                 revision: LUNAR_LAKE_REVISION,
                 architecture: 40,
                 firmware_api,
-            },
+            }
+            .encode(),
         }
     }
 
@@ -540,7 +565,7 @@ mod tests {
             memory: memory_id,
             offset: 0,
             bytes: 16,
-            access: BindingAccess::Read,
+            access: AccessMode::Read,
         }];
         let bindings = SubmissionBindings::new(&binding_entries).unwrap();
         let mut command = [0u8; 256];

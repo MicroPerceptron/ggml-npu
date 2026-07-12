@@ -23,6 +23,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ffi::{ggml_get_type_traits, GGML_TYPE_F32};
+use crate::host::{HostEnvironment, MathService};
 use crate::ops::Operand;
 
 /// A weight re-quantized to a grouped low-bit form. `weight` is `[N, K]` row-major, one value per
@@ -194,20 +195,11 @@ pub fn requant(
     })
 }
 
-// The scalar float ops `core` doesn't expose (they may lower to libm) resolve from the host's libm
-// at dlopen — the same way `malloc`/`getenv`/`clock_gettime` do elsewhere, so the crate keeps its
-// zero runtime Cargo deps. `roundf` is round-half-away-from-zero, matching the quantizer's rounding.
-extern "C" {
-    fn roundf(x: f32) -> f32;
-    fn fabsf(x: f32) -> f32;
-}
-
-/// Round half away from zero to `i32` (host libm `roundf`).
+/// Round half away from zero to `i32` through the selected host math service.
 fn round_i(v: f32) -> i32 {
-    unsafe { roundf(v) as i32 }
+    crate::host::builtin().math().round_f32(v) as i32
 }
 
-/// `|x|` (host libm `fabsf`).
 fn fabs(x: f32) -> f32 {
-    unsafe { fabsf(x) }
+    x.abs()
 }

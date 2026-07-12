@@ -15,11 +15,10 @@ use super::direct::prepare::{prepare_inference, PreparedInference};
 use super::direct::transport::release_host_writes;
 use super::direct::{CommandQueue, IvpuDevice};
 use super::profile;
+use crate::host::{ClockService, HostEnvironment};
 use crate::identity::{ExactKeyBuilder, ExactSemanticKey};
 use crate::metrics::MetricEvent;
 use crate::ops::Operand;
-use crate::os::linux::LinuxOs;
-use crate::os::OsServices;
 use crate::runtime::{Deadline, RuntimeError};
 
 struct DirectContext {
@@ -314,7 +313,7 @@ fn dispatch(
     }
     release_host_writes();
     let t1 = if prof { profile::now_ns() } else { 0 };
-    let now = match LinuxOs.monotonic_now_ns() {
+    let now = match crate::host::builtin().clock().monotonic_now_ns() {
         Ok(now) => now,
         Err(error) => {
             profile::note(&alloc::format!(
@@ -350,8 +349,8 @@ fn dispatch(
     let t3 = if prof { profile::now_ns() } else { 0 };
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     if prof {
-        let bytes_in = input_bytes.iter().map(|bytes| bytes.len() as u64).sum();
-        let bytes_out = outputs
+        let bytes_in: u64 = input_bytes.iter().map(|bytes| bytes.len() as u64).sum();
+        let bytes_out: u64 = outputs
             .iter()
             .filter_map(|output| operand_storage_bytes(output))
             .map(|bytes| bytes as u64)
@@ -363,7 +362,10 @@ fn dispatch(
             t2,
             t3,
             0,
+            0,
+            0,
             (inputs.len() + outputs.len()) as u64,
+            bytes_in.saturating_add(bytes_out),
             bytes_in,
             bytes_out,
         );
@@ -523,13 +525,22 @@ fn run_program(
             return false;
         }
         let accounted_bytes = prepared.total_accounted_bytes;
-        profile::event(MetricEvent::DirectMemoryBreakdown {
-            executable_bytes: prepared.executable_bo_bytes,
-            binding_bytes: prepared.binding_bo_bytes,
-            hpi_bytes: prepared.hpi_bo_bytes,
-            command_bytes: prepared.command_bo_bytes,
-            preemption_bytes: prepared.preemption_bytes,
-        });
+        for binding in &prepared.bindings {
+            profile::event(MetricEvent::StagingAllocation {
+                allocation: binding
+                    .bo
+                    .shared_identity()
+                    .map_or(binding.bo.vpu_address(), |identity| identity.object),
+                bytes: binding.logical_bytes,
+            });
+        }
+        profile::record_direct_memory_breakdown(
+            prepared.executable_bo_bytes,
+            prepared.binding_bo_bytes,
+            prepared.hpi_bo_bytes,
+            prepared.command_bo_bytes,
+            prepared.preemption_bytes,
+        );
         state.resident_bytes = state.resident_bytes.saturating_add(resident_bytes);
         state.resident_high_water = state.resident_high_water.max(state.resident_bytes);
         state.accounted_high_water = state
@@ -650,9 +661,13 @@ pub(super) fn run_blob_selftest_multi(
     context
         .queue
         .submit(&prepared.handles, prepared.commands_offset(), 0)?;
-    let now = LinuxOs
+    let now = crate::host::builtin()
+        .clock()
         .monotonic_now_ns()
-        .map_err(|error| RuntimeError::Os(error.0))?;
+        .map_err(|error| RuntimeError::External {
+            domain: crate::host::ERROR_DOMAIN,
+            code: error.0,
+        })?;
     if prepared
         .command
         .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)))?
@@ -721,9 +736,13 @@ impl DirectBenchmarkFixture {
         context
             .queue
             .submit(&self.prepared.handles, self.prepared.commands_offset(), 0)?;
-        let now = LinuxOs
+        let now = crate::host::builtin()
+            .clock()
             .monotonic_now_ns()
-            .map_err(|error| RuntimeError::Os(error.0))?;
+            .map_err(|error| RuntimeError::External {
+                domain: crate::host::ERROR_DOMAIN,
+                code: error.0,
+            })?;
         if self
             .prepared
             .command

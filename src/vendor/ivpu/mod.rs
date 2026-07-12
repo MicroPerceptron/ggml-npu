@@ -5,9 +5,11 @@
 //! [`crate::vendor::Vendor`] impl the agnostic backend dispatches to; [`IvpuHal`] is the
 //! (still-aspirational) 5-verb submission seam.
 
+pub(crate) mod address;
+pub(crate) mod artifact;
 mod cache;
 mod compile;
-#[cfg(all(feature = "direct-ivpu", target_os = "linux"))]
+#[cfg(feature = "direct-ivpu")]
 pub mod direct;
 #[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]
 #[path = "session_direct.rs"]
@@ -25,14 +27,17 @@ mod session;
 mod ze;
 
 use alloc::vec::Vec;
+use core::alloc::Layout;
 #[cfg(feature = "level-zero-compat")]
-use core::alloc::{AllocError, Allocator, Layout};
+use core::alloc::{AllocError, Allocator};
 use core::ffi::c_void;
 #[cfg(feature = "level-zero-compat")]
 use core::ptr::NonNull;
 
 #[cfg(feature = "level-zero-compat")]
 use crate::hal::{BufFlags, NpuHal};
+#[cfg(not(feature = "level-zero-compat"))]
+use crate::host::{AllocationService, HostEnvironment};
 use crate::ops::{Op, Operand};
 use crate::vendor::{DeviceInfo, LoweringSupport, Vendor};
 
@@ -118,7 +123,7 @@ impl Vendor for IvpuVendor {
         lower::subgraph::run(sg)
     }
 
-    fn graph_support(&self, graph: &crate::graph_ir::GraphIr) -> LoweringSupport {
+    fn graph_support(&self, graph: &crate::graph::GraphIr) -> LoweringSupport {
         if lower::graph::can_lower(graph) {
             LoweringSupport::Supported
         } else {
@@ -126,14 +131,14 @@ impl Vendor for IvpuVendor {
         }
     }
 
-    fn run_graph(&self, graph: &crate::graph_ir::GraphIr) -> bool {
+    fn run_graph(&self, graph: &crate::graph::GraphIr) -> bool {
         lower::graph::run(graph)
     }
 
     unsafe fn node_support(
         &self,
         node: *const crate::ffi::ggml_tensor,
-        spec: &crate::graph_ir::OpSpec,
+        spec: &crate::graph::OpSpec,
     ) -> LoweringSupport {
         if compile::graph_node_feasible(node, spec) {
             LoweringSupport::Supported
@@ -157,22 +162,25 @@ impl Vendor for IvpuVendor {
         }
         #[cfg(not(feature = "level-zero-compat"))]
         {
-            let mut allocation = core::ptr::null_mut();
-            if crate::posix_memalign(&mut allocation, 4096, size.max(1)) != 0 {
+            let Ok(layout) = Layout::from_size_align(size.max(1), 4096) else {
                 return core::ptr::null_mut();
-            }
-            allocation
+            };
+            crate::host::builtin().allocator().allocate(layout).cast()
         }
     }
 
-    unsafe fn free_host(&self, ptr: *mut c_void) {
+    unsafe fn free_host(&self, ptr: *mut c_void, size: usize) {
         #[cfg(feature = "level-zero-compat")]
         {
             ze::free_host(ptr);
         }
         #[cfg(not(feature = "level-zero-compat"))]
         {
-            crate::free(ptr);
+            if let Ok(layout) = Layout::from_size_align(size.max(1), 4096) {
+                crate::host::builtin()
+                    .allocator()
+                    .deallocate(ptr.cast(), layout);
+            }
         }
     }
 }
@@ -320,22 +328,12 @@ impl NpuHal for IvpuHal {
 
 #[cfg(all(test, not(feature = "level-zero-compat")))]
 mod direct_tests {
-    use std::io::Read;
-    use std::vec;
-
     use super::*;
 
     #[test]
     #[ignore = "explicit direct-runtime hardware execution using an existing bounded artifact"]
     fn default_runtime_executes_tiny_known_answer_without_level_zero() {
-        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
-        let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
-        assert!(length <= 1024 * 1024);
-        let mut artifact = vec![0u8; length];
-        std::fs::File::open(PATH)
-            .unwrap()
-            .read_exact(&mut artifact)
-            .unwrap();
+        let artifact = direct::load_test_artifact(1024 * 1024);
         let input0 = core::array::from_fn::<_, 32, _>(|index| index as f32 * 0.125 - 1.5);
         let input1 =
             core::array::from_fn::<_, 32, _>(|index| ((index * 7) % 17) as f32 * 0.25 - 2.0);

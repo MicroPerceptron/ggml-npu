@@ -1,8 +1,8 @@
 //! Portable runtime contracts.
 //!
 //! These traits describe ownership and lifecycle, not a vendor command protocol. Implementations
-//! may use Level Zero, a direct kernel UAPI, XRT, QNN, or another OS service without exposing those
-//! handles to graph lowering. All submission bindings are immutable for the duration of submit.
+//! keep provider protocols and system handles behind their associated types. All submission
+//! bindings are immutable for the duration of submit.
 
 #![allow(dead_code)]
 
@@ -54,8 +54,11 @@ pub enum RuntimeError {
     OutOfMemory,
     ResourceLimit,
     DeviceLost,
-    Os(i32),
-    Vendor { domain: u32, code: i64 },
+    /// Opaque adapter failure. The adapter owns the stable meaning of `domain` and `code`.
+    External {
+        domain: u32,
+        code: i64,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -104,11 +107,22 @@ impl MemoryRequest {
     }
 }
 
+/// Intended access to a memory region during one operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindingAccess {
+pub enum AccessMode {
     Read,
     Write,
     ReadWrite,
+}
+
+impl AccessMode {
+    pub const fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    pub const fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +132,7 @@ pub struct Binding {
     pub memory: MemoryId,
     pub offset: u64,
     pub bytes: u64,
-    pub access: BindingAccess,
+    pub access: AccessMode,
 }
 
 /// Validated immutable bindings. A backend may retain this slice only until `submit` returns.
@@ -204,7 +218,7 @@ mod tests {
             memory,
             offset: 4,
             bytes: 8,
-            access: BindingAccess::Read,
+            access: AccessMode::Read,
         }];
         assert_eq!(SubmissionBindings::new(&valid).unwrap().entries(), valid);
 
@@ -296,7 +310,7 @@ mod tests {
     #[test]
     fn fake_runtime_conforms_to_explicit_lifecycle() {
         use artifact::{
-            ArtifactEnvelope, ArtifactHeader, BindingAbi, NativePayloadKind, TargetFingerprint,
+            ArtifactEnvelope, ArtifactFormat, ArtifactHeader, BindingAbi, TargetIdentity,
             ARTIFACT_ABI_MAJOR, ARTIFACT_MAGIC,
         };
 
@@ -326,14 +340,8 @@ mod tests {
                 envelope_minor: 0,
                 header_bytes: core::mem::size_of::<ArtifactHeader>() as u32,
                 module_id: 1,
-                target: TargetFingerprint {
-                    vendor_id: 0,
-                    device_id: 0,
-                    revision: 0,
-                    architecture: 0,
-                    firmware_api: [0; 8],
-                },
-                payload_kind: NativePayloadKind::CANONICAL_MLIR_BYTECODE,
+                target: TargetIdentity::new([0; 12]),
+                format: ArtifactFormat::new(1).unwrap(),
                 binding_abi: BindingAbi {
                     major: 1,
                     minor: 0,
@@ -356,7 +364,7 @@ mod tests {
             memory: MemoryId::new(1).unwrap(),
             offset: 0,
             bytes: 16,
-            access: BindingAccess::Read,
+            access: AccessMode::Read,
         }];
         let event = runtime
             .submit(

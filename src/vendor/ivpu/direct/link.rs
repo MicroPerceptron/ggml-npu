@@ -6,6 +6,9 @@
 
 use goblin::elf::section_header;
 
+use crate::address::ByteLen;
+
+use super::super::address::{IvpuAddr, IvpuOffset, SectionOffset, SectionRange};
 use super::elf::{DeviceRelocation, DeviceSection, ElfError, ParsedIntelElf};
 
 pub const VPU_SHF_USER_INPUT: u64 = 0x0020_0000;
@@ -277,33 +280,43 @@ pub fn resolve_symbol(
         .iter()
         .find(|placement| placement.section == symbol.section_index)
     {
-        (placement.device_address, placement.bytes, true)
+        (
+            IvpuAddr::new(placement.device_address),
+            ByteLen::new(placement.bytes),
+            true,
+        )
     } else if let Some(runtime) = runtime_sections
         .iter()
         .find(|runtime| runtime.section_type == target_section.section_type)
     {
         // Pinned HPI symtab override mode replaces the blob symbol for non-allocated CMX
         // sections; it does not add the blob's st_value.
-        (runtime.device_address, runtime.bytes, false)
+        (
+            IvpuAddr::new(runtime.device_address),
+            ByteLen::new(runtime.bytes),
+            false,
+        )
     } else {
         return Err(LinkError::MissingPlacement);
     };
-    let end = symbol
-        .value
-        .checked_add(symbol.bytes)
-        .ok_or(LinkError::ArithmeticOverflow)?;
+    let available = SectionRange::from_start_len(SectionOffset::new(0), available)
+        .map_err(|_| LinkError::ArithmeticOverflow)?;
+    let symbol_range =
+        SectionRange::from_start_len(SectionOffset::new(symbol.value), ByteLen::new(symbol.bytes))
+            .map_err(|_| LinkError::ArithmeticOverflow)?;
     if placements
         .iter()
         .any(|placement| placement.section == symbol.section_index)
-        && end > available
+        && !available.contains_range(symbol_range)
     {
         return Err(LinkError::TargetOutOfBounds);
     }
     if add_symbol_value {
-        base.checked_add(symbol.value)
+        base.checked_add_offset(IvpuOffset::new(symbol.value))
+            .map(IvpuAddr::get)
             .ok_or(LinkError::ArithmeticOverflow)
     } else {
-        Ok(base)
+        Ok(base.get())
     }
 }
 
@@ -325,14 +338,24 @@ pub fn apply_link_operation(
     operation: LinkOperation,
     resolved_symbol: u64,
 ) -> Result<(), LinkError> {
-    let offset =
-        usize::try_from(operation.target_offset).map_err(|_| LinkError::TargetOutOfBounds)?;
-    let width = operation.write_bytes as usize;
-    let end = offset
-        .checked_add(width)
-        .ok_or(LinkError::TargetOutOfBounds)?;
+    let target_range = SectionRange::from_start_len(
+        SectionOffset::new(0),
+        ByteLen::try_from_usize(target.len()).map_err(|_| LinkError::TargetOutOfBounds)?,
+    )
+    .map_err(|_| LinkError::TargetOutOfBounds)?;
+    let write_range = SectionRange::from_start_len_non_empty(
+        SectionOffset::new(operation.target_offset),
+        ByteLen::new(u64::from(operation.write_bytes)),
+    )
+    .map_err(|_| LinkError::TargetOutOfBounds)?;
+    if !target_range.contains_range(write_range) {
+        return Err(LinkError::TargetOutOfBounds);
+    }
+    let write_range = write_range
+        .try_usize_range()
+        .map_err(|_| LinkError::TargetOutOfBounds)?;
     let bytes = target
-        .get_mut(offset..end)
+        .get_mut(write_range)
         .ok_or(LinkError::TargetOutOfBounds)?;
     let value = relocated_value(resolved_symbol, operation.addend)?;
     match operation.relocation_type {

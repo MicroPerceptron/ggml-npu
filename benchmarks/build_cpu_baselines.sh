@@ -42,15 +42,32 @@ build_flexiblas() {
 }
 
 build_mkl() {
-    local oneapi="${ONEAPI_ROOT:-/opt/intel/oneapi}"
-    local icx="$oneapi/compiler/latest/bin/icx"
-    local icpx="$oneapi/compiler/latest/bin/icpx"
-    local mklroot="${MKLROOT:-$oneapi/mkl/latest}"
-    if [[ ! -x "$icx" || ! -x "$icpx" || ! -f "$mklroot/lib/pkgconfig/mkl-sdl.pc" ]]; then
+    local oneapi="${ONEAPI_ROOT:-}"
+    local icx="${MKL_CC:-}"
+    local icpx="${MKL_CXX:-}"
+    local mklroot="${MKLROOT:-}"
+    local pkg_config_path="${PKG_CONFIG_PATH:-}"
+
+    if [[ -n "$oneapi" ]]; then
+        icx="${icx:-$oneapi/compiler/latest/bin/icx}"
+        icpx="${icpx:-$oneapi/compiler/latest/bin/icpx}"
+        mklroot="${mklroot:-$oneapi/mkl/latest}"
+    else
+        icx="${icx:-$(type -P icx || true)}"
+        icpx="${icpx:-$(type -P icpx || true)}"
+    fi
+    if [[ -n "$mklroot" && -f "$mklroot/lib/pkgconfig/mkl-sdl.pc" ]]; then
+        pkg_config_path="$mklroot/lib/pkgconfig${pkg_config_path:+:$pkg_config_path}"
+    fi
+    if [[ ! -x "$icx" || ! -x "$icpx" ]] ||
+        ! PKG_CONFIG_PATH="$pkg_config_path" pkg-config --exists mkl-sdl; then
         echo "oneMKL development files or oneAPI compilers are unavailable; skipping." >&2
         return 0
     fi
-    MKLROOT="$mklroot" PKG_CONFIG_PATH="$mklroot/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+    if [[ -z "$mklroot" ]]; then
+        mklroot="$(PKG_CONFIG_PATH="$pkg_config_path" pkg-config --variable=prefix mkl-sdl)"
+    fi
+    MKLROOT="$mklroot" PKG_CONFIG_PATH="$pkg_config_path" \
         configure_and_build mkl \
             -DGGML_BLAS=ON \
             -DGGML_BLAS_VENDOR=Intel10_64lp \

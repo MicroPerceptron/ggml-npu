@@ -304,7 +304,10 @@ mod tests {
         for fault in [
             RuntimeError::OutOfMemory,
             RuntimeError::DeviceLost,
-            RuntimeError::Os(5),
+            RuntimeError::External {
+                domain: super::super::IVPU_ERROR_DOMAIN,
+                code: 5,
+            },
         ] {
             transport.fault.set(Some(fault));
             assert_eq!(transport.open(0), Err(fault));

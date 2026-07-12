@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
-OV="${OPENVINO_DIR:-/opt/intel/openvino_2026.2.1}"
 
 cd "$ROOT"
 cargo test
@@ -22,7 +21,6 @@ if [[ -n "${MODEL:-}" ]]; then
     for _ in $(seq 1 "${MODEL_RUNS:-2}"); do
         RUN_NPU=1 \
         LLAMA_ROOT="$LLAMA_DIR" \
-        OPENVINO_DIR="$OV" \
         MODE=npu \
         NGL="${NGL:-0}" \
         NPU_ONLY="${NPU_ONLY:-0}" \

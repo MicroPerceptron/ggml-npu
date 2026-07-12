@@ -8,8 +8,15 @@ pub struct DispatchMetrics {
     pub submit_ns: u64,
     pub wait_ns: u64,
     pub copy_out_ns: u64,
-    pub owned_bindings: u64,
-    pub bounced_bindings: u64,
+    /// Device-native allocation bound without a payload copy.
+    pub direct_bindings: u64,
+    /// Shared allocation already understood by both backends.
+    pub shared_bindings: u64,
+    /// Foreign allocation imported into the consuming backend without a payload copy.
+    pub imported_bindings: u64,
+    /// Per-dispatch payload-copy occurrences. This is never counted as interop success.
+    pub staged_occurrences: u64,
+    pub staged_bytes: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
 }
@@ -28,18 +35,16 @@ pub enum MetricEvent {
         domain: &'static str,
         bytes: u64,
     },
+    StagingAllocation {
+        /// Process-local allocation identity used to avoid conflating occurrences with objects.
+        allocation: u64,
+        bytes: u64,
+    },
     MemoryState {
         resident_bytes: u64,
         resident_high_water: u64,
         accounted_high_water: u64,
         resident_limit: u64,
-    },
-    DirectMemoryBreakdown {
-        executable_bytes: u64,
-        binding_bytes: u64,
-        hpi_bytes: u64,
-        command_bytes: u64,
-        preemption_bytes: u64,
     },
     CacheEviction {
         cache: &'static str,

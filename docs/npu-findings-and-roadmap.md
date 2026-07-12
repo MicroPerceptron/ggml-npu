@@ -196,7 +196,8 @@ belongs on the GPU. (Side effect: the ~1 GB‑Constant compile feasibility is st
   (ABI‑compatible).
 - **Env for an NPU+Vulkan run:**
   `GGML_BACKEND_PATH=<npu.so>` · `GGML_NPU_OVC=<shim.so>` · `GGML_NPU_PROFILE=1` ·
-  `LD_LIBRARY_PATH=build-dl/bin:Scratch:/opt/intel/openvino_2026.2.1/runtime/lib/intel64:/usr/lib64`.
+  optionally `OPENVINO_RUNTIME_LIB_DIR=<runtime-library-directory>` when OpenVINO is not on the
+  system loader path.
 - **Placement knobs:** `-ngl N` (layers on GPU; head offloads to GPU only when ngl > n_layer).
   `-ngl 99` = all‑GPU; `-ngl 31` = spill last 2 layers + MTP (+ head on CPU).
 - **Safety:** run NPU benches behind a background MemAvailable kill‑guard (kill the bench at

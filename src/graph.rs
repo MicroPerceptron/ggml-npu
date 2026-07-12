@@ -1,9 +1,10 @@
-//! Vendor-neutral graph IR captured from one ggml scheduler split.
+//! Graph semantics and the current ggml capture adapter.
 //!
 //! This is deliberately richer than the original pattern-specific `Subgraph`: values retain rank,
 //! strides, dtype and storage role; nodes retain all ggml operands and opaque op parameters; graph
-//! outputs and mutable state are explicit. Intel lowering may recognize profitable supernodes while
-//! other vendors can consume the same representation without inheriting OpenVINO semantics.
+//! outputs and mutable state are explicit. Capability and profitability decisions remain outside
+//! capture. The source-API decoding in this file is an adapter concern and is intentionally not
+//! treated as part of the portable graph wire contract.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -87,7 +88,7 @@ pub enum CostModel {
     Stateful,
 }
 
-/// How ggml should use a correct vendor lowering. This is descriptive capability metadata:
+/// How ggml should use a correct lowering. This is descriptive capability metadata:
 /// profitability remains exclusively in `policy.rs`/`offload_op`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementClass {
@@ -127,7 +128,7 @@ pub enum OpReject {
     InvalidArity,
 }
 
-/// One semantic contract used by scheduler probing, graph capture, vendor feasibility and tests.
+/// One semantic contract used by scheduler probing, graph capture, feasibility checks, and tests.
 pub trait OperationContract {
     unsafe fn decode_tensor(t: *const ggml_tensor) -> Result<OpSpec, OpReject>;
     fn decode_node(node: &Node) -> Result<OpSpec, OpReject>;
@@ -554,7 +555,7 @@ impl OperationContract for OpRegistry {
 }
 
 /// Capture a concrete scheduler split. Unsupported operations are still represented; capability
-/// decisions belong to the vendor lowerer rather than the capture layer.
+/// decisions belong to execution adapters rather than the capture layer.
 pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
     if cgraph.is_null() {
         return None;
@@ -582,7 +583,7 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
         }
         // Empty state-selection views carry no bytes and require no device work. ggml may attach
         // them to a non-empty scheduler split even when `supports_op` rejected the zero shape.
-        // Omitting them keeps the static NPU graph valid; any non-empty consumer would reintroduce
+        // Omitting them keeps a statically shaped target graph valid; any non-empty consumer would reintroduce
         // the tensor as an external input and fail capability validation conservatively.
         if (*t).ne.iter().any(|&dim| dim <= 0) {
             continue;

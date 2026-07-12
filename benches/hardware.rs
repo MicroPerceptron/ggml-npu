@@ -9,7 +9,6 @@ use criterion::{
     criterion_group, criterion_main, BenchmarkGroup, Criterion, SamplingMode, Throughput,
 };
 
-const ARTIFACT: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
 const ELEMENTS: usize = 32;
 const DIRECT: u32 = 0;
 const LEVEL_ZERO: u32 = 1;
@@ -210,7 +209,10 @@ fn timed_execute(fixture: &mut Fixture<'_>, readback: bool) -> Duration {
 fn hardware(criterion: &mut Criterion) {
     let start = resources();
     let api = Api::load();
-    let artifact = fs::read(ARTIFACT).expect("missing proven tiny artifact");
+    let artifact_path = env::var_os("GGML_NPU_TEST_ARTIFACT")
+        .map(PathBuf::from)
+        .expect("set GGML_NPU_TEST_ARTIFACT to the bounded Intel NPU test artifact");
+    let artifact = fs::read(&artifact_path).expect("missing proven tiny artifact");
     assert!(artifact.len() <= 1024 * 1024);
     let (input0, input1) = inputs();
     let oracle = expected(&input0, &input1);

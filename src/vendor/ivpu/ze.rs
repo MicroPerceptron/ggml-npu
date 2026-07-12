@@ -1,18 +1,18 @@
 //! Level Zero runtime integration for the Intel NPU.
 //!
-//! The loader (`libze_loader.so.1`) is `dlopen`'d at runtime and its functions resolved by
-//! `dlsym`, so the cdylib has no hard dependency on Level Zero — on a machine without it,
-//! [`probe`] simply returns empty. The loaded function table is a process-lifetime
-//! singleton published with a lock-free `AtomicPtr` (no global lock). `no_std`: `dlopen`,
-//! `dlsym`, and the ze functions all resolve from the host process.
+//! The selected host dynamic-loader service resolves the loader at runtime, so the cdylib has no
+//! hard dependency on Level Zero — on a machine without it, [`probe`] simply returns empty. The
+//! loaded function table is a process-lifetime singleton published with a lock-free `AtomicPtr`.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_void, CStr};
 use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
+
+use crate::host::{DynamicLibraryService, HostEnvironment, LibraryVisibility};
 
 /// bindgen'd Level Zero types + constants (functions are dlsym'd, not linked).
 #[allow(
@@ -26,12 +26,6 @@ pub(super) mod raw {
     include!(concat!(env!("OUT_DIR"), "/ze_bindings.rs"));
 }
 use raw::*;
-
-extern "C" {
-    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-}
-const RTLD_NOW: c_int = 2;
 
 type PfnInit = unsafe extern "C" fn(ze_init_flags_t) -> ze_result_t;
 type PfnDriverGet = unsafe extern "C" fn(*mut u32, *mut ze_driver_handle_t) -> ze_result_t;
@@ -80,6 +74,7 @@ type PfnMemFree = unsafe extern "C" fn(ze_context_handle_t, *mut c_void) -> ze_r
 
 /// Resolved Level Zero entry points. All fields are function pointers (`Send + Sync`).
 pub(super) struct ZeLib {
+    _library: crate::host::BuiltinLibrary,
     pub(super) init: PfnInit,
     pub(super) driver_get: PfnDriverGet,
     pub(super) device_get: PfnDeviceGet,
@@ -102,42 +97,41 @@ pub(super) struct ZeLib {
 static ZE_LIB: AtomicPtr<ZeLib> = AtomicPtr::new(ptr::null_mut());
 const FAILED: *mut ZeLib = 1usize as *mut ZeLib;
 
-/// Resolve one symbol and reinterpret it as a function-pointer type `T`. `transmute_copy`
-/// reads the (pointer-sized) address bits as `T`; POSIX guarantees dlsym results are
-/// castable to function pointers.
-unsafe fn sym<T>(h: *mut c_void, name: *const c_char) -> Option<T> {
-    let p = dlsym(h, name);
-    if p.is_null() {
-        return None;
-    }
+/// Resolve one symbol and reinterpret it as a function-pointer type `T`.
+unsafe fn sym<T>(library: &crate::host::BuiltinLibrary, name: &CStr) -> Option<T> {
+    let p = unsafe {
+        crate::host::builtin()
+            .libraries()
+            .symbol(library, name)
+            .ok()?
+    };
     Some(mem::transmute_copy::<*mut c_void, T>(&p))
 }
 
 unsafe fn load() -> Option<ZeLib> {
-    let mut h = dlopen(c"libze_loader.so.1".as_ptr(), RTLD_NOW);
-    if h.is_null() {
-        h = dlopen(c"libze_loader.so".as_ptr(), RTLD_NOW);
-    }
-    if h.is_null() {
-        return None;
-    }
+    let libraries = crate::host::builtin().libraries();
+    let library = libraries
+        .open(c"libze_loader.so.1", LibraryVisibility::Local)
+        .or_else(|_| libraries.open(c"libze_loader.so", LibraryVisibility::Local))
+        .ok()?;
     Some(ZeLib {
-        init: sym(h, c"zeInit".as_ptr())?,
-        driver_get: sym(h, c"zeDriverGet".as_ptr())?,
-        device_get: sym(h, c"zeDeviceGet".as_ptr())?,
-        device_get_properties: sym(h, c"zeDeviceGetProperties".as_ptr())?,
-        get_ext_fn_addr: sym(h, c"zeDriverGetExtensionFunctionAddress".as_ptr())?,
-        context_create: sym(h, c"zeContextCreate".as_ptr())?,
-        context_destroy: sym(h, c"zeContextDestroy".as_ptr())?,
-        cmd_queue_create: sym(h, c"zeCommandQueueCreate".as_ptr())?,
-        cmd_queue_exec: sym(h, c"zeCommandQueueExecuteCommandLists".as_ptr())?,
-        cmd_queue_sync: sym(h, c"zeCommandQueueSynchronize".as_ptr())?,
-        cmd_queue_destroy: sym(h, c"zeCommandQueueDestroy".as_ptr())?,
-        cmd_list_create: sym(h, c"zeCommandListCreate".as_ptr())?,
-        cmd_list_close: sym(h, c"zeCommandListClose".as_ptr())?,
-        cmd_list_destroy: sym(h, c"zeCommandListDestroy".as_ptr())?,
-        mem_alloc_host: sym(h, c"zeMemAllocHost".as_ptr())?,
-        mem_free: sym(h, c"zeMemFree".as_ptr())?,
+        init: sym(&library, c"zeInit")?,
+        driver_get: sym(&library, c"zeDriverGet")?,
+        device_get: sym(&library, c"zeDeviceGet")?,
+        device_get_properties: sym(&library, c"zeDeviceGetProperties")?,
+        get_ext_fn_addr: sym(&library, c"zeDriverGetExtensionFunctionAddress")?,
+        context_create: sym(&library, c"zeContextCreate")?,
+        context_destroy: sym(&library, c"zeContextDestroy")?,
+        cmd_queue_create: sym(&library, c"zeCommandQueueCreate")?,
+        cmd_queue_exec: sym(&library, c"zeCommandQueueExecuteCommandLists")?,
+        cmd_queue_sync: sym(&library, c"zeCommandQueueSynchronize")?,
+        cmd_queue_destroy: sym(&library, c"zeCommandQueueDestroy")?,
+        cmd_list_create: sym(&library, c"zeCommandListCreate")?,
+        cmd_list_close: sym(&library, c"zeCommandListClose")?,
+        cmd_list_destroy: sym(&library, c"zeCommandListDestroy")?,
+        mem_alloc_host: sym(&library, c"zeMemAllocHost")?,
+        mem_free: sym(&library, c"zeMemFree")?,
+        _library: library,
     })
 }
 

@@ -5,24 +5,20 @@
 //! without linking a logging framework into this `no_std` cdylib.
 
 use alloc::format;
-use core::ffi::{c_char, c_int};
 
 use crate::ffi::*;
-
-extern "C" {
-    fn getenv(name: *const c_char) -> *const c_char;
-    fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
-}
+use crate::host::{ConfigService, DiagnosticService, HostEnvironment};
 
 fn enabled() -> bool {
-    let p = unsafe { getenv(c"GGML_NPU_TRACE".as_ptr()) };
-    !p.is_null() && unsafe { *p != 0 }
+    crate::host::builtin()
+        .config()
+        .is_nonempty(c"GGML_NPU_TRACE")
 }
 
 fn emit(line: &str) {
-    unsafe {
-        let _ = write(2, line.as_ptr(), line.len());
-    }
+    crate::host::builtin()
+        .diagnostics()
+        .write_stderr(line.as_bytes());
 }
 
 /// Emit the shape/stride/storage summary of a scheduler split before recognition.

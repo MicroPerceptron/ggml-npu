@@ -6,7 +6,7 @@
 //! (Named `engine`, not `core`, to avoid shadowing the `core` crate.)
 
 use crate::ffi::*;
-use crate::graph_ir::{OpRegistry, OperationContract};
+use crate::graph::{OpRegistry, OperationContract};
 use crate::{ops, vendor};
 
 const MAX_GRAPH_PARTITION_NODES: usize = 8;
@@ -41,7 +41,7 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
     let Some(v) = vendor::present() else {
         return false;
     };
-    let graph = match crate::graph_ir::capture(cgraph) {
+    let graph = match crate::graph::capture(cgraph) {
         Some(graph) => {
             v.debug_note(&alloc::format!(
                 "[npu ir2] captured split: nodes={} inputs={} outputs={}\n",
@@ -53,7 +53,7 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
                 v.debug_note(&alloc::format!(
                     "[npu ir2] node {index}: ggml_op={} wire={:?} inputs={}\n",
                     node.op,
-                    crate::graph_ir::GraphIr::wire_op(node),
+                    crate::graph::GraphIr::wire_op(node),
                     node.inputs.len()
                 ));
             }

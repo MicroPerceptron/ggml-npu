@@ -13,41 +13,19 @@
 //! backend, but the counters are lock-free regardless). When disabled, the hot path pays only one
 //! relaxed atomic load per dispatch and takes no clock samples.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+use crate::host::{ClockService, ConfigService, DiagnosticService, HostEnvironment};
 use crate::metrics::{DispatchMetrics, MetricEvent, MetricsSink};
-
-extern "C" {
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    // glibc routes `atexit` through `__cxa_atexit`; the plain `atexit` symbol is not reliably
-    // resolvable from a dlopen'd .so, so register the exit dump the C++-runtime way. A null
-    // `dso_handle` schedules the callback at process exit.
-    fn __cxa_atexit(func: extern "C" fn(*mut c_void), arg: *mut c_void, dso: *mut c_void) -> i32;
-    fn getenv(name: *const c_char) -> *const c_char;
-}
-
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-const CLOCK_MONOTONIC: i32 = 1;
 
 /// Monotonic clock in nanoseconds (vDSO-fast). Only sampled when profiling is on.
 pub(super) fn now_ns() -> u64 {
-    let mut ts = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .wrapping_mul(1_000_000_000)
-        .wrapping_add(ts.tv_nsec as u64)
+    crate::host::builtin()
+        .clock()
+        .monotonic_now_ns()
+        .unwrap_or(0)
 }
 
 // 0 = untried, 1 = off, 2 = on. Resolved once from the environment on the first dispatch.
@@ -60,10 +38,9 @@ pub(super) fn debug_on() -> bool {
     if s != 0 {
         return s == 2;
     }
-    let on = unsafe {
-        let p = getenv(c"GGML_NPU_DEBUG".as_ptr());
-        !p.is_null() && *p != 0
-    };
+    let on = crate::host::builtin()
+        .config()
+        .is_nonempty(c"GGML_NPU_DEBUG");
     DEBUG.store(if on { 2 } else { 1 }, Ordering::Release);
     on
 }
@@ -71,7 +48,9 @@ pub(super) fn debug_on() -> bool {
 /// Write `s` to stderr when `GGML_NPU_DEBUG` is set (a `no_std` eprintln for failure diagnostics).
 pub(super) fn note(s: &str) {
     if debug_on() {
-        unsafe { write(2, s.as_ptr(), s.len()) };
+        crate::host::builtin()
+            .diagnostics()
+            .write_stderr(s.as_bytes());
     }
 }
 
@@ -81,8 +60,13 @@ static T_DEVICE: AtomicU64 = AtomicU64::new(0); // ns, submit + NPU compute + sy
 static T_SUBMIT: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_exec — async submit (host cost only)
 static T_SYNC: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_sync — wait for the NPU to drain
 static T_COPY_OUT: AtomicU64 = AtomicU64::new(0); // ns, host copy of foreign outputs out of bounces
-static N_ARGS_OWNED: AtomicU64 = AtomicU64::new(0); // bound directly (zero copy)
-static N_ARGS_BOUNCED: AtomicU64 = AtomicU64::new(0); // staged through a bounce buffer
+static N_DIRECT_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_SHARED_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_IMPORTED_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_STAGED_OCCURRENCES: AtomicU64 = AtomicU64::new(0);
+static N_STAGED_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+static STAGED_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
 static BYTES_IN: AtomicU64 = AtomicU64::new(0);
 static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -102,10 +86,9 @@ pub(super) fn enabled() -> bool {
     if s != 0 {
         return s == 2;
     }
-    let on = unsafe {
-        let p = getenv(c"GGML_NPU_PROFILE".as_ptr());
-        !p.is_null() && *p != 0
-    };
+    let on = crate::host::builtin()
+        .config()
+        .is_nonempty(c"GGML_NPU_PROFILE");
     let want = if on { 2 } else { 1 };
     // Only the thread that flips 0 -> want registers the exit dump (once).
     if ENABLED
@@ -113,7 +96,9 @@ pub(super) fn enabled() -> bool {
         .is_ok()
         && on
     {
-        unsafe { __cxa_atexit(dump_at_exit, ptr::null_mut(), ptr::null_mut()) };
+        crate::host::builtin()
+            .diagnostics()
+            .register_process_exit(dump_at_exit, ptr::null_mut());
     }
     on
 }
@@ -129,8 +114,11 @@ pub(super) fn record(
     tmid: u64,
     t2: u64,
     t3: u64,
-    owned: u64,
-    bounced: u64,
+    direct: u64,
+    shared: u64,
+    imported: u64,
+    staged_occurrences: u64,
+    staged_bytes: u64,
     bytes_in: u64,
     bytes_out: u64,
 ) {
@@ -139,8 +127,11 @@ pub(super) fn record(
         submit_ns: tmid.saturating_sub(t1),
         wait_ns: t2.saturating_sub(tmid),
         copy_out_ns: t3.saturating_sub(t2),
-        owned_bindings: owned,
-        bounced_bindings: bounced,
+        direct_bindings: direct,
+        shared_bindings: shared,
+        imported_bindings: imported,
+        staged_occurrences,
+        staged_bytes,
         bytes_in,
         bytes_out,
     }));
@@ -149,6 +140,22 @@ pub(super) fn record(
 pub(super) fn event(event: MetricEvent) {
     if enabled() {
         PROFILE_SINK.event(event);
+    }
+}
+
+pub(super) fn record_direct_memory_breakdown(
+    executable_bytes: u64,
+    binding_bytes: u64,
+    hpi_bytes: u64,
+    command_bytes: u64,
+    preemption_bytes: u64,
+) {
+    if enabled() {
+        EXECUTABLE_BYTES.store(executable_bytes, Ordering::Relaxed);
+        BINDING_BYTES.store(binding_bytes, Ordering::Relaxed);
+        HPI_BYTES.store(hpi_bytes, Ordering::Relaxed);
+        COMMAND_BYTES.store(command_bytes, Ordering::Relaxed);
+        PREEMPTION_BYTES.store(preemption_bytes, Ordering::Relaxed);
     }
 }
 
@@ -168,10 +175,17 @@ impl MetricsSink for ProfileSink {
                     Ordering::Relaxed,
                 );
                 T_COPY_OUT.fetch_add(metrics.copy_out_ns, Ordering::Relaxed);
-                N_ARGS_OWNED.fetch_add(metrics.owned_bindings, Ordering::Relaxed);
-                N_ARGS_BOUNCED.fetch_add(metrics.bounced_bindings, Ordering::Relaxed);
+                N_DIRECT_BINDINGS.fetch_add(metrics.direct_bindings, Ordering::Relaxed);
+                N_SHARED_BINDINGS.fetch_add(metrics.shared_bindings, Ordering::Relaxed);
+                N_IMPORTED_BINDINGS.fetch_add(metrics.imported_bindings, Ordering::Relaxed);
+                N_STAGED_OCCURRENCES.fetch_add(metrics.staged_occurrences, Ordering::Relaxed);
+                STAGED_BYTES.fetch_add(metrics.staged_bytes, Ordering::Relaxed);
                 BYTES_IN.fetch_add(metrics.bytes_in, Ordering::Relaxed);
                 BYTES_OUT.fetch_add(metrics.bytes_out, Ordering::Relaxed);
+            }
+            MetricEvent::StagingAllocation { bytes, .. } => {
+                N_STAGED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                STAGED_ALLOCATION_BYTES.fetch_add(bytes, Ordering::Relaxed);
             }
             MetricEvent::MemoryState {
                 resident_bytes,
@@ -186,19 +200,6 @@ impl MetricsSink for ProfileSink {
             }
             MetricEvent::CacheEviction { bytes, .. } => {
                 EVICTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-            }
-            MetricEvent::DirectMemoryBreakdown {
-                executable_bytes,
-                binding_bytes,
-                hpi_bytes,
-                command_bytes,
-                preemption_bytes,
-            } => {
-                EXECUTABLE_BYTES.store(executable_bytes, Ordering::Relaxed);
-                BINDING_BYTES.store(binding_bytes, Ordering::Relaxed);
-                HPI_BYTES.store(hpi_bytes, Ordering::Relaxed);
-                COMMAND_BYTES.store(command_bytes, Ordering::Relaxed);
-                PREEMPTION_BYTES.store(preemption_bytes, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -239,15 +240,18 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
     );
     let total = ti + td + to;
     let host = ti + to;
-    let (owned, bounced) = (
-        N_ARGS_OWNED.load(Ordering::Relaxed),
-        N_ARGS_BOUNCED.load(Ordering::Relaxed),
-    );
+    let direct = N_DIRECT_BINDINGS.load(Ordering::Relaxed);
+    let shared = N_SHARED_BINDINGS.load(Ordering::Relaxed);
+    let imported = N_IMPORTED_BINDINGS.load(Ordering::Relaxed);
+    let staged = N_STAGED_OCCURRENCES.load(Ordering::Relaxed);
+    let staged_allocations = N_STAGED_ALLOCATIONS.load(Ordering::Relaxed);
+    let staged_bytes = STAGED_BYTES.load(Ordering::Relaxed);
+    let staged_allocation_bytes = STAGED_ALLOCATION_BYTES.load(Ordering::Relaxed);
     let (bin, bout) = (
         BYTES_IN.load(Ordering::Relaxed),
         BYTES_OUT.load(Ordering::Relaxed),
     );
-    let args = owned + bounced;
+    let bindings = direct + shared + imported + staged;
 
     let s = alloc::format!(
         "\n[ggml-npu profile]  dispatches={n}   measured host+device wall={:.3} ms ({:.3} us/disp)\n\
@@ -257,7 +261,8 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
          \x20   \\- sync   (wait NPU)  : {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
          \x20 copy-out (bounce->host) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 ---- host copy total    : {:>9.3} ms  ({:.1}%)     device total: {:.3} ms ({:.1}%)\n\
-         \x20 args: {owned} owned (zero-copy) / {bounced} bounced  ({:.1}% zero-copy of {args})\n\
+         \x20 bindings: {direct} direct / {shared} shared / {imported} imported / {staged} staged occurrences ({:.1}% no-copy of {bindings})\n\
+         \x20 bounce allocations: {staged_allocations} unique, {:.2} MiB allocated; {:.2} MiB copied across occurrences\n\
          \x20 direct memory: resident {:.2} MiB, resident high {:.2} MiB, accounted high {:.2} MiB, limit {:.2} MiB, evicted {:.2} MiB\n\
          \x20 latest program: executable {:.2} MiB, bindings {:.2} MiB, HPI {:.2} MiB, command {:.2} MiB, preemption {:.2} MiB\n",
         ms(total),
@@ -283,7 +288,9 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         pct(host, total),
         ms(td),
         pct(td, total),
-        pct(owned, args.max(1)),
+        pct(direct + shared + imported, bindings.max(1)),
+        staged_allocation_bytes as f64 / 1.048576e6,
+        staged_bytes as f64 / 1.048576e6,
         RESIDENT_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
         RESIDENT_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
         ACCOUNTED_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
@@ -295,5 +302,7 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         COMMAND_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
         PREEMPTION_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
     );
-    unsafe { write(2, s.as_ptr(), s.len()) };
+    crate::host::builtin()
+        .diagnostics()
+        .write_stderr(s.as_bytes());
 }

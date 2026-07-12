@@ -3,21 +3,17 @@
 //! Pre-placed NPU tensors use the normal capability path. `offload_op` uses this cost floor before
 //! pulling work from CPU/GPU memory, avoiding per-op ping-pong for tiny latency-bound kernels.
 
-use core::ffi::{c_char, CStr};
+use core::ffi::CStr;
 
 use crate::ffi::*;
-use crate::graph_ir::{OpRegistry, OperationContract, PlacementClass};
-
-extern "C" {
-    fn getenv(name: *const c_char) -> *const c_char;
-}
+use crate::graph::{OpRegistry, OperationContract, PlacementClass};
+use crate::host::{ConfigService, HostEnvironment};
 
 fn env_u64(name: &'static CStr, default: u64) -> u64 {
-    let p = unsafe { getenv(name.as_ptr()) };
-    if p.is_null() {
+    let Some(value) = crate::host::builtin().config().value(name) else {
         return default;
-    }
-    let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
+    };
+    let bytes = value.to_bytes();
     let mut value = 0u64;
     if bytes.is_empty() {
         return default;
@@ -100,13 +96,18 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     let Ok(spec) = OpRegistry::decode_tensor(node) else {
         return false;
     };
-    if !getenv(c"GGML_NPU_LFM_SHORTCONV".as_ptr()).is_null()
+    if crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_LFM_SHORTCONV")
         && (spec.placement != PlacementClass::Stateful || x.op == GGML_OP_SSM_CONV)
         && is_shortconv_candidate(node)
     {
         return true;
     }
-    if !getenv(c"GGML_NPU_FORCE_GRAPH".as_ptr()).is_null() {
+    if crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_FORCE_GRAPH")
+    {
         // Anchors may start a split. Cheap glue/layout may only extend a split downstream from an
         // anchor; this prevents embedding gathers or isolated unary nodes from becoming NPU
         // dispatches merely because force mode was requested.

@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use crate::ffi::ggml_tensor;
-use crate::graph_ir::{GraphIr, OpSpec};
+use crate::graph::{GraphIr, OpSpec};
 use crate::ops::subgraph::Subgraph;
 use crate::ops::{Op, Operand};
 
@@ -89,7 +89,7 @@ pub trait Vendor: Sync {
     /// buffer type then reports OOM rather than hand out unbindable memory).
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void;
     /// Free memory returned by [`alloc_host`](Vendor::alloc_host).
-    unsafe fn free_host(&self, ptr: *mut c_void);
+    unsafe fn free_host(&self, ptr: *mut c_void, size: usize);
 }
 
 static IVPU: ivpu::IvpuVendor = ivpu::IvpuVendor;

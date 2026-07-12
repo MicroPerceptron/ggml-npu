@@ -3,14 +3,11 @@
 //! panicking paths (no unwrap/index) since a panic aborts the host (see crate docs).
 
 use alloc::boxed::Box;
-use core::ffi::{c_char, CStr};
+use core::ffi::c_char;
 use core::ptr;
 
 use crate::ffi::*;
-
-extern "C" {
-    fn getenv(name: *const c_char) -> *const c_char;
-}
+use crate::host::{ConfigService, HostEnvironment};
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -78,12 +75,14 @@ unsafe extern "C" fn dev_get_memory(_dev: ggml_backend_dev_t, free: *mut usize, 
 }
 
 fn memory_limit() -> usize {
-    let p = unsafe { getenv(c"GGML_NPU_MEMORY_LIMIT".as_ptr()) };
-    if p.is_null() {
+    let Some(env_value) = crate::host::builtin()
+        .config()
+        .value(c"GGML_NPU_MEMORY_LIMIT")
+    else {
         return 0;
-    }
+    };
     let mut value = 0usize;
-    for &b in unsafe { CStr::from_ptr(p) }.to_bytes() {
+    for &b in env_value.to_bytes() {
         if !b.is_ascii_digit() {
             return 0;
         }
@@ -99,15 +98,17 @@ fn memory_limit() -> usize {
 }
 
 fn async_enabled() -> bool {
-    !unsafe { getenv(c"GGML_NPU_ASYNC".as_ptr()) }.is_null()
+    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
 }
 
 fn device_type() -> ggml_backend_dev_type {
-    let p = unsafe { getenv(c"GGML_NPU_DEVICE_CLASS".as_ptr()) };
-    if p.is_null() {
+    let Some(value) = crate::host::builtin()
+        .config()
+        .value(c"GGML_NPU_DEVICE_CLASS")
+    else {
         return GGML_BACKEND_DEVICE_TYPE_NPU;
-    }
-    match unsafe { CStr::from_ptr(p) }.to_bytes() {
+    };
+    match value.to_bytes() {
         b"accel" => GGML_BACKEND_DEVICE_TYPE_ACCEL,
         b"gpu" => GGML_BACKEND_DEVICE_TYPE_GPU,
         b"igpu" => GGML_BACKEND_DEVICE_TYPE_IGPU,

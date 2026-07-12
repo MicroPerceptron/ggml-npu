@@ -5,8 +5,8 @@
 use alloc::vec::Vec;
 use core::ptr;
 
+use crate::host::MemoryMapping;
 use crate::identity::{SemanticDigest, SemanticHasher};
-use crate::os::MemoryMapping;
 use crate::runtime::RuntimeError;
 
 use super::elf::ParsedIntelElf;
@@ -15,6 +15,7 @@ use super::hpi::{HpiRequirements, HOST_PARSED_INFERENCE_ALIGNMENT, HOST_PARSED_I
 use super::link::{
     visit_binding_requirements, BindingRequirement, DeviceMemoryClass, PlacedSection,
 };
+use super::linux::LinuxIvpuSharedAllocation;
 use super::load::{stage_program, LoadError, StagedProgram};
 use super::transport::{acquire_device_writes, release_host_writes};
 use super::uapi::{
@@ -23,7 +24,7 @@ use super::uapi::{
 use super::validate::{
     validate_command_image, validate_device, CommandImage, MemoryRange, ValidationError,
 };
-use super::{BufferObject, DeviceParameters, IvpuDevice};
+use super::{BufferBacking, BufferObject, DeviceParameters, IvpuDevice};
 
 const VPU_SHT_PERF_METRICS: u32 = 0x8aaa_aaae;
 const PERFORMANCE_METRICS_BYTES: usize = 320;
@@ -56,11 +57,20 @@ pub enum PrepareError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingBacking {
+    /// Host-owned transferable allocation imported into the IVPU context.
+    ImportedShared,
+    /// Correct fallback allocated by IVPU. It remains exportable when PRIME export is available.
+    IvpuGem,
+}
+
 pub struct BindingBuffer<'device> {
     pub section: usize,
     pub class: DeviceMemoryClass,
     pub logical_bytes: u64,
     pub bo: BufferObject<'device>,
+    pub backing: BindingBacking,
 }
 
 pub struct PreparedInference<'device> {
@@ -149,6 +159,25 @@ impl PreparedInference<'_> {
             .filter(|binding| binding.class == DeviceMemoryClass::Output)
             .nth(output_index)
             .and_then(|binding| usize::try_from(binding.logical_bytes).ok())
+    }
+
+    pub(super) fn output_shared_allocation(
+        &self,
+        output_index: usize,
+    ) -> Result<(LinuxIvpuSharedAllocation, usize, BindingBacking), PrepareError> {
+        let binding = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+            .nth(output_index)
+            .ok_or(PrepareError::BindingMismatch)?;
+        let bytes =
+            usize::try_from(binding.logical_bytes).map_err(|_| PrepareError::InvalidMetadata)?;
+        binding
+            .bo
+            .export_shared()
+            .map(|allocation| (allocation, bytes, binding.backing))
+            .map_err(PrepareError::Runtime)
     }
 
     pub fn zero_outputs(&self) -> Result<(), PrepareError> {
@@ -318,12 +347,21 @@ fn create_bindings<'device>(
         } else {
             None
         };
-        let bo = device
-            .create_bo(
-                requirement.allocation_bytes.max(1),
-                DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM,
-            )
-            .map_err(PrepareError::Runtime)?;
+        let requested_bytes = requirement.allocation_bytes.max(1);
+        let (bo, backing) = match LinuxIvpuSharedAllocation::allocate(
+            requested_bytes,
+            requirement.alignment.min(rustix::param::page_size() as u64),
+        )
+        .and_then(|allocation| device.import_shared(allocation))
+        {
+            Ok(bo) => (bo, BindingBacking::ImportedShared),
+            Err(_) => (
+                device
+                    .create_bo(requested_bytes, DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
+                    .map_err(PrepareError::Runtime)?,
+                BindingBacking::IvpuGem,
+            ),
+        };
         let info = bo.info().map_err(PrepareError::Runtime)?;
         if info.vpu_address % requirement.alignment != 0 {
             return Err(PrepareError::InvalidMetadata);
@@ -342,6 +380,7 @@ fn create_bindings<'device>(
             class: requirement.class,
             logical_bytes: requirement.bytes,
             bo,
+            backing,
         });
     }
     Ok((buffers, placements, total))
@@ -550,8 +589,15 @@ pub fn prepare_inference<'device>(
     }
     for binding in &bindings {
         let info = binding.bo.info().map_err(PrepareError::Runtime)?;
-        if info.flags & (DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
-            != DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM
+        let expected_backing = match binding.backing {
+            BindingBacking::ImportedShared => binding.bo.backing() == BufferBacking::ImportedShared,
+            BindingBacking::IvpuGem => {
+                binding.bo.backing() == BufferBacking::IvpuGem
+                    && info.flags & (DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
+                        == DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM
+            }
+        };
+        if !expected_backing
             || info.flags & super::uapi::DRM_IVPU_BO_READ_ONLY != 0
             || info.vpu_address != binding.bo.vpu_address()
             || info.bytes < binding.logical_bytes
@@ -586,9 +632,6 @@ pub fn prepare_inference<'device>(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "bench-hardware")]
-    use std::io::Read;
-
     #[cfg(feature = "bench-hardware")]
     use super::super::elf::parse_intel_elf;
     #[cfg(feature = "bench-hardware")]
@@ -625,16 +668,7 @@ mod tests {
     #[cfg(feature = "bench-hardware")]
     #[ignore = "full dry-run preparation only; allocates bounded BOs but never submits"]
     fn prepare_tiny_artifact_with_accounted_preemption() {
-        const PATH: &str = "/home/cassmantle/.cache/ggml-npu/ir2-8c91da4914adc7d5-n1.blob";
-        let length = usize::try_from(std::fs::metadata(PATH).unwrap().len()).unwrap();
-        assert!(length <= 1024 * 1024);
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).unwrap();
-        bytes.resize(length, 0);
-        std::fs::File::open(PATH)
-            .unwrap()
-            .read_exact(&mut bytes)
-            .unwrap();
+        let bytes = super::super::load_test_artifact(1024 * 1024);
         let elf = parse_intel_elf(&bytes).unwrap();
         let device = IvpuDevice::open_first().unwrap();
         let parameters = device.parameters().unwrap();
@@ -654,8 +688,9 @@ mod tests {
         )
         .unwrap();
         std::println!(
-            "device={} artifact={PATH} preempt_buffer_bytes={} user_bo_bytes={} accounted_bytes={}",
+            "device={} artifact={} preempt_buffer_bytes={} user_bo_bytes={} accounted_bytes={}",
             device.device_path().to_string_lossy(),
+            super::super::test_artifact_location().to_string_lossy(),
             parameters.preempt_buffer_bytes,
             prepared.total_user_bo_bytes,
             prepared.total_accounted_bytes,

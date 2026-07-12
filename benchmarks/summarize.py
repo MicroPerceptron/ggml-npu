@@ -10,11 +10,43 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 PROFILE_DISPATCHES = re.compile(r"\[ggml-npu profile\]\s+dispatches=(\d+)")
 DIRECT_RESIDENT = re.compile(r"direct memory: resident\s+([0-9]+(?:\.[0-9]+)?)\s+MiB")
 RATE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(?:±\s*([0-9]+(?:\.[0-9]+)?))?")
 WORKLOAD = re.compile(r"^(pp|tg)(\d+)$")
+ABSOLUTE_FILE_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/)(?:[^/\\\s]+[/\\])+[^/\\\s]+")
+
+
+def portable_run_path(run: Path) -> str:
+    """Use a repository-relative path, or only the run name for external inputs."""
+    try:
+        return run.resolve().relative_to(REPOSITORY_ROOT).as_posix()
+    except ValueError:
+        return run.name
+
+
+def portable_filename(value: object) -> str | None:
+    """Discard host-specific parent directories while preserving the artifact name."""
+    if value is None:
+        return None
+    text = str(value).replace("\\", "/").rstrip("/")
+    return text.rsplit("/", 1)[-1] or None
+
+
+def portable_diagnostic(value: str | None, private_paths: tuple[object, ...] = ()) -> str | None:
+    """Remove absolute input locations from a diagnostic retained in a summary."""
+    if value is None:
+        return None
+    text = value
+    for path in private_paths:
+        if path:
+            text = text.replace(str(path), portable_filename(path) or "<path>")
+    return ABSOLUTE_FILE_PATH.sub(
+        lambda match: portable_filename(match.group(0)) or "<path>",
+        text,
+    )
 
 
 def read_environment(path: Path) -> dict[str, str]:
@@ -242,7 +274,14 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
         status = "failed"
     else:
         status = "incomplete"
-    failure = None if status == "success" else parse_failure(stderr, process_text, guard)
+    failure = (
+        None
+        if status == "success"
+        else portable_diagnostic(
+            parse_failure(stderr, process_text, guard),
+            (env.get("model"), run, run.resolve()),
+        )
+    )
 
     mode = env.get("mode", "")
     execution = execution_path(mode, env, stderr)
@@ -311,7 +350,7 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
         normalized.append(
             {
                 "schema_version": SCHEMA_VERSION,
-                "artifact_dir": str(run.resolve()),
+                "artifact_dir": portable_run_path(run),
                 "run": run.name,
                 "timestamp_utc": env.get("timestamp_utc") or row.get("test_time"),
                 "status": status,
@@ -320,7 +359,7 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
                 "mode": mode,
                 "execution": execution,
                 "model": {
-                    "file": row.get("model_filename", env.get("model")) or None,
+                    "file": portable_filename(row.get("model_filename", env.get("model"))),
                     "type": row.get("model_type") or None,
                     "size_bytes": int(row["model_size"]) if row.get("model_size") is not None else None,
                     "parameters": int(row["model_n_params"]) if row.get("model_n_params") is not None else None,

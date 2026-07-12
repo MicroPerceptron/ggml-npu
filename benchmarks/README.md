@@ -28,9 +28,18 @@ RUN_NPU=1 MODEL=/path/LFM2.5-8B-A1B-Q4_K_M.gguf MODE=npu FLASH_ATTENTION=on \
 `build_cpu_baselines.sh` creates isolated `llama.cpp/build-cpu-{native,openblas,flexiblas,mkl}`
 trees and builds only `llama-bench`. A missing development dependency is reported and skipped; the
 script never installs packages. OpenBLAS requires `openblas.pc` or `openblas64.pc`, FlexiBLAS
-requires `flexiblas_api.pc`, and oneMKL uses the existing oneAPI compilers plus `mkl-sdl.pc`.
+requires `flexiblas_api.pc`, and oneMKL discovers `icx`/`icpx` from `PATH` plus `mkl-sdl.pc`.
+`ONEAPI_ROOT`, `MKLROOT`, `MKL_CC`, `MKL_CXX`, and `PKG_CONFIG_PATH` remain explicit overrides.
 `run_lfm_baseline.sh` clears inherited `GGML_BACKEND_PATH` and every `GGML_NPU_*` control used by
 this backend before CPU/BLAS runs, so those baselines cannot silently load or schedule the NPU.
+`MODEL`, `LLAMA_ROOT`, `LLAMA_BENCH`, `RESULTS_ROOT`, and `BENCHMARK_OUTPUT_DIR` can relocate all
+external inputs and generated results. Stored metadata and summaries retain artifact basenames and
+repository-relative run identifiers, not developer-machine paths.
+
+Build the OpenVINO compiler shim with `shim/build.sh`. CMake discovers the OpenVINO package from
+standard locations or `CMAKE_PREFIX_PATH`; `OPENVINO_DIR` may point to an installation root or the
+directory containing `OpenVINOConfig.cmake`. For a prebuilt shim whose dependencies are outside the
+system loader path, set `OPENVINO_RUNTIME_LIB_DIR`.
 
 Use the Vulkan run for all-GPU attention, the default NPU run for NPU constant-weight/QKV
 projections plus GPU attention, and `ATTENTION_PLACEMENT=full` for the experimental runtime

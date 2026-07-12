@@ -39,6 +39,7 @@ use super::profile;
 use super::ze;
 use super::ze::raw::*;
 use super::NpuHostAlloc;
+use crate::host::{ConfigService, HostEnvironment};
 use crate::ops::Operand;
 
 /// One graph argument: its index in the blob and element count (FP32 device I/O).
@@ -107,12 +108,8 @@ struct BindingKey {
 static LISTS: Cache<BindingKey, Option<&'static NodeList>> = Cache::new(2048);
 static PENDING: AtomicBool = AtomicBool::new(false);
 
-extern "C" {
-    fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
-}
-
 pub(super) fn async_enabled() -> bool {
-    !unsafe { getenv(c"GGML_NPU_ASYNC".as_ptr()) }.is_null()
+    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
 }
 
 pub(super) fn synchronize() -> bool {
@@ -311,6 +308,10 @@ unsafe fn bind_arg(
             ));
             return None;
         }
+        profile::event(crate::metrics::MetricEvent::StagingAllocation {
+            allocation: buf.as_ptr() as u64,
+            bytes: bytes as u64,
+        });
         Some(Bind {
             bounce: Some(buf),
             elems: min(op.elems, arg.elems),
@@ -498,7 +499,20 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
                 .filter(|b| b.bounce.is_none())
                 .count() as u64;
             let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
-            profile::record(t0, t1, tmid, t2, t3, owned, bounced, bytes_in, bytes_out);
+            profile::record(
+                t0,
+                t1,
+                tmid,
+                t2,
+                t3,
+                owned,
+                0,
+                0,
+                bounced,
+                bytes_in.saturating_add(bytes_out),
+                bytes_in,
+                bytes_out,
+            );
         }
     }
     true

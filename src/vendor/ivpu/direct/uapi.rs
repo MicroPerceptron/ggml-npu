@@ -8,31 +8,17 @@
 
 use core::mem::{align_of, size_of};
 
-const IOC_NRBITS: u32 = 8;
-const IOC_TYPEBITS: u32 = 8;
-const IOC_SIZEBITS: u32 = 14;
-const IOC_NRSHIFT: u32 = 0;
-const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
-const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
-const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
-const IOC_WRITE: u32 = 1;
-const IOC_READ: u32 = 2;
+use crate::host::linux::ioctl::{encode, IOC_READ, IOC_WRITE};
+
 const DRM_IOCTL_BASE: u32 = b'd' as u32;
 const DRM_COMMAND_BASE: u32 = 0x40;
 
-const fn ioc(direction: u32, ioctl_type: u32, number: u32, bytes: usize) -> u32 {
-    (direction << IOC_DIRSHIFT)
-        | (ioctl_type << IOC_TYPESHIFT)
-        | (number << IOC_NRSHIFT)
-        | ((bytes as u32) << IOC_SIZESHIFT)
-}
-
 const fn drm_iowr(number: u32, bytes: usize) -> u32 {
-    ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_BASE, number, bytes)
+    encode(IOC_READ | IOC_WRITE, DRM_IOCTL_BASE, number, bytes)
 }
 
 const fn drm_iow(number: u32, bytes: usize) -> u32 {
-    ioc(IOC_WRITE, DRM_IOCTL_BASE, number, bytes)
+    encode(IOC_WRITE, DRM_IOCTL_BASE, number, bytes)
 }
 
 #[repr(C)]
@@ -60,13 +46,6 @@ pub struct DrmIvpuBoInfo {
     pub vpu_addr: u64,
     pub mmap_offset: u64,
     pub size: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DrmGemClose {
-    pub handle: u32,
-    pub pad: u32,
 }
 
 #[repr(C)]
@@ -158,16 +137,12 @@ pub const DRM_IOCTL_IVPU_CMDQ_DESTROY: u32 =
     drm_iow(DRM_COMMAND_BASE + 0x0c, size_of::<DrmIvpuCmdqDestroy>());
 pub const DRM_IOCTL_IVPU_CMDQ_SUBMIT: u32 =
     drm_iow(DRM_COMMAND_BASE + 0x0d, size_of::<DrmIvpuCmdqSubmit>());
-pub const DRM_IOCTL_GEM_CLOSE: u32 = drm_iow(0x09, size_of::<DrmGemClose>());
-
 const _: [(); 16] = [(); size_of::<DrmIvpuParam>()];
 const _: [(); 8] = [(); align_of::<DrmIvpuParam>()];
 const _: [(); 24] = [(); size_of::<DrmIvpuBoCreate>()];
 const _: [(); 8] = [(); align_of::<DrmIvpuBoCreate>()];
 const _: [(); 32] = [(); size_of::<DrmIvpuBoInfo>()];
 const _: [(); 8] = [(); align_of::<DrmIvpuBoInfo>()];
-const _: [(); 8] = [(); size_of::<DrmGemClose>()];
-const _: [(); 4] = [(); align_of::<DrmGemClose>()];
 const _: [(); 24] = [(); size_of::<DrmIvpuBoWait>()];
 const _: [(); 8] = [(); align_of::<DrmIvpuBoWait>()];
 const _: [(); 12] = [(); size_of::<DrmIvpuCmdqCreate>()];
@@ -190,7 +165,6 @@ mod tests {
         assert_eq!(DRM_IOCTL_IVPU_CMDQ_CREATE, 0xc00c_644b);
         assert_eq!(DRM_IOCTL_IVPU_CMDQ_DESTROY, 0x4004_644c);
         assert_eq!(DRM_IOCTL_IVPU_CMDQ_SUBMIT, 0x4020_644d);
-        assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x4008_6409);
     }
 
     #[test]
@@ -206,10 +180,6 @@ mod tests {
         assert_eq!(
             (size_of::<DrmIvpuBoInfo>(), align_of::<DrmIvpuBoInfo>()),
             (32, 8)
-        );
-        assert_eq!(
-            (size_of::<DrmGemClose>(), align_of::<DrmGemClose>()),
-            (8, 4)
         );
         assert_eq!(core::mem::offset_of!(DrmIvpuParam, value), 8);
         assert_eq!(core::mem::offset_of!(DrmIvpuBoCreate, handle), 12);

@@ -12,31 +12,24 @@
 //!   single matmul or the exact [`sg_semantic_key`] for a subgraph) — so a program compiles at
 //!   most once per process and steady-state decode is a pure graph-cache hit.
 //!
-//! `no_std`: the shim, `dlopen`, and `getenv` resolve from the host. A compile failure is cached
-//! (as `None`) and not retried.
+//! `no_std`: the selected host provider supplies configuration and dynamic loading. A compile
+//! failure is cached (as `None`) and not retried.
 
 use alloc::boxed::Box;
 use alloc::ffi::CString;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ffi::{c_char, c_int, c_void, CStr};
+use core::ffi::{c_char, c_int, c_void};
 use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::graph_ir::{Dim, GraphIr, TensorRole, OP_PARAM_BYTES};
+use crate::graph::{Dim, GraphIr, TensorRole, OP_PARAM_BYTES};
+use crate::host::{ConfigService, DynamicLibraryService, HostEnvironment, LibraryVisibility};
 use crate::identity::{SemanticDigest, SemanticHasher};
 use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
 use crate::ops::Operand;
-
-extern "C" {
-    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
-    fn dlerror() -> *const c_char;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn getenv(name: *const c_char) -> *const c_char;
-}
-const RTLD_NOW: c_int = 2;
 
 /// Persistent artifact namespace. Increment whenever compiler semantics or framing changes.
 const FORMAT_VERSION: u64 = 8;
@@ -206,6 +199,7 @@ struct IrNodeAbi {
 }
 
 struct Shim {
+    _library: crate::host::BuiltinLibrary,
     compile_const: CompileConst,
     compile_subgraph: Option<CompileSubgraph>,
     compile_graph: Option<CompileGraph>,
@@ -217,45 +211,52 @@ static SHIM: AtomicPtr<Shim> = AtomicPtr::new(ptr::null_mut());
 const SHIM_FAILED: *mut Shim = 1usize as *mut Shim;
 
 unsafe fn load_shim() -> Option<Shim> {
-    let env = getenv(c"GGML_NPU_OVC".as_ptr());
-    let h = if env.is_null() {
-        dlopen(c"libggml_npu_ovc.so".as_ptr(), RTLD_NOW)
-    } else {
-        dlopen(env, RTLD_NOW)
-    };
-    if h.is_null() {
-        let error = dlerror();
-        if !error.is_null() {
-            super::profile::note(&alloc::format!(
-                "[npu ir2] shim dlopen failed: {}\n",
-                CStr::from_ptr(error).to_string_lossy()
-            ));
+    let host = crate::host::builtin();
+    let path = host
+        .config()
+        .value(c"GGML_NPU_OVC")
+        .unwrap_or(c"libggml_npu_ovc.so");
+    let library = match host.libraries().open(path, LibraryVisibility::Local) {
+        Ok(library) => library,
+        Err(_) => {
+            if let Some(error) = host.libraries().last_error() {
+                super::profile::note(&alloc::format!(
+                    "[npu ir2] shim load failed: {}\n",
+                    error.to_string_lossy()
+                ));
+            }
+            return None;
         }
-        return None;
-    }
-    let compile_const = dlsym(h, c"ggml_npu_ov_compile_matmul_const".as_ptr());
-    let free = dlsym(h, c"ggml_npu_ov_free".as_ptr());
-    if compile_const.is_null() || free.is_null() {
-        return None;
-    }
-    // Optional: an older shim without subgraph support still serves the single-matmul path.
-    let sg = dlsym(h, c"ggml_npu_ov_compile_subgraph".as_ptr());
-    let compile_subgraph = if sg.is_null() {
-        None
-    } else {
-        Some(mem::transmute::<*mut c_void, CompileSubgraph>(sg))
     };
-    let ir = dlsym(h, c"ggml_npu_ov_compile_graph".as_ptr());
-    let compile_graph = if ir.is_null() {
-        None
-    } else {
-        Some(mem::transmute::<*mut c_void, CompileGraph>(ir))
+    let compile_const = unsafe {
+        host.libraries()
+            .symbol(&library, c"ggml_npu_ov_compile_matmul_const")
+            .ok()?
+    };
+    let free = unsafe {
+        host.libraries()
+            .symbol(&library, c"ggml_npu_ov_free")
+            .ok()?
+    };
+    // Optional: an older shim without subgraph support still serves the single-matmul path.
+    let compile_subgraph = unsafe {
+        host.libraries()
+            .symbol(&library, c"ggml_npu_ov_compile_subgraph")
+            .ok()
+            .map(|pointer| mem::transmute::<*mut c_void, CompileSubgraph>(pointer))
+    };
+    let compile_graph = unsafe {
+        host.libraries()
+            .symbol(&library, c"ggml_npu_ov_compile_graph")
+            .ok()
+            .map(|pointer| mem::transmute::<*mut c_void, CompileGraph>(pointer))
     };
     Some(Shim {
-        compile_const: mem::transmute::<*mut c_void, CompileConst>(compile_const),
+        _library: library,
+        compile_const: unsafe { mem::transmute::<*mut c_void, CompileConst>(compile_const) },
         compile_subgraph,
         compile_graph,
-        free: mem::transmute::<*mut c_void, FreeBlob>(free),
+        free: unsafe { mem::transmute::<*mut c_void, FreeBlob>(free) },
     })
 }
 
@@ -333,16 +334,14 @@ pub(super) fn compile_const_blob(weight: &Operand, m: i64, k: i64, n: i64) -> Op
 /// Optional weight-width override from `GGML_NPU_BITS` (`"4"`, `"8"`, or `"16"`); unset/other →
 /// auto per source type. Reads the first two bytes of the C string (enough to distinguish).
 fn forced_bits() -> Option<i32> {
-    let p = unsafe { getenv(c"GGML_NPU_BITS".as_ptr()) };
-    if p.is_null() {
-        return None;
-    }
-    let c0 = unsafe { *p };
-    let c1 = if c0 == 0 { 0 } else { unsafe { *p.add(1) } };
-    match (c0 as u8, c1 as u8) {
-        (b'4', _) => Some(4),
-        (b'8', _) => Some(8),
-        (b'1', b'6') => Some(16),
+    match crate::host::builtin()
+        .config()
+        .value(c"GGML_NPU_BITS")?
+        .to_bytes()
+    {
+        [b'4', ..] => Some(4),
+        [b'8', ..] => Some(8),
+        [b'1', b'6', ..] => Some(16),
         _ => None,
     }
 }
@@ -377,7 +376,7 @@ fn choose_bits(weight: &Operand, force: Option<i32>) -> i32 {
 
 /// Asymmetric (canonical, kept-compressed) unless `GGML_NPU_SYM` is set (a debug toggle).
 fn asymmetric() -> bool {
-    unsafe { getenv(c"GGML_NPU_SYM".as_ptr()).is_null() }
+    !crate::host::builtin().config().is_set(c"GGML_NPU_SYM")
 }
 
 fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
@@ -483,7 +482,7 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
             ));
             return false;
         }
-        let runtime_matmul = op == crate::graph_ir::WireOp::MatMul
+        let runtime_matmul = op == crate::graph::WireOp::MatMul
             && node
                 .inputs
                 .first()
@@ -497,32 +496,32 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
         }
         let supported = matches!(
             op,
-            crate::graph_ir::WireOp::MatMul
-                | crate::graph_ir::WireOp::Mul
-                | crate::graph_ir::WireOp::Add
-                | crate::graph_ir::WireOp::RmsNorm
-                | crate::graph_ir::WireOp::Silu
-                | crate::graph_ir::WireOp::Reshape
-                | crate::graph_ir::WireOp::View
-                | crate::graph_ir::WireOp::Cont
-                | crate::graph_ir::WireOp::Transpose
-                | crate::graph_ir::WireOp::Concat
-                | crate::graph_ir::WireOp::Copy
-                | crate::graph_ir::WireOp::SsmConv
-                | crate::graph_ir::WireOp::Rope
-                | crate::graph_ir::WireOp::GetRows
-                | crate::graph_ir::WireOp::SetRows
-                | crate::graph_ir::WireOp::Scale
-                | crate::graph_ir::WireOp::Div
-                | crate::graph_ir::WireOp::Clamp
-                | crate::graph_ir::WireOp::Argsort
-                | crate::graph_ir::WireOp::MatMulId
-                | crate::graph_ir::WireOp::Sigmoid
-                | crate::graph_ir::WireOp::SumRows
-                | crate::graph_ir::WireOp::SoftMax
-                | crate::graph_ir::WireOp::FlashAttention
-                | crate::graph_ir::WireOp::Permute
-                | crate::graph_ir::WireOp::Swiglu
+            crate::graph::WireOp::MatMul
+                | crate::graph::WireOp::Mul
+                | crate::graph::WireOp::Add
+                | crate::graph::WireOp::RmsNorm
+                | crate::graph::WireOp::Silu
+                | crate::graph::WireOp::Reshape
+                | crate::graph::WireOp::View
+                | crate::graph::WireOp::Cont
+                | crate::graph::WireOp::Transpose
+                | crate::graph::WireOp::Concat
+                | crate::graph::WireOp::Copy
+                | crate::graph::WireOp::SsmConv
+                | crate::graph::WireOp::Rope
+                | crate::graph::WireOp::GetRows
+                | crate::graph::WireOp::SetRows
+                | crate::graph::WireOp::Scale
+                | crate::graph::WireOp::Div
+                | crate::graph::WireOp::Clamp
+                | crate::graph::WireOp::Argsort
+                | crate::graph::WireOp::MatMulId
+                | crate::graph::WireOp::Sigmoid
+                | crate::graph::WireOp::SumRows
+                | crate::graph::WireOp::SoftMax
+                | crate::graph::WireOp::FlashAttention
+                | crate::graph::WireOp::Permute
+                | crate::graph::WireOp::Swiglu
         );
         if !supported || node.inputs.len() > IR_MAX_INPUTS {
             super::profile::note(&alloc::format!(
@@ -537,22 +536,22 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
 
 pub(super) unsafe fn graph_node_feasible(
     node: *const crate::ffi::ggml_tensor,
-    spec: &crate::graph_ir::OpSpec,
+    spec: &crate::graph::OpSpec,
 ) -> bool {
     let op = Some(spec.wire);
     let moe_only = matches!(
         op,
         Some(
-            crate::graph_ir::WireOp::MatMulId
-                | crate::graph_ir::WireOp::Argsort
-                | crate::graph_ir::WireOp::Sigmoid
-                | crate::graph_ir::WireOp::SumRows
+            crate::graph::WireOp::MatMulId
+                | crate::graph::WireOp::Argsort
+                | crate::graph::WireOp::Sigmoid
+                | crate::graph::WireOp::SumRows
         )
     );
     let attention_only = matches!(
         op,
-        Some(crate::graph_ir::WireOp::SoftMax | crate::graph_ir::WireOp::Permute)
-    ) || (op == Some(crate::graph_ir::WireOp::MatMul)
+        Some(crate::graph::WireOp::SoftMax | crate::graph::WireOp::Permute)
+    ) || (op == Some(crate::graph::WireOp::MatMul)
         && !node.is_null()
         && !(*node).src[0].is_null()
         && (*(*node).src[0]).op != crate::ffi::GGML_OP_NONE);
@@ -563,12 +562,14 @@ pub(super) unsafe fn graph_node_feasible(
 }
 
 fn moe_enabled() -> bool {
-    !unsafe { getenv(c"GGML_NPU_MOE".as_ptr()) }.is_null()
+    crate::host::builtin().config().is_set(c"GGML_NPU_MOE")
 }
 
 fn attention_full() -> bool {
-    let p = unsafe { getenv(c"GGML_NPU_ATTENTION".as_ptr()) };
-    !p.is_null() && unsafe { CStr::from_ptr(p) }.to_bytes() == b"full"
+    crate::host::builtin()
+        .config()
+        .value(c"GGML_NPU_ATTENTION")
+        .is_some_and(|value| value.to_bytes() == b"full")
 }
 
 pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {

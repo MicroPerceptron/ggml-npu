@@ -24,7 +24,8 @@ class SummaryTests(unittest.TestCase):
                 Path(directory),
                 "direct",
                 "mode=npu\nprompt_tokens=512\ngenerated_tokens=0\nrepetitions=3\n"
-                "threads=8\nnpu_only=0\nnpu_moe=0\ncompiler_shim_sha256=abc\n",
+                f"threads=8\nnpu_only=0\nnpu_moe=0\nmodel={Path(directory) / 'models' / 'fixture.gguf'}\n"
+                "compiler_shim_sha256=abc\n",
             )
             row = {
                 "model_type": "fixture",
@@ -58,6 +59,10 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(record["metrics"]["peak_rss_bytes"], 1024 * 1024)
             self.assertFalse(record["metrics"]["energy_available"])
             self.assertIsNone(record["metrics"]["energy_joules"])
+            self.assertEqual(record["artifact_dir"], "direct")
+            self.assertEqual(record["model"]["file"], "fixture.gguf")
+            self.assertNotIn(directory, json.dumps(record))
+            self.assertNotIn(directory, summarize.human_summary([record]))
 
     def test_reports_timeout_failure_without_fabricating_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -72,13 +77,15 @@ class SummaryTests(unittest.TestCase):
                 '{"wall_seconds":300.0,"max_rss_kib":10,"exit_status":124}\n'
             )
             (run / "stderr.txt").write_text(
-                "[npu direct] output 0 storage mismatch: required=2 available=1\n"
+                f"[npu direct] output 0 storage mismatch in {Path(directory) / 'cache' / 'artifact.blob'}: "
+                "required=2 available=1\n"
                 "llama_bench: error: failed to run prompt warmup\n"
             )
 
             record = summarize.normalize_run(run)[0]
             self.assertEqual(record["status"], "timeout")
             self.assertIn("storage mismatch", record["failure_reason"])
+            self.assertNotIn(directory, record["failure_reason"])
             self.assertIsNone(record["metrics"]["throughput_tps"])
 
     def test_zero_direct_profile_does_not_prove_direct_submission(self) -> None:
