@@ -27,6 +27,13 @@ Criterion output is generated under `target/criterion/`, already excluded by `/t
 
 ## End-to-end model benchmarks: llama-bench
 
+Full LFM pp512 (and similarly long multi-sample locked) runs are expensive. Do **not** run them by
+default. Prefer tests → Criterion microbenches → short attribution/profile → optional `r=1` smoke,
+and reserve full locked pp512 (`r≥3`, flock, full feature matrix) for explicit requests, acceptance
+criteria that require it, or changes expected to move end-to-end tok/s after cheaper gates pass.
+Never stack concurrent full benches; keep the OpenVINO shim / `compile_graph_v3` current before NPU
+full benches. Policy details: `.cursor/rules/benchmark-invocation.mdc`.
+
 `benchmarks/run_lfm_baseline.sh` runs llama-bench in a fresh process and captures:
 
 - native llama-bench JSONL statistics;
