@@ -1,0 +1,27 @@
+wire_op,compile_claimed,gate,proof,notes
+MatMul,yes,hermetic,"contract:OpRegistry;test:graph::semantic_key_tracks_structure_shape_and_constant_identity",dense constant-weight and runtime matmul anchor
+Mul,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout",FFN glue claim path
+Add,yes,hermetic,"contract:OpRegistry;test:graph::partition_policy_fuses_connected_graphs_larger_than_eight_nodes",residual / elementwise glue
+RmsNorm,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout",FFN / attention norm glue
+Silu,yes,hermetic,"contract:OpRegistry;test:policy::fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout",FFN activation glue
+Reshape,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
+View,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
+Cont,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
+Transpose,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",layout metadata
+Concat,yes,hermetic,"contract:OpRegistry",fusible layout / packing
+Copy,yes,hermetic,"contract:OpRegistry",fusible copy glue
+SsmConv,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",ShortConv numerical check (#9)
+Rope,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",attention RoPE numerical (#10)
+SoftMax,yes,opt_in_hw,"contract:OpRegistry;issue:#10",attention softmax; full attention env
+GetRows,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",gather / MoE bank indexing
+Argsort,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE routing; GGML_NPU_MOE=1
+MatMulId,yes,opt_in_hw,"contract:OpRegistry;test:graph::partition_policy_limits_only_routed_expert_banks;issue:#11",routed experts
+Div,yes,hermetic,"contract:OpRegistry",elementwise
+Scale,yes,hermetic,"contract:OpRegistry",elementwise
+Clamp,yes,hermetic,"contract:OpRegistry",elementwise
+Permute,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes",attention layout metadata
+FlashAttention,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",GQA FlashAttention numerical (#10)
+Swiglu,yes,hermetic,"contract:OpRegistry",GLU / SwiGLU dense block
+Sigmoid,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE gating; GGML_NPU_MOE=1
+SumRows,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE reduction; GGML_NPU_MOE=1
+SetRows,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",mutable state write (#9)

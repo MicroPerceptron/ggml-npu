@@ -45,6 +45,76 @@ pub enum WireOp {
     SetRows = 26,
 }
 
+impl WireOp {
+    /// Every wire opcode the backend can name. Coverage gates require a matrix row per entry.
+    pub const ALL: &'static [WireOp] = &[
+        WireOp::MatMul,
+        WireOp::Mul,
+        WireOp::Add,
+        WireOp::RmsNorm,
+        WireOp::Silu,
+        WireOp::Reshape,
+        WireOp::View,
+        WireOp::Cont,
+        WireOp::Transpose,
+        WireOp::Concat,
+        WireOp::Copy,
+        WireOp::SsmConv,
+        WireOp::Rope,
+        WireOp::SoftMax,
+        WireOp::GetRows,
+        WireOp::Argsort,
+        WireOp::MatMulId,
+        WireOp::Div,
+        WireOp::Scale,
+        WireOp::Clamp,
+        WireOp::Permute,
+        WireOp::FlashAttention,
+        WireOp::Swiglu,
+        WireOp::Sigmoid,
+        WireOp::SumRows,
+        WireOp::SetRows,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WireOp::MatMul => "MatMul",
+            WireOp::Mul => "Mul",
+            WireOp::Add => "Add",
+            WireOp::RmsNorm => "RmsNorm",
+            WireOp::Silu => "Silu",
+            WireOp::Reshape => "Reshape",
+            WireOp::View => "View",
+            WireOp::Cont => "Cont",
+            WireOp::Transpose => "Transpose",
+            WireOp::Concat => "Concat",
+            WireOp::Copy => "Copy",
+            WireOp::SsmConv => "SsmConv",
+            WireOp::Rope => "Rope",
+            WireOp::SoftMax => "SoftMax",
+            WireOp::GetRows => "GetRows",
+            WireOp::Argsort => "Argsort",
+            WireOp::MatMulId => "MatMulId",
+            WireOp::Div => "Div",
+            WireOp::Scale => "Scale",
+            WireOp::Clamp => "Clamp",
+            WireOp::Permute => "Permute",
+            WireOp::FlashAttention => "FlashAttention",
+            WireOp::Swiglu => "Swiglu",
+            WireOp::Sigmoid => "Sigmoid",
+            WireOp::SumRows => "SumRows",
+            WireOp::SetRows => "SetRows",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<WireOp> {
+        WireOp::ALL
+            .iter()
+            .copied()
+            .find(|op| op.as_str() == name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpTraits {
     pub metadata: bool,

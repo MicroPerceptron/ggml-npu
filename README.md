@@ -116,7 +116,9 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 - `GGML_NPU_LFM_SHORTCONV=1` opts into ancestry-based placement of LFM convolution segments while
   leaving sequence gather/write setup and unrelated attention/MoE glue on CPU/GPU.
 
-Run the mandatory operation/capability gate with `./tests/run_coverage_gate.sh`. Set `MODEL` to
+Run the hermetic claim ⊆ coverage matrix gate with `./tests/run_claim_coverage_check.sh`
+(see [`docs/coverage-gates.md`](docs/coverage-gates.md); issue #12). The broader local operation
+gate is `./tests/run_coverage_gate.sh`. Set `MODEL` to
 also run two fresh-process, timeout- and memory-guarded LFM prefill/decode checks with MoE,
 ShortConv, and full attention enabled. The default keeps model placement on CPU (`NGL=0`) and pulls
 eligible NPU splits; `NPU_ONLY=1 NPU_DEVICE_CLASS=igpu` remains an explicit experiment. Whole-layer

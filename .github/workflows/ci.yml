@@ -53,6 +53,10 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Claim coverage gate (native only)
+        if: '!matrix.cross'
+        run: ./tests/run_claim_coverage_check.sh
+
       - name: Registration check (native only)
         if: '!matrix.cross'
         run: ./tests/run_registration_check.sh target/${{ matrix.target }}/release/libggml_npu.so

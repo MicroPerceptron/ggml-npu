@@ -778,7 +778,9 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// Wire ops the Intel graph compiler admits today. Keep in lockstep with shim lowering.
-fn compiler_wire_op_supported(op: crate::graph::WireOp) -> bool {
+/// Coverage gates compare this set to `tests/coverage_matrix.csv` so claims cannot outrun proofs (#12).
+/// Env/policy gates are applied separately via `env_policy_admits` (#8).
+pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
     matches!(
         op,
         crate::graph::WireOp::MatMul
@@ -902,7 +904,7 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
             ));
             return false;
         }
-        if !compiler_wire_op_supported(op) || node.inputs.len() > IR_MAX_INPUTS {
+        if !wire_op_compile_supported(op) || node.inputs.len() > IR_MAX_INPUTS {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected: wire op {op:?}, inputs={}\n",
                 node.inputs.len()
@@ -921,7 +923,7 @@ pub(super) unsafe fn graph_node_feasible(
         return false;
     }
     let input_count = (*node).src.iter().filter(|src| !src.is_null()).count();
-    if input_count > IR_MAX_INPUTS || !compiler_wire_op_supported(spec.wire) {
+    if input_count > IR_MAX_INPUTS || !wire_op_compile_supported(spec.wire) {
         return false;
     }
     // Match graph_feasible: runtime-weight MatMul needs ATTENTION=full (same as traits.attention).
@@ -1762,11 +1764,11 @@ mod tests {
     #[test]
     fn compiler_wire_allowlist_admits_dense_and_rejects_unknown_gaps() {
         // Shared allowlist used by both supports_op and graph_feasible (#8).
-        assert!(compiler_wire_op_supported(crate::graph::WireOp::MatMul));
-        assert!(compiler_wire_op_supported(crate::graph::WireOp::Silu));
-        assert!(compiler_wire_op_supported(crate::graph::WireOp::FlashAttention));
-        assert!(compiler_wire_op_supported(crate::graph::WireOp::SsmConv));
-        assert!(compiler_wire_op_supported(crate::graph::WireOp::Swiglu));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::MatMul));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Silu));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::FlashAttention));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::SsmConv));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Swiglu));
     }
 
     #[test]

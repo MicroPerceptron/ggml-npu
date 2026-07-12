@@ -74,6 +74,10 @@ itself. Direct IVPU is reported only when stderr contains successful direct disp
 a nonzero direct-memory profile. OpenVINO artifact compilation is recorded separately from runtime
 submission, and a loaded NPU backend without submission proof is labeled `npu-unproven`.
 
+When citing runs as baselines, pass `--require-baseline-proof` to `summarize.py` so
+`npu-unproven` (and other unproven successful measurements) fail the aggregation. Proven
+`direct-ivpu` / `level-zero` and CPU/Vulkan modes remain eligible.
+
 Every new `run_lfm_baseline.sh` invocation writes per-run summaries automatically. To aggregate
 selected runs into one human-readable report and one schema-versioned JSON document:
 

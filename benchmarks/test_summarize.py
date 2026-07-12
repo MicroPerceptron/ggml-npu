@@ -260,5 +260,75 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(passes[1]["unattributed_ns"], 900)
 
 
+
+    def test_unproven_npu_is_not_baseline_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.make_run(
+                Path(directory),
+                "unproven",
+                "mode=npu\nprompt_tokens=1\ngenerated_tokens=0\n",
+            )
+            (run / "result.jsonl").write_text('{"n_prompt":1,"n_gen":0,"avg_ts":1}\n')
+            (run / "process.json").write_text('{"exit_status":0}\n')
+            (run / "stderr.txt").write_text(
+                "[ggml-npu profile]  dispatches=2\n"
+                " direct memory: resident 0.00 MiB\n"
+            )
+
+            record = summarize.normalize_run(run)[0]
+            self.assertEqual(record["execution"]["runtime"], "npu-unproven")
+            self.assertFalse(record["execution"]["baseline_eligible"])
+            self.assertFalse(
+                summarize.baseline_eligible(record["execution"], record["status"])
+            )
+
+    def test_proven_direct_npu_is_baseline_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.make_run(
+                Path(directory),
+                "direct",
+                "mode=npu\nprompt_tokens=1\ngenerated_tokens=0\n",
+            )
+            (run / "result.jsonl").write_text('{"n_prompt":1,"n_gen":0,"avg_ts":1}\n')
+            (run / "process.json").write_text('{"exit_status":0}\n')
+            (run / "stderr.txt").write_text(
+                "[ggml-npu profile]  dispatches=4\n"
+                " direct memory: resident 1.25 MiB\n"
+            )
+
+            record = summarize.normalize_run(run)[0]
+            self.assertEqual(record["execution"]["runtime"], "direct-ivpu")
+            self.assertTrue(record["execution"]["baseline_eligible"])
+
+    def test_require_baseline_proof_rejects_unproven(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_run(
+                root,
+                "unproven",
+                "mode=npu\nprompt_tokens=1\ngenerated_tokens=0\n",
+            )
+            (run / "result.jsonl").write_text('{"n_prompt":1,"n_gen":0,"avg_ts":1}\n')
+            (run / "process.json").write_text('{"exit_status":0}\n')
+            (run / "stderr.txt").write_text(
+                "[ggml-npu profile]  dispatches=2\n"
+                " direct memory: resident 0.00 MiB\n"
+            )
+            import subprocess
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parent / "summarize.py"),
+                    str(run),
+                    "--require-baseline-proof",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("baseline proof required", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
