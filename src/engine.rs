@@ -76,6 +76,16 @@ fn run_partitions(vendor: &dyn Vendor, graph: &GraphIr) -> bool {
     }
     // Capability is preflighted for every partition before the first state mutation or output.
     for (index, partition) in partitions.iter().enumerate() {
+        let nodes = partition.graph.nodes.len() as u64;
+        crate::metrics::record_npu_program(nodes);
+        crate::trace::perf(
+            "npu_program",
+            &alloc::format!(
+                ",\"nodes\":{nodes},\"unitary\":{},\"reason\":\"{}\",\"index\":{index}",
+                if nodes <= 1 { "true" } else { "false" },
+                partition.reason.as_str(),
+            ),
+        );
         vendor.debug_note(&alloc::format!(
             "[npu ir2] partition {index}: nodes={} inputs={} outputs={} reason={}\n",
             partition.graph.nodes.len(),
@@ -163,6 +173,15 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
             }
             let stateful = graph.nodes.iter().any(|node| node.op == GGML_OP_SSM_CONV);
             if stateful && v.graph_support(&graph).is_supported() {
+                let nodes = graph.nodes.len() as u64;
+                crate::metrics::record_npu_program(nodes);
+                crate::trace::perf(
+                    "npu_program",
+                    &alloc::format!(
+                        ",\"nodes\":{nodes},\"unitary\":{},\"reason\":\"stateful_whole_graph\",\"index\":0",
+                        if nodes <= 1 { "true" } else { "false" },
+                    ),
+                );
                 crate::trace::graph("graph_partition", &graph, "stateful_whole_graph");
                 return v.run_graph(&graph);
             }
@@ -176,6 +195,15 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
     if let Some(sg) = ops::subgraph::recognize(cgraph) {
         // A recognized subgraph spans ops the per-node path can't run on its own (e.g. silu/mul),
         // so it must run as one program or fail loudly — never fall through to a partial dispatch.
+        let nodes = sg.nodes.len() as u64;
+        crate::metrics::record_npu_program(nodes);
+        crate::trace::perf(
+            "npu_program",
+            &alloc::format!(
+                ",\"nodes\":{nodes},\"unitary\":{},\"reason\":\"recognized_subgraph\",\"index\":0",
+                if nodes <= 1 { "true" } else { "false" },
+            ),
+        );
         return v.run_subgraph(&sg);
     }
     if let Some(graph) = graph {
@@ -189,15 +217,27 @@ pub unsafe fn compute(cgraph: *mut ggml_cgraph) -> bool {
         }
         let t = node as *const ggml_tensor;
         if let Some(op) = ops::match_node(t) {
+            crate::metrics::record_npu_program(1);
+            crate::trace::perf(
+                "npu_program",
+                ",\"nodes\":1,\"unitary\":true,\"reason\":\"per_node\",\"index\":0",
+            );
             if !ops::run(op, node, v) {
                 return false;
             }
         } else if ops::subgraph::is_glue_op(t) {
             // A claimed glue op that didn't fuse (this split isn't a full FFN): run it standalone.
             // We claimed it, so it must run — fail loudly if we somehow can't build it.
-            match ops::subgraph::recognize_glue(t) {
-                Some(sg) if v.run_subgraph(&sg) => {}
-                _ => return false,
+            let Some(sg) = ops::subgraph::recognize_glue(t) else {
+                return false;
+            };
+            crate::metrics::record_npu_program(1);
+            crate::trace::perf(
+                "npu_program",
+                ",\"nodes\":1,\"unitary\":true,\"reason\":\"glue_fallback\",\"index\":0",
+            );
+            if !v.run_subgraph(&sg) {
+                return false;
             }
         } else {
             // Every node in this scheduler split was assigned to this backend. Returning success
