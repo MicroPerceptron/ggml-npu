@@ -20,13 +20,21 @@ bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
 test-support = []
 # Production quant-transcode implementation. The crate's pinned nightly enables `portable_simd`;
-# unsupported architectures retain the scalar implementation.
+# LLVM emits scalar code on unsupported targets — there is no separate hand-rolled scalar default.
 portable-simd = ["dep:cpufeatures"]
+# F8 constant foundations via `float8`. Kept off by default: `float8` transitively depends on
+# `half`, which must never become the F16 path (nightly `f16` remains the baseline).
+dtype-f8 = ["dep:float8"]
 
 [dependencies]
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 cpufeatures = { version = "0.3.0", default-features = false, optional = true }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
+# BF16 type + SIMD-friendly conversions. Import `simsimd::bf16` only — never `simsimd::f16`
+# (IEEE F16 stays nightly `f16`; do not use the `half` crate for F16).
+simsimd = { version = "6.5.16", default-features = false }
+# Optional F8E4M3 / F8E5M2 foundations. See `dtype-f8` feature note above.
+float8 = { version = "0.7.0", default-features = false, optional = true }
 goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
 # Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
 rustix = { version = "1.1.4", features = ["alloc", "event", "fs", "mm", "param", "process", "thread", "time"], default-features = false }

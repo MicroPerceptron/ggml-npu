@@ -13,7 +13,7 @@
 #![feature(allocator_api)]
 #![feature(f16)]
 // `portable-simd` is a production default pinned to this repository's nightly toolchain. Builds
-// which disable default features retain the scalar quant-transcode kernel.
+// which disable default features retain the scalar quant-transcode / requant helpers.
 #![cfg_attr(feature = "portable-simd", feature(portable_simd))]
 
 extern crate alloc;

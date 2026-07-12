@@ -1,6 +1,16 @@
-//! Vendor-agnostic weight requantization. Dequantize a ggml weight (any type ggml can `to_float`,
-//! or f32) and re-quantize it to a **grouped low-bit** form a vendor bakes or binds as a compressed
-//! constant.
+//! Vendor-agnostic weight requantization. Prefer **source-native** adapters in `ggml_quant` when
+//! available. This module is the fallback: decode a ggml weight and re-quantize it to a **grouped
+//! low-bit** form a vendor bakes or binds as a compressed constant.
+//!
+//! # Intermediate width policy
+//!
+//! The NPU interior baseline is nightly **`f16`**. Dequant / requant scratch must **not** default
+//! to f32 unless an API or format has no f16 path:
+//! - Working row buffers after decode are nightly `f16`.
+//! - ggml type-traits `to_float` is currently **f32-only ABI** — that is the explicit exception:
+//!   decode into a transient f32 row, then narrow immediately to the f16 working buffer. Do not
+//!   keep f32 as the primary intermediate. Never use the `half` crate for this path.
+//! - An f32 *source* tensor is consumed in place (it is already f32; that is not a dequant default).
 //!
 //! Two forms, selected by `asymmetric`:
 //! - **asymmetric unsigned** (`u4`/`u8` + per-group **zero-point** + f16 scale) — the *canonical*
@@ -10,11 +20,12 @@
 //! - **symmetric signed** (`i4`/`i8` + f16 scale, no zero-point) — the simpler form; a fallback for
 //!   vendors/compilers that don't need the canonical shape.
 //!
-//! `bits == 16` emits an f16 constant (no scales/zeros) for an f32 source. This is fallback scalar
-//! narrowing, not native f16 source pass-through. The weight is emitted
-//! **unpacked** (one value per byte) so we never depend on a compiler's sub-byte packing order; the
-//! consumer narrows it (e.g. OpenVINO `Constant::create(u4, …)` packs). The output [`Requant`] is
-//! transient — the vendor copies the bytes during compilation, so nothing here needs to outlive it.
+//! `bits == 16` emits an f16 constant (no scales/zeros) for an f32 source. This is fallback
+//! narrowing (via `core::simd` under the default `portable-simd` feature), not native f16 source
+//! pass-through. The weight is emitted **unpacked** (one value per byte) so we never depend on a
+//! compiler's sub-byte packing order; the consumer narrows it (e.g. OpenVINO
+//! `Constant::create(u4, …)` packs). The output [`Requant`] is transient — the vendor copies the
+//! bytes during compilation, so nothing here needs to outlive it.
 //!
 //! The `bits`/`asymmetric` *policy* is the vendor's (source width, accuracy, what its compiler
 //! fuses); only the *algorithm* is here. The per-group length is picked adaptively — the largest of
@@ -67,17 +78,241 @@ pub fn can_requant(weight: &Operand, k: usize) -> bool {
     (tr.is_quantized && tr.to_float.is_some()) || weight.dtype == GGML_TYPE_F32
 }
 
-/// Little-endian f16 bytes of `x`, appended to `out`.
+/// Little-endian f16 bytes of `x`, appended to `out`. Uses nightly `f16`, never `half`.
 fn push_f16(out: &mut Vec<u8>, x: f32) {
     let b = (x as f16).to_bits();
     out.push((b & 0xff) as u8);
     out.push((b >> 8) as u8);
 }
 
+/// Baseline lane width for requant float hot loops. `core::simd` lowers to scalar where needed.
+#[cfg(feature = "portable-simd")]
+const REQUANT_LANES: usize = 8;
+
+#[cfg(feature = "portable-simd")]
+fn narrow_f32_to_f16(src: &[f32], dst: &mut [f16]) {
+    use core::simd::prelude::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let mut i = 0;
+    while i + REQUANT_LANES <= src.len() {
+        let v = Simd::<f32, REQUANT_LANES>::from_slice(&src[i..]);
+        let narrowed: Simd<f16, REQUANT_LANES> = v.cast();
+        narrowed.copy_to_slice(&mut dst[i..]);
+        i += REQUANT_LANES;
+    }
+    for (dst, &src) in dst[i..].iter_mut().zip(src[i..].iter()) {
+        *dst = src as f16;
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn narrow_f32_to_f16(src: &[f32], dst: &mut [f16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (dst, &src) in dst.iter_mut().zip(src.iter()) {
+        *dst = src as f16;
+    }
+}
+
+#[cfg(feature = "portable-simd")]
+fn widen_f16_to_f32(src: &[f16], dst: &mut [f32]) {
+    use core::simd::prelude::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let mut i = 0;
+    while i + REQUANT_LANES <= src.len() {
+        let v = Simd::<f16, REQUANT_LANES>::from_slice(&src[i..]);
+        let widened: Simd<f32, REQUANT_LANES> = v.cast();
+        widened.copy_to_slice(&mut dst[i..]);
+        i += REQUANT_LANES;
+    }
+    for (dst, &src) in dst[i..].iter_mut().zip(src[i..].iter()) {
+        *dst = src as f32;
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn widen_f16_to_f32(src: &[f16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (dst, &src) in dst.iter_mut().zip(src.iter()) {
+        *dst = src as f32;
+    }
+}
+
+#[cfg(feature = "portable-simd")]
+fn push_f16_row(out: &mut Vec<u8>, values: &[f32]) {
+    use core::simd::prelude::*;
+    let mut i = 0;
+    while i + REQUANT_LANES <= values.len() {
+        let v = Simd::<f32, REQUANT_LANES>::from_slice(&values[i..]);
+        let narrowed: Simd<f16, REQUANT_LANES> = v.cast();
+        for bits in narrowed.to_bits().to_array() {
+            out.push((bits & 0xff) as u8);
+            out.push((bits >> 8) as u8);
+        }
+        i += REQUANT_LANES;
+    }
+    for &value in &values[i..] {
+        push_f16(out, value);
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn push_f16_row(out: &mut Vec<u8>, values: &[f32]) {
+    for &value in values {
+        push_f16(out, value);
+    }
+}
+
+#[cfg(feature = "portable-simd")]
+fn push_f16_bits_row(out: &mut Vec<u8>, values: &[f16]) {
+    use core::simd::prelude::*;
+    let mut i = 0;
+    while i + REQUANT_LANES <= values.len() {
+        let v = Simd::<f16, REQUANT_LANES>::from_slice(&values[i..]);
+        for bits in v.to_bits().to_array() {
+            out.push((bits & 0xff) as u8);
+            out.push((bits >> 8) as u8);
+        }
+        i += REQUANT_LANES;
+    }
+    for &value in &values[i..] {
+        let bits = value.to_bits();
+        out.push((bits & 0xff) as u8);
+        out.push((bits >> 8) as u8);
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn push_f16_bits_row(out: &mut Vec<u8>, values: &[f16]) {
+    for &value in values {
+        let bits = value.to_bits();
+        out.push((bits & 0xff) as u8);
+        out.push((bits >> 8) as u8);
+    }
+}
+
+#[cfg(feature = "portable-simd")]
+fn group_min_max(values: &[f32]) -> (f32, f32) {
+    use core::simd::prelude::*;
+    debug_assert!(!values.is_empty());
+    let mut i = 0;
+    let mut lo = Simd::<f32, REQUANT_LANES>::splat(values[0]);
+    let mut hi = Simd::<f32, REQUANT_LANES>::splat(values[0]);
+    while i + REQUANT_LANES <= values.len() {
+        let v = Simd::<f32, REQUANT_LANES>::from_slice(&values[i..]);
+        lo = lo.simd_min(v);
+        hi = hi.simd_max(v);
+        i += REQUANT_LANES;
+    }
+    let mut lo_s = lo.reduce_min();
+    let mut hi_s = hi.reduce_max();
+    for &value in &values[i..] {
+        lo_s = lo_s.min(value);
+        hi_s = hi_s.max(value);
+    }
+    (lo_s, hi_s)
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn group_min_max(values: &[f32]) -> (f32, f32) {
+    let mut lo = values[0];
+    let mut hi = values[0];
+    for &value in &values[1..] {
+        if value < lo {
+            lo = value;
+        }
+        if value > hi {
+            hi = value;
+        }
+    }
+    (lo, hi)
+}
+
+#[cfg(feature = "portable-simd")]
+fn group_abs_max(values: &[f32]) -> f32 {
+    use core::simd::prelude::*;
+    debug_assert!(!values.is_empty());
+    let mut i = 0;
+    let mut maximum = Simd::<f32, REQUANT_LANES>::splat(0.0);
+    while i + REQUANT_LANES <= values.len() {
+        let v = Simd::<f32, REQUANT_LANES>::from_slice(&values[i..]).abs();
+        maximum = maximum.simd_max(v);
+        i += REQUANT_LANES;
+    }
+    let mut maximum_s = maximum.reduce_max();
+    for &value in &values[i..] {
+        maximum_s = maximum_s.max(fabs(value));
+    }
+    maximum_s
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn group_abs_max(values: &[f32]) -> f32 {
+    let mut maximum = 0.0f32;
+    for &value in values {
+        maximum = maximum.max(fabs(value));
+    }
+    maximum
+}
+
+#[cfg(feature = "portable-simd")]
+fn store_asymmetric_quants(values: &[f32], inv: f32, zero: i32, qmax: i32, out: &mut [u8]) {
+    use core::simd::prelude::*;
+    debug_assert_eq!(values.len(), out.len());
+    let inv_v = Simd::<f32, REQUANT_LANES>::splat(inv);
+    let mut i = 0;
+    while i + REQUANT_LANES <= values.len() {
+        let scaled = Simd::<f32, REQUANT_LANES>::from_slice(&values[i..]) * inv_v;
+        for (lane, &scaled) in scaled.to_array().iter().enumerate() {
+            out[i + lane] = (round_i(scaled) + zero).clamp(0, qmax) as u8;
+        }
+        i += REQUANT_LANES;
+    }
+    for (dst, &value) in out[i..].iter_mut().zip(values[i..].iter()) {
+        *dst = (round_i(value * inv) + zero).clamp(0, qmax) as u8;
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn store_asymmetric_quants(values: &[f32], inv: f32, zero: i32, qmax: i32, out: &mut [u8]) {
+    debug_assert_eq!(values.len(), out.len());
+    for (dst, &value) in out.iter_mut().zip(values.iter()) {
+        *dst = (round_i(value * inv) + zero).clamp(0, qmax) as u8;
+    }
+}
+
+#[cfg(feature = "portable-simd")]
+fn store_symmetric_quants(values: &[f32], inverse: f32, limit: i32, out: &mut [u8]) {
+    use core::simd::prelude::*;
+    debug_assert_eq!(values.len(), out.len());
+    let inv_v = Simd::<f32, REQUANT_LANES>::splat(inverse);
+    let mut i = 0;
+    while i + REQUANT_LANES <= values.len() {
+        let scaled = Simd::<f32, REQUANT_LANES>::from_slice(&values[i..]) * inv_v;
+        for (lane, &scaled) in scaled.to_array().iter().enumerate() {
+            out[i + lane] = round_i(scaled).clamp(-limit, limit) as i8 as u8;
+        }
+        i += REQUANT_LANES;
+    }
+    for (dst, &value) in out[i..].iter_mut().zip(values[i..].iter()) {
+        *dst = round_i(value * inverse).clamp(-limit, limit) as i8 as u8;
+    }
+}
+
+#[cfg(not(feature = "portable-simd"))]
+fn store_symmetric_quants(values: &[f32], inverse: f32, limit: i32, out: &mut [u8]) {
+    debug_assert_eq!(values.len(), out.len());
+    for (dst, &value) in out.iter_mut().zip(values.iter()) {
+        *dst = round_i(value * inverse).clamp(-limit, limit) as i8 as u8;
+    }
+}
+
 /// Re-quantize `weight` (`[N, K]` row-major) to `bits`-wide grouped form. `asymmetric` → unsigned
 /// `q` + per-group zero-point (canonical, compressible); else symmetric signed. `bits == 16` → f16.
-/// Quantized sources are decoded one row at a time, so scratch is `K * sizeof(f32)` rather than
-/// `K * N * sizeof(f32)`. F32 rows are consumed in place and need no value scratch.
+///
+/// Quantized sources are decoded one row at a time. ggml `to_float` fills a transient f32 row
+/// (ABI exception), which is immediately narrowed to an f16 working buffer — scratch is therefore
+/// `K * (sizeof(f32) + sizeof(f16))` for quantized rows, not a persistent f32 intermediate.
+/// F32 source rows are consumed in place and need no value scratch.
 pub fn requant(
     weight: &Operand,
     k: usize,
@@ -141,33 +376,62 @@ pub fn requant_with_stats(
         bits,
         group: group as i32,
     };
-    let mut scratch = if traits.is_some() {
+    // ABI exception buffer (f32) + policy working buffer (nightly f16).
+    let mut abi_f32 = if traits.is_some() {
         alloc::vec![0.0f32; k]
     } else {
         Vec::new()
     };
+    let mut row_f16 = if traits.is_some() {
+        alloc::vec![0.0f16; k]
+    } else {
+        Vec::new()
+    };
     let stats = RequantStats {
-        peak_scratch_bytes: scratch.len() * core::mem::size_of::<f32>(),
+        peak_scratch_bytes: abi_f32.len() * core::mem::size_of::<f32>()
+            + row_f16.len() * core::mem::size_of::<f16>(),
         rows_decoded: n,
     };
 
     for row in 0..n {
-        let values = if let Some(traits) = traits {
+        if let Some(traits) = traits {
             let block_size = traits.blck_size as usize;
             let row_bytes = (k / block_size).checked_mul(traits.type_size)?;
             let source = unsafe { (weight.ptr as *const u8).add(row.checked_mul(row_bytes)?) };
-            unsafe { (traits.to_float?)(source.cast(), scratch.as_mut_ptr(), k as i64) };
-            scratch.as_slice()
+            // ggml to_float is f32-only; narrow to f16 working row immediately.
+            unsafe { (traits.to_float?)(source.cast(), abi_f32.as_mut_ptr(), k as i64) };
+            narrow_f32_to_f16(&abi_f32, &mut row_f16);
+            quantize_row_f16(&row_f16, row, k, group, bits, asymmetric, &mut result)?;
         } else {
-            unsafe { core::slice::from_raw_parts((weight.ptr as *const f32).add(row * k), k) }
-        };
-        quantize_row(values, row, k, group, bits, asymmetric, &mut result)?;
+            let values =
+                unsafe { core::slice::from_raw_parts((weight.ptr as *const f32).add(row * k), k) };
+            quantize_row_f32(values, row, k, group, bits, asymmetric, &mut result)?;
+        }
     }
 
     Some((result, stats))
 }
 
-fn quantize_row(
+fn quantize_row_f16(
+    values: &[f16],
+    row: usize,
+    k: usize,
+    group: usize,
+    bits: i32,
+    asymmetric: bool,
+    result: &mut Requant,
+) -> Option<()> {
+    if bits == 16 {
+        push_f16_bits_row(&mut result.weight, values);
+        return Some(());
+    }
+    // Widen elementwise for the established scale/round algorithm; the row storage is f16.
+    let mut widened = alloc::vec![0.0f32; values.len()];
+    widen_f16_to_f32(values, &mut widened);
+    quantize_row_f32(&widened, row, k, group, bits, asymmetric, result)
+}
+
+fn quantize_row_f32(
     values: &[f32],
     row: usize,
     k: usize,
@@ -177,9 +441,7 @@ fn quantize_row(
     result: &mut Requant,
 ) -> Option<()> {
     if bits == 16 {
-        for &value in values {
-            push_f16(&mut result.weight, value);
-        }
+        push_f16_row(&mut result.weight, values);
         return Some(());
     }
     if !matches!(bits, 4 | 8) || values.len() != k {
@@ -187,20 +449,13 @@ fn quantize_row(
     }
     let kg = k / group;
     if asymmetric {
-        // Keep the established canonical algorithm byte-for-byte stable.
+        // Keep the established canonical algorithm byte-for-byte stable for f32 sources.
         let qmax = ((1i32 << bits) - 1) as f32;
         for g in 0..kg {
             let input_base = g * group;
             let output_base = row * k + input_base;
-            let (mut lo, mut hi) = (values[input_base], values[input_base]);
-            for &value in &values[input_base + 1..input_base + group] {
-                if value < lo {
-                    lo = value;
-                }
-                if value > hi {
-                    hi = value;
-                }
-            }
+            let group_values = &values[input_base..input_base + group];
+            let (mut lo, mut hi) = group_min_max(group_values);
             if lo > 0.0 {
                 lo = 0.0;
             }
@@ -211,10 +466,13 @@ fn quantize_row(
             let scale = if range > 1e-12 { range / qmax } else { 1.0 };
             let inv = 1.0 / scale;
             let zero = round_i(-lo * inv).clamp(0, qmax as i32);
-            for j in 0..group {
-                let quant = (round_i(values[input_base + j] * inv) + zero).clamp(0, qmax as i32);
-                result.weight[output_base + j] = quant as u8;
-            }
+            store_asymmetric_quants(
+                group_values,
+                inv,
+                zero,
+                qmax as i32,
+                &mut result.weight[output_base..output_base + group],
+            );
             result.zeros[row * kg + g] = zero as u8;
             push_f16(&mut result.scales, scale);
         }
@@ -224,16 +482,16 @@ fn quantize_row(
         for g in 0..kg {
             let input_base = g * group;
             let output_base = row * k + input_base;
-            let mut maximum = 0.0f32;
-            for &value in &values[input_base..input_base + group] {
-                maximum = maximum.max(fabs(value));
-            }
+            let group_values = &values[input_base..input_base + group];
+            let maximum = group_abs_max(group_values);
             let scale = maximum / qmax;
             let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            for j in 0..group {
-                let quant = round_i(values[input_base + j] * inverse).clamp(-limit, limit);
-                result.weight[output_base + j] = quant as i8 as u8;
-            }
+            store_symmetric_quants(
+                group_values,
+                inverse,
+                limit,
+                &mut result.weight[output_base..output_base + group],
+            );
             push_f16(&mut result.scales, scale);
         }
     }

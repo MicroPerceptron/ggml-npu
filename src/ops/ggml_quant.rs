@@ -2,6 +2,10 @@
 //!
 //! Concrete block layouts stop here. Compiler adapters consume [`ConstantDescriptor`] and never
 //! need to know a GGML type name.
+//!
+//! Prefer source-native pass-through / transcode. When a fallback decode is unavoidable, the
+//! working intermediate is nightly **`f16`** (see `requant`); do not default to f32, and never use
+//! the `half` crate for IEEE F16. BF16 uses `simsimd::bf16` only.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -16,11 +20,17 @@ use super::requant::{self, Requant};
 use super::Operand;
 #[cfg(test)]
 use crate::ffi::GGML_TYPE_F32;
-use crate::ffi::{GGML_TYPE_F16, GGML_TYPE_I8, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+use crate::ffi::{
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_I8, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q8_K,
+};
 
 const SUPER_BLOCK: usize = 256;
 const Q4_K_BYTES: usize = 144;
 const Q6_K_BYTES: usize = 210;
+const Q8_0_BLOCK: usize = 32;
+const Q8_0_BYTES: usize = 34; // f16 d + i8[32]
+const Q8_K_BYTES: usize = 292; // f32 d + i8[256] + i16 bsums[16]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConstantUse {
@@ -47,7 +57,13 @@ pub fn source_native_supported(dtype: crate::ffi::ggml_type, use_: ConstantUse) 
     use_ == ConstantUse::Dense
         && matches!(
             dtype,
-            GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_F16 | GGML_TYPE_I8
+            GGML_TYPE_Q4_K
+                | GGML_TYPE_Q6_K
+                | GGML_TYPE_Q8_0
+                | GGML_TYPE_Q8_K
+                | GGML_TYPE_F16
+                | GGML_TYPE_BF16
+                | GGML_TYPE_I8
         )
 }
 
@@ -151,9 +167,14 @@ pub fn can_prepare(weight: &Operand, k: usize, use_: ConstantUse, source_native:
         return false;
     }
     match weight.dtype {
-        GGML_TYPE_F16 => source_native,
+        GGML_TYPE_F16 | GGML_TYPE_BF16 => source_native,
         GGML_TYPE_I8 => source_native,
-        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K if source_native && use_ == ConstantUse::Dense => {
+        GGML_TYPE_Q8_0 if source_native && use_ == ConstantUse::Dense => {
+            k.is_multiple_of(Q8_0_BLOCK)
+        }
+        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_K
+            if source_native && use_ == ConstantUse::Dense =>
+        {
             k.is_multiple_of(SUPER_BLOCK)
         }
         _ => requant::can_requant(weight, k),
@@ -191,11 +212,29 @@ pub fn prepare(
                     unsafe { source_bytes(weight.ptr, expected_blocks(k, n)? * Q6_K_BYTES) };
                 return transcode_q6_k(bytes, k, n).map(PreparedConstant::SourceNative);
             }
+            GGML_TYPE_Q8_0 => {
+                let blocks = expected_q8_0_blocks(k, n)?;
+                let bytes = unsafe { source_bytes(weight.ptr, blocks * Q8_0_BYTES) };
+                return transcode_q8_0(bytes, k, n).map(PreparedConstant::SourceNative);
+            }
+            GGML_TYPE_Q8_K => {
+                let bytes =
+                    unsafe { source_bytes(weight.ptr, expected_blocks(k, n)? * Q8_K_BYTES) };
+                return transcode_q8_k(bytes, k, n).map(PreparedConstant::SourceNative);
+            }
             GGML_TYPE_F16 => {
                 let bytes = unsafe {
                     source_bytes(weight.ptr, elems.checked_mul(2).ok_or(PrepareError::Shape)?)
                 };
                 return Ok(PreparedConstant::SourceNative(pass_through_f16(
+                    bytes, elems,
+                )?));
+            }
+            GGML_TYPE_BF16 => {
+                let bytes = unsafe {
+                    source_bytes(weight.ptr, elems.checked_mul(2).ok_or(PrepareError::Shape)?)
+                };
+                return Ok(PreparedConstant::SourceNative(pass_through_bf16(
                     bytes, elems,
                 )?));
             }
@@ -210,8 +249,11 @@ pub fn prepare(
     }
 
     // Explicit canonical fallback: unsupported source, compiler capability rejection, policy
-    // override, or routed gather. F16/I8 have no proven legacy canonical conversion.
-    if matches!(weight.dtype, GGML_TYPE_F16 | GGML_TYPE_I8) {
+    // override, or routed gather. Scalar float/int8 sources have no proven legacy conversion.
+    if matches!(
+        weight.dtype,
+        GGML_TYPE_F16 | GGML_TYPE_BF16 | GGML_TYPE_I8
+    ) {
         return Err(PrepareError::Unsupported);
     }
     requant::requant(weight, k, n, fallback_bits, asymmetric)
@@ -228,6 +270,13 @@ fn expected_blocks(k: usize, n: usize) -> Result<usize, PrepareError> {
         return Err(PrepareError::Shape);
     }
     (k / SUPER_BLOCK).checked_mul(n).ok_or(PrepareError::Shape)
+}
+
+fn expected_q8_0_blocks(k: usize, n: usize) -> Result<usize, PrepareError> {
+    if k == 0 || n == 0 || !k.is_multiple_of(Q8_0_BLOCK) {
+        return Err(PrepareError::Shape);
+    }
+    (k / Q8_0_BLOCK).checked_mul(n).ok_or(PrepareError::Shape)
 }
 
 fn native_descriptor(
@@ -256,18 +305,23 @@ pub fn pass_through_f16(source: &[u8], elems: usize) -> Result<ConstantData, Pre
         return Err(PrepareError::SourceLength);
     }
     Ok(ConstantData {
-        descriptor: ConstantDescriptor {
-            numeric_kind: NumericKind::Float,
-            bit_width: 16,
-            storage_bits: 16,
-            signedness: Signedness::NotApplicable,
-            block_elems: 1,
-            group_elems: 1,
-            packing: Packing::Unpacked,
-            scale_encoding: ScaleEncoding::None,
-            offset_encoding: OffsetEncoding::None,
-            exactness: Exactness::SourceBytes,
-        },
+        descriptor: float_pass_through_descriptor(16),
+        values: source.to_vec(),
+        scale_base: Vec::new(),
+        scale_factor: Vec::new(),
+        offset_base: Vec::new(),
+        offset_factor: Vec::new(),
+    })
+}
+
+/// Byte-exact BF16 pass-through. Source dtype (GGML BF16 vs F16) is carried separately for the
+/// compiler; the descriptor is float/16. Typed helpers use `simsimd::bf16`, never `half`.
+pub fn pass_through_bf16(source: &[u8], elems: usize) -> Result<ConstantData, PrepareError> {
+    if source.len() != elems.checked_mul(2).ok_or(PrepareError::Shape)? {
+        return Err(PrepareError::SourceLength);
+    }
+    Ok(ConstantData {
+        descriptor: float_pass_through_descriptor(16),
         values: source.to_vec(),
         scale_base: Vec::new(),
         scale_factor: Vec::new(),
@@ -301,6 +355,42 @@ pub fn pass_through_i8(source: &[u8], elems: usize) -> Result<ConstantData, Prep
     })
 }
 
+/// Byte-exact F8 pass-through foundation (`bit_width = 8`). Vendors without FP8 consumption
+/// (current iVPU path) must reject at bake time. Gated crate types live behind `dtype-f8`.
+pub fn pass_through_f8(source: &[u8], elems: usize) -> Result<ConstantData, PrepareError> {
+    if source.len() != elems {
+        return Err(PrepareError::SourceLength);
+    }
+    Ok(ConstantData {
+        descriptor: float_pass_through_descriptor(8),
+        values: source.to_vec(),
+        scale_base: Vec::new(),
+        scale_factor: Vec::new(),
+        offset_base: Vec::new(),
+        offset_factor: Vec::new(),
+    })
+}
+
+fn float_pass_through_descriptor(bit_width: i32) -> ConstantDescriptor {
+    ConstantDescriptor {
+        numeric_kind: NumericKind::Float,
+        bit_width,
+        storage_bits: bit_width,
+        signedness: Signedness::NotApplicable,
+        block_elems: 1,
+        group_elems: 1,
+        packing: Packing::Unpacked,
+        scale_encoding: ScaleEncoding::None,
+        offset_encoding: OffsetEncoding::None,
+        exactness: Exactness::SourceBytes,
+    }
+}
+
+/// True when a prepared constant is an 8-bit float that the current iVPU lowering must stub.
+pub fn is_f8_constant(descriptor: ConstantDescriptor) -> bool {
+    descriptor.numeric_kind == NumericKind::Float && descriptor.bit_width == 8
+}
+
 /// Transcode Q4_K into regular logical-order packed u4 plus exact factorized scale/min metadata.
 pub fn transcode_q4_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData, PrepareError> {
     let blocks = expected_blocks(k, n)?;
@@ -328,15 +418,7 @@ pub fn transcode_q4_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData,
             &mut offset_base,
             &mut offset_factor,
         ),
-        #[cfg(all(
-            feature = "portable-simd",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64"
-            )
-        ))]
+        #[cfg(feature = "portable-simd")]
         ProductionKernel::Portable(kernel) => transcode_q4_blocks(
             kernel,
             source_blocks,
@@ -397,15 +479,7 @@ pub fn transcode_q6_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData,
             &mut scale_base,
             &mut scale_factor,
         ),
-        #[cfg(all(
-            feature = "portable-simd",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64"
-            )
-        ))]
+        #[cfg(feature = "portable-simd")]
         ProductionKernel::Portable(kernel) => transcode_q6_blocks(
             kernel,
             source_blocks,
@@ -434,6 +508,77 @@ pub fn transcode_q6_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData,
         values,
         scale_base,
         scale_factor,
+        offset_base: Vec::new(),
+        offset_factor: Vec::new(),
+    })
+}
+
+/// Transcode Q8_0 into unpacked signed i8 quants plus per-group f16 scales (group = 32).
+/// No f32 dequant; qs and scales are copied from the source blocks.
+pub fn transcode_q8_0(source: &[u8], k: usize, n: usize) -> Result<ConstantData, PrepareError> {
+    let blocks = expected_q8_0_blocks(k, n)?;
+    if source.len() != blocks.checked_mul(Q8_0_BYTES).ok_or(PrepareError::Shape)? {
+        return Err(PrepareError::SourceLength);
+    }
+    let elems = k.checked_mul(n).ok_or(PrepareError::Shape)?;
+    let mut values = Vec::with_capacity(elems);
+    let mut scale_base = Vec::with_capacity(blocks * 2);
+    for block in source.chunks_exact(Q8_0_BYTES) {
+        scale_base.extend_from_slice(&block[0..2]);
+        values.extend_from_slice(&block[2..Q8_0_BYTES]);
+    }
+    Ok(ConstantData {
+        descriptor: ConstantDescriptor {
+            numeric_kind: NumericKind::Integer,
+            bit_width: 8,
+            storage_bits: 8,
+            signedness: Signedness::Signed,
+            block_elems: Q8_0_BLOCK as i32,
+            group_elems: Q8_0_BLOCK as i32,
+            packing: Packing::Unpacked,
+            scale_encoding: ScaleEncoding::PerGroupF16,
+            offset_encoding: OffsetEncoding::None,
+            exactness: Exactness::SourceNumeric,
+        },
+        values,
+        scale_base,
+        scale_factor: Vec::new(),
+        offset_base: Vec::new(),
+        offset_factor: Vec::new(),
+    })
+}
+
+/// Transcode Q8_K into unpacked signed i8 quants plus exact per-block f32 scales.
+/// Derived `bsums` are dropped (recoverable from qs). No f32 dequant of the weights.
+pub fn transcode_q8_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData, PrepareError> {
+    let blocks = expected_blocks(k, n)?;
+    if source.len() != blocks.checked_mul(Q8_K_BYTES).ok_or(PrepareError::Shape)? {
+        return Err(PrepareError::SourceLength);
+    }
+    let elems = k.checked_mul(n).ok_or(PrepareError::Shape)?;
+    let mut values = Vec::with_capacity(elems);
+    let mut scale_base = Vec::with_capacity(blocks * 4);
+    for block in source.chunks_exact(Q8_K_BYTES) {
+        scale_base.extend_from_slice(&block[0..4]);
+        values.extend_from_slice(&block[4..4 + SUPER_BLOCK]);
+        // Skip bsums at [260..292]; they are derived from qs for vec_dot.
+    }
+    Ok(ConstantData {
+        descriptor: ConstantDescriptor {
+            numeric_kind: NumericKind::Integer,
+            bit_width: 8,
+            storage_bits: 8,
+            signedness: Signedness::Signed,
+            block_elems: SUPER_BLOCK as i32,
+            group_elems: SUPER_BLOCK as i32,
+            packing: Packing::Unpacked,
+            scale_encoding: ScaleEncoding::PerGroupF32,
+            offset_encoding: OffsetEncoding::None,
+            exactness: Exactness::SourceNumeric,
+        },
+        values,
+        scale_base,
+        scale_factor: Vec::new(),
         offset_base: Vec::new(),
         offset_factor: Vec::new(),
     })
@@ -814,6 +959,99 @@ mod tests {
             ConstantUse::RoutedGather
         ));
         assert!(!source_native_supported(GGML_TYPE_F32, ConstantUse::Dense));
+    }
+
+    #[test]
+    fn bf16_is_byte_pass_through_and_simsimd_roundtrips() {
+        // 1.0bf16 = 0x3f80, -2.0bf16 = 0xc000
+        let source = [0x80, 0x3f, 0x00, 0xc0];
+        let value = pass_through_bf16(&source, 2).unwrap();
+        assert_eq!(value.values, source);
+        assert_eq!(value.descriptor.bit_width, 16);
+        assert_eq!(value.descriptor.exactness, Exactness::SourceBytes);
+        assert!(source_native_supported(GGML_TYPE_BF16, ConstantUse::Dense));
+        assert!(!source_native_supported(
+            GGML_TYPE_BF16,
+            ConstantUse::RoutedGather
+        ));
+
+        let one = simsimd::bf16::from_f32(1.0);
+        let bits = one.0.to_le_bytes();
+        assert_eq!(bits, [0x80, 0x3f]);
+        assert!((simsimd::bf16(u16::from_le_bytes(bits)).to_f32() - 1.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn q8_0_transcode_copies_qs_and_f16_scales_exactly() {
+        let mut block = vec![0u8; Q8_0_BYTES];
+        block[0..2].copy_from_slice(&f16_bytes(0.5));
+        for i in 0..32 {
+            block[2 + i] = (i as i8).wrapping_sub(16) as u8;
+        }
+        let native = transcode_q8_0(&block, Q8_0_BLOCK, 1).unwrap();
+        assert_eq!(
+            native.descriptor,
+            ConstantDescriptor {
+                numeric_kind: NumericKind::Integer,
+                bit_width: 8,
+                storage_bits: 8,
+                signedness: Signedness::Signed,
+                block_elems: 32,
+                group_elems: 32,
+                packing: Packing::Unpacked,
+                scale_encoding: ScaleEncoding::PerGroupF16,
+                offset_encoding: OffsetEncoding::None,
+                exactness: Exactness::SourceNumeric,
+            }
+        );
+        assert_eq!(native.values, block[2..]);
+        assert_eq!(native.scale_base, block[0..2]);
+        assert_eq!(native.stored_bytes(), Q8_0_BYTES);
+
+        assert_eq!(
+            transcode_q8_0(&block[..Q8_0_BYTES - 1], 32, 1).unwrap_err(),
+            PrepareError::SourceLength
+        );
+        assert_eq!(
+            transcode_q8_0(&block, 33, 1).unwrap_err(),
+            PrepareError::Shape
+        );
+    }
+
+    #[test]
+    fn q8_k_transcode_preserves_qs_and_f32_scale_drops_bsums() {
+        let mut block = vec![0u8; Q8_K_BYTES];
+        block[0..4].copy_from_slice(&0.125f32.to_le_bytes());
+        for i in 0..SUPER_BLOCK {
+            block[4 + i] = ((i as i16) - 128) as i8 as u8;
+        }
+        for i in 0..16 {
+            let sum = (i as i16) * 10;
+            block[260 + i * 2..260 + i * 2 + 2].copy_from_slice(&sum.to_le_bytes());
+        }
+        let native = transcode_q8_k(&block, SUPER_BLOCK, 1).unwrap();
+        assert_eq!(native.descriptor.scale_encoding, ScaleEncoding::PerGroupF32);
+        assert_eq!(native.descriptor.bit_width, 8);
+        assert_eq!(native.descriptor.signedness, Signedness::Signed);
+        assert_eq!(native.values, block[4..260]);
+        assert_eq!(native.scale_base, block[0..4]);
+        assert_eq!(native.stored_bytes(), SUPER_BLOCK + 4);
+        assert!(source_native_supported(GGML_TYPE_Q8_K, ConstantUse::Dense));
+        assert_eq!(
+            transcode_q8_k(&block[..Q8_K_BYTES - 1], SUPER_BLOCK, 1).unwrap_err(),
+            PrepareError::SourceLength
+        );
+    }
+
+    #[test]
+    fn f8_pass_through_sets_float8_descriptor() {
+        let source = [0x3c, 0x00, 0x7f];
+        let value = pass_through_f8(&source, 3).unwrap();
+        assert_eq!(value.values, source);
+        assert_eq!(value.descriptor.bit_width, 8);
+        assert_eq!(value.descriptor.numeric_kind, NumericKind::Float);
+        assert!(is_f8_constant(value.descriptor));
+        assert!(!is_f8_constant(pass_through_f16(&[0, 0], 1).unwrap().descriptor));
     }
 
     #[cfg(feature = "bench")]
