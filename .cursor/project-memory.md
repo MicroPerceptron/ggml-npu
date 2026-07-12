@@ -20,6 +20,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `Cargo.toml`, `docs/quant-simd-evaluation.md`, `src/ops/quant_kernel.rs`.
   - Verified: 2026-07-12
 
+- `ADR/f16-default-intermediate` — Dequant / requant working intermediates default to nightly **`f16`** (NPU interior baseline). Do not default scratch to f32. Explicit exception: ggml type-traits `to_float` is f32-only ABI — decode then narrow immediately to an f16 row. Prefer source-native pass-through/transcode (no dequant). Never use the `half` crate for IEEE F16.
+  - Rationale: Match NPU interior width and avoid unnecessary f32 expansion bandwidth/precision policy drift.
+  - Evidence: `src/ops/requant.rs`, `src/ops/ggml_quant.rs`, GitHub issues #27–#29.
+  - Verified: 2026-07-12
+
+- `ADR/bf16-via-simsimd` — BF16 typed helpers use `simsimd::bf16` only; IEEE F16 remains nightly `f16`. Do not depend on `half` for F16 or BF16.
+  - Rationale: Avoid nightly/`half` `f16` symbol collision; `simsimd` provides SIMD-friendly BF16 without making `half` the F16 path. Import `bf16` only — never `simsimd::f16`.
+  - Evidence: `Cargo.toml`, `src/ops/ggml_quant.rs`, GitHub issue #27.
+  - Verified: 2026-07-12
+
 - `ADR/inward-runtime-boundaries` — Dependencies point inward from provider/compiler and external-API adapters through OS adapters to runtime contracts and core semantics. `src/host/` is the sole built-in host composition boundary; vendor protocols remain in vendor adapters.
   - Rationale: Keep graph/runtime semantics portable and make platform and provider failures explicit.
   - Evidence: `docs/architecture-boundaries.md`, `src/host/mod.rs`, `src/vendor/ivpu/direct/transport.rs`.
@@ -91,6 +101,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Rejected alternatives
 
+- `REJECTED/half-crate-for-f16` — Do not switch IEEE F16 constants or intermediates to the `half` crate (or any crate `f16` type). Keep nightly `f16`.
+  - Rationale: Nightly `f16` is the objective baseline; `half::f16` collides in naming/API surface and would pull F16 off the NPU interior type.
+  - Evidence: `rust-toolchain.toml` / `#![feature(f16)]` in `src/lib.rs`, `src/ops/requant.rs`, `src/ops/ggml_quant.rs`, issue #27.
+  - Verified: 2026-07-12
+
 - `REJECTED/avx2-q4-quant-transcode` — Do not ship an AVX2 specialization for Q4_K quant-transcode; production keeps the portable-SIMD baseline (with scalar fallback).
   - Rationale: Authoritative sequential `perf stat` showed explicit AVX2 worse than portable on cycles/element and throughput for Q4_K, so the ISA path is not selected.
   - Evidence: `docs/quant-simd-evaluation.md`, `src/ops/quant_kernel.rs`.
@@ -150,3 +165,7 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 - `MILESTONE/remove-openvino` — Remove the OpenVINO shim only after the neutral Intel provider reaches operation/model parity and both Intel runtimes consume its artifacts.
   - Acceptance: All enabled Intel graph paths have explicit fallback; quality/performance and reproducibility gates pass; stale cache namespaces are rejected; CI builds/tests with OpenVINO absent; neither ggml-npu nor the standalone Intel compiler transitively requires OpenVINO.
   - Evidence: `docs/compiler-migration-plan.md`.
+
+- `MILESTONE/native-bf16-q8-f8` — Source-native BF16 pass-through, Q8_0/Q8_K transcoder parity with Q4/Q6, and F8 foundations via feature-gated `float8` (iVPU stub/reject until a provider consumes FP8). Intermediate dequant defaults to nightly f16.
+  - Acceptance: `cargo test --lib` covers BF16/Q8/F8 descriptor and byte-exact paths; iVPU rejects f8 bake; Graph IR admits BF16; no `half` on the F16 path. Issues #27–#29.
+  - Evidence: `src/ops/ggml_quant.rs`, `src/ops/requant.rs`, `src/ops/constant.rs`, `src/vendor/ivpu/compile.rs`, `Cargo.toml`.

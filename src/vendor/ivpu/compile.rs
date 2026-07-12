@@ -689,9 +689,11 @@ fn forced_bits() -> Option<i32> {
 }
 
 /// Vendor policy: pick the re-quant width for `weight`. `GGML_NPU_BITS` overrides; else int4 for a
-/// ≤5-bpw quantized source (Q4_*), int8 for ≥5-bpw (Q6_K/Q8_0), f16 for an f32 source. The NPU keeps
-/// low-bit weights compressed (and fuses the dequant) only via the asymmetric-unsigned canonical
-/// form, which [`compile_const`]/[`compile_subgraph`] always request (`asymmetric = true`).
+/// ≤5-bpw quantized source (Q4_*), int8 for ≥5-bpw (Q6_K/Q8_0), **f16** for an f32 source (NPU
+/// interior baseline — never default the fallback narrow to a wider-than-needed float). The NPU
+/// keeps low-bit weights compressed (and fuses the dequant) only via the asymmetric-unsigned
+/// canonical form, which [`compile_const`]/[`compile_subgraph`] always request (`asymmetric =
+/// true`).
 fn choose_bits(weight: &Operand, force: Option<i32>) -> i32 {
     if let Some(b) = force {
         return b;
@@ -737,6 +739,11 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
         source_native_policy(),
     )
     .ok()?;
+    // iVPU stub: 8-bit float constants have no provider lowering yet.
+    if ggml_quant::is_f8_constant(constant.descriptor()) {
+        super::profile::note("[npu] rejected f8 constant: iVPU bake stub\n");
+        return None;
+    }
     let key = prepared_cache_key(&constant, weight.ptr as usize, weight.dtype as u32, m, k, n);
     let abi = ConstantAbi::from_prepared(&constant);
 
@@ -793,6 +800,7 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 value.dtype,
                 crate::ffi::GGML_TYPE_F32
                     | crate::ffi::GGML_TYPE_F16
+                    | crate::ffi::GGML_TYPE_BF16
                     | crate::ffi::GGML_TYPE_I32
                     | crate::ffi::GGML_TYPE_I64
             )
@@ -1088,6 +1096,10 @@ fn compile_graph_uncached(graph: &GraphIr) -> Option<Vec<u8>> {
             source_native_policy(),
         )
         .ok()?;
+        if ggml_quant::is_f8_constant(constant.descriptor()) {
+            super::profile::note("[npu ir2] rejected f8 constant: iVPU bake stub\n");
+            return None;
+        }
         if routed[id] && constant.is_source_native() {
             super::profile::note(
                 "[npu ir2] rejected source-native routed bank: packed dynamic gather unavailable\n",
@@ -1122,7 +1134,11 @@ fn compile_graph_uncached(graph: &GraphIr) -> Option<Vec<u8>> {
                     2
                 } else if t.dtype == crate::ffi::GGML_TYPE_F16 {
                     3
+                } else if t.dtype == crate::ffi::GGML_TYPE_BF16 {
+                    4
                 } else {
+                    // 0 = F32. ABI slot 5 is reserved for F8 when a source dtype exists;
+                    // today F8 is expressed only via ConstantDescriptor bit_width=8 float.
                     0
                 },
                 ne,
@@ -1523,18 +1539,21 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
     // Prepare every baked weight (bytes must outlive the shim call).
     let mut constants: Vec<PreparedConstant> = Vec::with_capacity(sg.consts.len());
     for c in &sg.consts {
-        constants.push(
-            ggml_quant::prepare(
-                &c.weight,
-                c.k as usize,
-                c.n as usize,
-                choose_bits(&c.weight, force),
-                asymmetric(),
-                ConstantUse::Dense,
-                source_native_policy(),
-            )
-            .ok()?,
-        );
+        let prepared = ggml_quant::prepare(
+            &c.weight,
+            c.k as usize,
+            c.n as usize,
+            choose_bits(&c.weight, force),
+            asymmetric(),
+            ConstantUse::Dense,
+            source_native_policy(),
+        )
+        .ok()?;
+        if ggml_quant::is_f8_constant(prepared.descriptor()) {
+            super::profile::note("[npu] rejected f8 constant: iVPU bake stub\n");
+            return None;
+        }
+        constants.push(prepared);
     }
     let consts: Vec<SgConstAbi> = constants
         .iter()

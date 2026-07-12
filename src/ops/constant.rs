@@ -43,6 +43,10 @@ pub enum ScaleEncoding {
     BlockF16TimesGroupU8 = 2,
     /// One f16 base per block multiplied by one signed byte factor per group.
     BlockF16TimesGroupI8 = 3,
+    /// One little-endian f32 scale for each logical group (e.g. Q8_K super-block `d`).
+    /// Prefer f16 encodings when the source scale is already f16; use this only when the
+    /// source scale is natively f32 and must stay exact.
+    PerGroupF32 = 4,
 }
 
 /// Offset metadata and the exact graph expression it denotes.
@@ -86,9 +90,10 @@ pub struct ConstantDescriptor {
 
 /// Owned storage backing a [`ConstantDescriptor`].
 ///
-/// `scale_base`/`offset_base` contain f16 values. Factor arrays contain the integer metadata
-/// specified by the descriptor. Canonical fallback uses `scale_base` for per-group f16 scales and
-/// `offset_base` for zero points.
+/// `scale_base`/`offset_base` contain little-endian scale/offset bases as described by
+/// [`ScaleEncoding`] / [`OffsetEncoding`] (typically f16; [`ScaleEncoding::PerGroupF32`] stores
+/// f32). Factor arrays contain the integer metadata specified by the descriptor. Canonical
+/// fallback uses `scale_base` for per-group f16 scales and `offset_base` for zero points.
 #[derive(Debug)]
 pub struct ConstantData {
     pub descriptor: ConstantDescriptor,

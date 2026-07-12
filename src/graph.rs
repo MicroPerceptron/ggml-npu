@@ -436,7 +436,7 @@ fn decode_spec(
 }
 
 fn is_float_type(dtype: ggml_type) -> bool {
-    matches!(dtype, GGML_TYPE_F32 | GGML_TYPE_F16)
+    matches!(dtype, GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16)
 }
 
 fn is_index_type(dtype: ggml_type) -> bool {

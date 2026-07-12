@@ -1,6 +1,16 @@
-//! Vendor-agnostic weight requantization. Dequantize a ggml weight (any type ggml can `to_float`,
-//! or f32) and re-quantize it to a **grouped low-bit** form a vendor bakes or binds as a compressed
-//! constant.
+//! Vendor-agnostic weight requantization. Prefer **source-native** adapters in `ggml_quant` when
+//! available. This module is the fallback: decode a ggml weight and re-quantize it to a **grouped
+//! low-bit** form a vendor bakes or binds as a compressed constant.
+//!
+//! # Intermediate width policy
+//!
+//! The NPU interior baseline is nightly **`f16`**. Dequant / requant scratch must **not** default
+//! to f32 unless an API or format has no f16 path:
+//! - Working row buffers after decode are nightly `f16`.
+//! - ggml type-traits `to_float` is currently **f32-only ABI** — that is the explicit exception:
+//!   decode into a transient f32 row, then narrow immediately to the f16 working buffer. Do not
+//!   keep f32 as the primary intermediate. Never use the `half` crate for this path.
+//! - An f32 *source* tensor is consumed in place (it is already f32; that is not a dequant default).
 //!
 //! Two forms, selected by `asymmetric`:
 //! - **asymmetric unsigned** (`u4`/`u8` + per-group **zero-point** + f16 scale) — the *canonical*
@@ -67,7 +77,7 @@ pub fn can_requant(weight: &Operand, k: usize) -> bool {
     (tr.is_quantized && tr.to_float.is_some()) || weight.dtype == GGML_TYPE_F32
 }
 
-/// Little-endian f16 bytes of `x`, appended to `out`.
+/// Little-endian f16 bytes of `x`, appended to `out`. Uses nightly `f16`, never `half`.
 fn push_f16(out: &mut Vec<u8>, x: f32) {
     let b = (x as f16).to_bits();
     out.push((b & 0xff) as u8);
@@ -76,8 +86,11 @@ fn push_f16(out: &mut Vec<u8>, x: f32) {
 
 /// Re-quantize `weight` (`[N, K]` row-major) to `bits`-wide grouped form. `asymmetric` → unsigned
 /// `q` + per-group zero-point (canonical, compressible); else symmetric signed. `bits == 16` → f16.
-/// Quantized sources are decoded one row at a time, so scratch is `K * sizeof(f32)` rather than
-/// `K * N * sizeof(f32)`. F32 rows are consumed in place and need no value scratch.
+///
+/// Quantized sources are decoded one row at a time. ggml `to_float` fills a transient f32 row
+/// (ABI exception), which is immediately narrowed to an f16 working buffer — scratch is therefore
+/// `K * (sizeof(f32) + sizeof(f16))` for quantized rows, not a persistent f32 intermediate.
+/// F32 source rows are consumed in place and need no value scratch.
 pub fn requant(
     weight: &Operand,
     k: usize,
@@ -141,33 +154,70 @@ pub fn requant_with_stats(
         bits,
         group: group as i32,
     };
-    let mut scratch = if traits.is_some() {
+    // ABI exception buffer (f32) + policy working buffer (nightly f16).
+    let mut abi_f32 = if traits.is_some() {
         alloc::vec![0.0f32; k]
     } else {
         Vec::new()
     };
+    let mut row_f16 = if traits.is_some() {
+        alloc::vec![0.0f16; k]
+    } else {
+        Vec::new()
+    };
     let stats = RequantStats {
-        peak_scratch_bytes: scratch.len() * core::mem::size_of::<f32>(),
+        peak_scratch_bytes: abi_f32.len() * core::mem::size_of::<f32>()
+            + row_f16.len() * core::mem::size_of::<f16>(),
         rows_decoded: n,
     };
 
     for row in 0..n {
-        let values = if let Some(traits) = traits {
+        if let Some(traits) = traits {
             let block_size = traits.blck_size as usize;
             let row_bytes = (k / block_size).checked_mul(traits.type_size)?;
             let source = unsafe { (weight.ptr as *const u8).add(row.checked_mul(row_bytes)?) };
-            unsafe { (traits.to_float?)(source.cast(), scratch.as_mut_ptr(), k as i64) };
-            scratch.as_slice()
+            // ggml to_float is f32-only; narrow to f16 working row immediately.
+            unsafe { (traits.to_float?)(source.cast(), abi_f32.as_mut_ptr(), k as i64) };
+            for (dst, &src) in row_f16.iter_mut().zip(abi_f32.iter()) {
+                *dst = src as f16;
+            }
+            quantize_row_f16(&row_f16, row, k, group, bits, asymmetric, &mut result)?;
         } else {
-            unsafe { core::slice::from_raw_parts((weight.ptr as *const f32).add(row * k), k) }
-        };
-        quantize_row(values, row, k, group, bits, asymmetric, &mut result)?;
+            let values =
+                unsafe { core::slice::from_raw_parts((weight.ptr as *const f32).add(row * k), k) };
+            quantize_row_f32(values, row, k, group, bits, asymmetric, &mut result)?;
+        }
     }
 
     Some((result, stats))
 }
 
-fn quantize_row(
+fn quantize_row_f16(
+    values: &[f16],
+    row: usize,
+    k: usize,
+    group: usize,
+    bits: i32,
+    asymmetric: bool,
+    result: &mut Requant,
+) -> Option<()> {
+    if bits == 16 {
+        for &value in values {
+            let b = value.to_bits();
+            result.weight.push((b & 0xff) as u8);
+            result.weight.push((b >> 8) as u8);
+        }
+        return Some(());
+    }
+    // Widen elementwise for the established scale/round algorithm; the row storage is f16.
+    let mut widened = alloc::vec![0.0f32; values.len()];
+    for (dst, &src) in widened.iter_mut().zip(values.iter()) {
+        *dst = src as f32;
+    }
+    quantize_row_f32(&widened, row, k, group, bits, asymmetric, result)
+}
+
+fn quantize_row_f32(
     values: &[f32],
     row: usize,
     k: usize,
@@ -187,7 +237,7 @@ fn quantize_row(
     }
     let kg = k / group;
     if asymmetric {
-        // Keep the established canonical algorithm byte-for-byte stable.
+        // Keep the established canonical algorithm byte-for-byte stable for f32 sources.
         let qmax = ((1i32 << bits) - 1) as f32;
         for g in 0..kg {
             let input_base = g * group;
