@@ -1,7 +1,7 @@
-//! A lock-free, append-only cache keyed by a `Copy + PartialEq` key.
+//! A lock-free, bounded-retention cache keyed by exact `PartialEq` semantics.
 //!
 //! Reads (the hot path) are a plain atomic-load traversal — no lock (per the atomics-over-locks
-//! rule). Entries are never removed (they hold leaked, process-lifetime artifacts), so there is
+//! rule). Entries are not removed yet (they hold process-lifetime artifacts), so there is
 //! no reclamation or ABA problem; writes prepend via CAS. Each node is its own cacheline so a
 //! lookup touches one line per entry and the hot `head` never false-shares. Concurrent misses of
 //! the same key could duplicate an entry (harmless — both valid, lookup returns one), but compute
@@ -9,14 +9,10 @@
 //!
 //! Keys in use are all `Copy` tuples: `(weight pointer, M)` for the per-weight Constant blob,
 //! the blob address for its per-blob graph, and a per-node pointer-triple for the recorded
-//! execute list — see [`PtrKey`].
+//! execute list. Once its explicit entry budget is reached, misses fall back without compiling.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicPtr, Ordering};
-
-/// Per-node binding key: `(activation, output, blob)` data/artifact addresses. Uniquely
-/// identifies one graph node's bindings, which are stable across tokens.
-pub(super) type PtrKey = (usize, usize, usize);
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 struct Node<K, V> {
     key: K,
@@ -30,19 +26,25 @@ struct Node<K, V> {
 #[repr(align(64))]
 pub(super) struct Cache<K, V> {
     head: AtomicPtr<Node<K, V>>,
+    count: AtomicUsize,
+    limit: usize,
 }
 
-impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
-    pub(super) const fn new() -> Self {
-        Cache { head: AtomicPtr::new(core::ptr::null_mut()) }
+impl<K: PartialEq, V: Copy> Cache<K, V> {
+    pub(super) const fn new(limit: usize) -> Self {
+        Cache {
+            head: AtomicPtr::new(core::ptr::null_mut()),
+            count: AtomicUsize::new(0),
+            limit,
+        }
     }
 
     /// Lock-free lookup.
-    pub(super) fn get(&self, key: K) -> Option<V> {
+    pub(super) fn get(&self, key: &K) -> Option<V> {
         let mut p = self.head.load(Ordering::Acquire);
         while !p.is_null() {
             let node = unsafe { &*p };
-            if node.key == key {
+            if node.key.eq(key) {
                 return Some(node.val);
             }
             p = node.next.load(Ordering::Acquire);
@@ -50,11 +52,16 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
         None
     }
 
-    /// Cached value for `key`, computing + inserting it on a miss. `f` runs with **no lock held**
-    /// (it may compile a blob / build a graph — seconds); on a race the loser's node is dropped.
-    pub(super) fn get_or_insert_with(&self, key: K, f: impl FnOnce() -> V) -> V {
-        if let Some(v) = self.get(key) {
-            return v;
+    /// Bounded insertion. Returns `None` without invoking `f` once the retention budget is full,
+    /// allowing the caller to fall back instead of compiling another process-lifetime artifact.
+    pub(super) fn try_get_or_insert_with(&self, key: K, f: impl FnOnce() -> V) -> Option<V> {
+        if let Some(v) = self.get(&key) {
+            return Some(v);
+        }
+        let slot = self.count.fetch_add(1, Ordering::AcqRel);
+        if slot >= self.limit {
+            self.count.fetch_sub(1, Ordering::AcqRel);
+            return None;
         }
         let node = Box::into_raw(Box::new(Node {
             key,
@@ -63,10 +70,10 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
         }));
         let v = unsafe { (*node).val };
         loop {
-            if let Some(existing) = self.get(key) {
-                // Someone else published this key first; drop our redundant node.
+            if let Some(existing) = self.get(unsafe { &(*node).key }) {
                 drop(unsafe { Box::from_raw(node) });
-                return existing;
+                self.count.fetch_sub(1, Ordering::AcqRel);
+                return Some(existing);
             }
             let head = self.head.load(Ordering::Acquire);
             unsafe { (*node).next.store(head, Ordering::Relaxed) };
@@ -75,11 +82,11 @@ impl<K: Copy + PartialEq, V: Copy> Cache<K, V> {
                 .compare_exchange(head, node, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return v;
+                return Some(v);
             }
         }
     }
 }
 
 // SAFETY: shared across threads; all mutation is via atomics, keys/values are Copy + 'static.
-unsafe impl<K: Copy + Send, V: Copy + Send> Sync for Cache<K, V> {}
+unsafe impl<K: Send, V: Copy + Send> Sync for Cache<K, V> {}

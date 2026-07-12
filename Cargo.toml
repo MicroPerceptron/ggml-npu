@@ -11,8 +11,21 @@ publish = false
 # via GGML_BACKEND_PATH, so the exact filename does not matter for discovery.
 crate-type = ["cdylib"]
 
-# No runtime dependencies: the JIT caches and shim/loader handles are all lock-free (AtomicPtr),
-# so `spin`/`hashbrown` are gone (see vendor/ivpu/cache.rs).
+[features]
+default = ["direct-ivpu"]
+# Linux intel_vpu discovery, checked UAPI wrappers, and release-pinned firmware command validation.
+direct-ivpu = ["dep:goblin"]
+level-zero-compat = []
+bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
+bench-hardware = ["bench", "level-zero-compat"]
+
+[dependencies]
+blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
+goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
+# Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
+rustix = { version = "1.1.4", features = ["alloc", "event", "fs", "mm", "param", "process", "thread", "time"], default-features = false }
+zstd = { version = "0.13.3", default-features = false, optional = true }
 
 [build-dependencies]
 bindgen = "0.72.1"
@@ -28,3 +41,23 @@ panic = "abort"
 lto = "fat"
 codegen-units = 1
 opt-level = 3
+
+[[bench]]
+name = "hashing"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "runtime"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "artifact_cache"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "hardware"
+harness = false
+required-features = ["bench-hardware"]

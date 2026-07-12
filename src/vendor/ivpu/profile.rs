@@ -1,10 +1,11 @@
-//! Env-gated performance instrumentation for the NPU dispatch hot path ([`super::session::run`]).
+//! Env-gated runtime diagnostics for submit/wait/copy crash and placement investigations.
 //!
 //! Every offloaded op — a single matmul or a fused subgraph — funnels through one `session::run`,
 //! so timing its three phases (host stage-in of foreign inputs, the device submit+sync round-trip,
 //! host copy-out of foreign outputs) plus the owned-vs-bounced argument split gives an evidence
-//! breakdown of where a token's wall-clock actually goes: host memcpy, device latency, or
-//! orchestration. Enabled by `GGML_NPU_PROFILE` (any non-empty value); the accumulated report is
+//! breakdown of where a token's wall-clock went: host memcpy, device latency, or
+//! orchestration. This is not a benchmark statistics engine; Criterion and llama-bench own those
+//! roles. Enabled by `GGML_NPU_PROFILE` (any non-empty value); the accumulated report is
 //! written to stderr at process exit (via `atexit`), so it works for both the scratchpad harnesses
 //! and a real `llama-cli` run.
 //!
@@ -12,39 +13,22 @@
 //! backend, but the counters are lock-free regardless). When disabled, the hot path pays only one
 //! relaxed atomic load per dispatch and takes no clock samples.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-extern "C" {
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    // glibc routes `atexit` through `__cxa_atexit`; the plain `atexit` symbol is not reliably
-    // resolvable from a dlopen'd .so, so register the exit dump the C++-runtime way. A null
-    // `dso_handle` schedules the callback at process exit.
-    fn __cxa_atexit(func: extern "C" fn(*mut c_void), arg: *mut c_void, dso: *mut c_void) -> i32;
-    fn getenv(name: *const c_char) -> *const c_char;
-}
-
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-const CLOCK_MONOTONIC: i32 = 1;
+use crate::artifact_cache::{
+    BypassReason, CacheObserver, CacheOperation, CacheTier, EvictionReason,
+};
+use crate::host::{ClockService, ConfigService, DiagnosticService, HostEnvironment};
+use crate::metrics::{DispatchMetrics, MetricEvent, MetricsSink};
 
 /// Monotonic clock in nanoseconds (vDSO-fast). Only sampled when profiling is on.
 pub(super) fn now_ns() -> u64 {
-    let mut ts = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .wrapping_mul(1_000_000_000)
-        .wrapping_add(ts.tv_nsec as u64)
+    crate::host::builtin()
+        .clock()
+        .monotonic_now_ns()
+        .unwrap_or(0)
 }
 
 // 0 = untried, 1 = off, 2 = on. Resolved once from the environment on the first dispatch.
@@ -57,10 +41,9 @@ pub(super) fn debug_on() -> bool {
     if s != 0 {
         return s == 2;
     }
-    let on = unsafe {
-        let p = getenv(c"GGML_NPU_DEBUG".as_ptr());
-        !p.is_null() && *p != 0
-    };
+    let on = crate::host::builtin()
+        .config()
+        .is_nonempty(c"GGML_NPU_DEBUG");
     DEBUG.store(if on { 2 } else { 1 }, Ordering::Release);
     on
 }
@@ -68,7 +51,9 @@ pub(super) fn debug_on() -> bool {
 /// Write `s` to stderr when `GGML_NPU_DEBUG` is set (a `no_std` eprintln for failure diagnostics).
 pub(super) fn note(s: &str) {
     if debug_on() {
-        unsafe { write(2, s.as_ptr(), s.len()) };
+        crate::host::builtin()
+            .diagnostics()
+            .write_stderr(s.as_bytes());
     }
 }
 
@@ -78,10 +63,45 @@ static T_DEVICE: AtomicU64 = AtomicU64::new(0); // ns, submit + NPU compute + sy
 static T_SUBMIT: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_exec — async submit (host cost only)
 static T_SYNC: AtomicU64 = AtomicU64::new(0); // ns, cmd_queue_sync — wait for the NPU to drain
 static T_COPY_OUT: AtomicU64 = AtomicU64::new(0); // ns, host copy of foreign outputs out of bounces
-static N_ARGS_OWNED: AtomicU64 = AtomicU64::new(0); // bound directly (zero copy)
-static N_ARGS_BOUNCED: AtomicU64 = AtomicU64::new(0); // staged through a bounce buffer
+static N_DIRECT_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_SHARED_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_IMPORTED_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static N_STAGED_OCCURRENCES: AtomicU64 = AtomicU64::new(0);
+static N_STAGED_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+static STAGED_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
 static BYTES_IN: AtomicU64 = AtomicU64::new(0);
 static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static ACCOUNTED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_LIMIT: AtomicU64 = AtomicU64::new(0);
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXECUTABLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static BINDING_BYTES: AtomicU64 = AtomicU64::new(0);
+static HPI_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMAND_BYTES: AtomicU64 = AtomicU64::new(0);
+static PREEMPTION_BYTES: AtomicU64 = AtomicU64::new(0);
+static T0_HITS: AtomicU64 = AtomicU64::new(0);
+static T0_MISSES: AtomicU64 = AtomicU64::new(0);
+static T1_HITS: AtomicU64 = AtomicU64::new(0);
+static T1_MISSES: AtomicU64 = AtomicU64::new(0);
+static T2_HITS: AtomicU64 = AtomicU64::new(0);
+static T2_MISSES: AtomicU64 = AtomicU64::new(0);
+static CACHE_BYPASSES: AtomicU64 = AtomicU64::new(0);
+static CACHE_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
+static T_COMPRESS: AtomicU64 = AtomicU64::new(0);
+static T_DECOMPRESS: AtomicU64 = AtomicU64::new(0);
+static T_DISK_READ: AtomicU64 = AtomicU64::new(0);
+static T_DISK_WRITE: AtomicU64 = AtomicU64::new(0);
+static T_COMPILE: AtomicU64 = AtomicU64::new(0);
+static T_PROMOTE: AtomicU64 = AtomicU64::new(0);
+static T_SINGLE_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static T_REHYDRATE: AtomicU64 = AtomicU64::new(0);
+static COMPRESSED_BYTES: AtomicU64 = AtomicU64::new(0);
+static UNCOMPRESSED_BYTES: AtomicU64 = AtomicU64::new(0);
+static T1_BYTES: AtomicU64 = AtomicU64::new(0);
+static T1_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 /// Is profiling on? Resolves `GGML_NPU_PROFILE` once and registers the exit dump on first enable.
 pub(super) fn enabled() -> bool {
@@ -89,10 +109,9 @@ pub(super) fn enabled() -> bool {
     if s != 0 {
         return s == 2;
     }
-    let on = unsafe {
-        let p = getenv(c"GGML_NPU_PROFILE".as_ptr());
-        !p.is_null() && *p != 0
-    };
+    let on = crate::host::builtin()
+        .config()
+        .is_nonempty(c"GGML_NPU_PROFILE");
     let want = if on { 2 } else { 1 };
     // Only the thread that flips 0 -> want registers the exit dump (once).
     if ENABLED
@@ -100,7 +119,9 @@ pub(super) fn enabled() -> bool {
         .is_ok()
         && on
     {
-        unsafe { __cxa_atexit(dump_at_exit, ptr::null_mut(), ptr::null_mut()) };
+        crate::host::builtin()
+            .diagnostics()
+            .register_process_exit(dump_at_exit, ptr::null_mut());
     }
     on
 }
@@ -116,21 +137,267 @@ pub(super) fn record(
     tmid: u64,
     t2: u64,
     t3: u64,
-    owned: u64,
-    bounced: u64,
+    direct: u64,
+    shared: u64,
+    imported: u64,
+    staged_occurrences: u64,
+    staged_bytes: u64,
     bytes_in: u64,
     bytes_out: u64,
 ) {
-    N_DISPATCH.fetch_add(1, Ordering::Relaxed);
-    T_STAGE_IN.fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
-    T_DEVICE.fetch_add(t2.saturating_sub(t1), Ordering::Relaxed);
-    T_SUBMIT.fetch_add(tmid.saturating_sub(t1), Ordering::Relaxed);
-    T_SYNC.fetch_add(t2.saturating_sub(tmid), Ordering::Relaxed);
-    T_COPY_OUT.fetch_add(t3.saturating_sub(t2), Ordering::Relaxed);
-    N_ARGS_OWNED.fetch_add(owned, Ordering::Relaxed);
-    N_ARGS_BOUNCED.fetch_add(bounced, Ordering::Relaxed);
-    BYTES_IN.fetch_add(bytes_in, Ordering::Relaxed);
-    BYTES_OUT.fetch_add(bytes_out, Ordering::Relaxed);
+    PROFILE_SINK.event(MetricEvent::Dispatch(DispatchMetrics {
+        stage_in_ns: t1.saturating_sub(t0),
+        submit_ns: tmid.saturating_sub(t1),
+        wait_ns: t2.saturating_sub(tmid),
+        copy_out_ns: t3.saturating_sub(t2),
+        direct_bindings: direct,
+        shared_bindings: shared,
+        imported_bindings: imported,
+        staged_occurrences,
+        staged_bytes,
+        bytes_in,
+        bytes_out,
+    }));
+}
+
+pub(super) fn event(event: MetricEvent) {
+    if enabled() {
+        PROFILE_SINK.event(event);
+    }
+}
+
+pub(super) struct ArtifactCacheObserver;
+pub(super) static ARTIFACT_CACHE_OBSERVER: ArtifactCacheObserver = ArtifactCacheObserver;
+
+fn tier_name(tier: CacheTier) -> &'static str {
+    match tier {
+        CacheTier::Resident => "t0-resident-programs",
+        CacheTier::Memory => "t1-compressed-artifacts",
+        CacheTier::Persistent => "t2-content-store",
+        CacheTier::Compiler => "compiler",
+    }
+}
+
+fn bypass_name(reason: BypassReason) -> &'static str {
+    match reason {
+        BypassReason::Disabled => "disabled",
+        BypassReason::Oversized => "oversized",
+        BypassReason::FrequencyRejected => "frequency-rejected",
+        BypassReason::Pinned => "pinned",
+        BypassReason::Budget => "budget",
+        BypassReason::Incompatible => "incompatible",
+        BypassReason::StoreUnavailable => "store-unavailable",
+    }
+}
+
+fn eviction_name(reason: EvictionReason) -> &'static str {
+    match reason {
+        EvictionReason::Capacity => "capacity",
+        EvictionReason::Generation => "generation",
+        EvictionReason::Corrupt => "corrupt",
+        EvictionReason::Incompatible => "incompatible",
+    }
+}
+
+fn operation_name(operation: CacheOperation) -> &'static str {
+    match operation {
+        CacheOperation::Compress => "compression",
+        CacheOperation::Decompress => "decompression",
+        CacheOperation::DiskRead => "disk-read",
+        CacheOperation::DiskWrite => "disk-write",
+        CacheOperation::Compile => "compile",
+        CacheOperation::Promote => "promotion",
+        CacheOperation::SingleFlightWait => "single-flight-wait",
+        CacheOperation::ResidentRehydrate => "resident-rehydration",
+    }
+}
+
+impl CacheObserver for ArtifactCacheObserver {
+    fn hit(&self, tier: CacheTier, bytes: u64) {
+        event(MetricEvent::CacheHit {
+            cache: tier_name(tier),
+            bytes,
+        });
+    }
+
+    fn miss(&self, tier: CacheTier) {
+        event(MetricEvent::CacheMiss {
+            cache: tier_name(tier),
+        });
+    }
+
+    fn bypass(&self, tier: CacheTier, reason: BypassReason, bytes: u64) {
+        event(MetricEvent::CacheBypass {
+            cache: tier_name(tier),
+            reason: bypass_name(reason),
+            bytes,
+        });
+    }
+
+    fn eviction(&self, tier: CacheTier, reason: EvictionReason, bytes: u64) {
+        event(MetricEvent::CacheEviction {
+            cache: tier_name(tier),
+            reason: eviction_name(reason),
+            bytes,
+        });
+    }
+
+    fn corruption(&self, tier: CacheTier) {
+        event(MetricEvent::CacheCorruption {
+            cache: tier_name(tier),
+        });
+    }
+
+    fn latency(&self, operation: CacheOperation, elapsed_ns: u64, bytes: u64) {
+        event(MetricEvent::CacheLatency {
+            operation: operation_name(operation),
+            elapsed_ns,
+            bytes,
+        });
+    }
+
+    fn compression_ratio(&self, uncompressed_bytes: u64, compressed_bytes: u64) {
+        event(MetricEvent::CompressionRatio {
+            uncompressed_bytes,
+            compressed_bytes,
+        });
+    }
+
+    fn bytes(&self, tier: CacheTier, current: u64, budget: u64) {
+        event(MetricEvent::CacheBytes {
+            cache: tier_name(tier),
+            current_bytes: current,
+            budget_bytes: budget,
+        });
+    }
+}
+
+pub(super) fn record_direct_memory_breakdown(
+    executable_bytes: u64,
+    binding_bytes: u64,
+    hpi_bytes: u64,
+    command_bytes: u64,
+    preemption_bytes: u64,
+) {
+    if enabled() {
+        EXECUTABLE_BYTES.store(executable_bytes, Ordering::Relaxed);
+        BINDING_BYTES.store(binding_bytes, Ordering::Relaxed);
+        HPI_BYTES.store(hpi_bytes, Ordering::Relaxed);
+        COMMAND_BYTES.store(command_bytes, Ordering::Relaxed);
+        PREEMPTION_BYTES.store(preemption_bytes, Ordering::Relaxed);
+    }
+}
+
+struct ProfileSink;
+static PROFILE_SINK: ProfileSink = ProfileSink;
+
+impl MetricsSink for ProfileSink {
+    fn event(&self, event: MetricEvent) {
+        match event {
+            MetricEvent::Dispatch(metrics) => {
+                N_DISPATCH.fetch_add(1, Ordering::Relaxed);
+                T_STAGE_IN.fetch_add(metrics.stage_in_ns, Ordering::Relaxed);
+                T_SUBMIT.fetch_add(metrics.submit_ns, Ordering::Relaxed);
+                T_SYNC.fetch_add(metrics.wait_ns, Ordering::Relaxed);
+                T_DEVICE.fetch_add(
+                    metrics.submit_ns.saturating_add(metrics.wait_ns),
+                    Ordering::Relaxed,
+                );
+                T_COPY_OUT.fetch_add(metrics.copy_out_ns, Ordering::Relaxed);
+                N_DIRECT_BINDINGS.fetch_add(metrics.direct_bindings, Ordering::Relaxed);
+                N_SHARED_BINDINGS.fetch_add(metrics.shared_bindings, Ordering::Relaxed);
+                N_IMPORTED_BINDINGS.fetch_add(metrics.imported_bindings, Ordering::Relaxed);
+                N_STAGED_OCCURRENCES.fetch_add(metrics.staged_occurrences, Ordering::Relaxed);
+                STAGED_BYTES.fetch_add(metrics.staged_bytes, Ordering::Relaxed);
+                BYTES_IN.fetch_add(metrics.bytes_in, Ordering::Relaxed);
+                BYTES_OUT.fetch_add(metrics.bytes_out, Ordering::Relaxed);
+            }
+            MetricEvent::StagingAllocation { bytes, .. } => {
+                N_STAGED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                STAGED_ALLOCATION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            MetricEvent::MemoryState {
+                resident_bytes,
+                resident_high_water,
+                accounted_high_water,
+                resident_limit,
+            } => {
+                RESIDENT_BYTES.store(resident_bytes, Ordering::Relaxed);
+                RESIDENT_HIGH_WATER.fetch_max(resident_high_water, Ordering::Relaxed);
+                ACCOUNTED_HIGH_WATER.fetch_max(accounted_high_water, Ordering::Relaxed);
+                RESIDENT_LIMIT.store(resident_limit, Ordering::Relaxed);
+            }
+            MetricEvent::CacheHit { cache, .. } => match cache {
+                "direct-programs" | "t0-resident-programs" => {
+                    T0_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                "t1-compressed-artifacts" => {
+                    T1_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                "t2-content-store" => {
+                    T2_HITS.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            },
+            MetricEvent::CacheMiss { cache } => match cache {
+                "direct-programs" | "t0-resident-programs" => {
+                    T0_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+                "t1-compressed-artifacts" => {
+                    T1_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+                "t2-content-store" => {
+                    T2_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            },
+            MetricEvent::CacheBypass { .. } => {
+                CACHE_BYPASSES.fetch_add(1, Ordering::Relaxed);
+            }
+            MetricEvent::CacheCorruption { .. } => {
+                CACHE_CORRUPTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            MetricEvent::CacheLatency {
+                operation,
+                elapsed_ns,
+                ..
+            } => {
+                let target = match operation {
+                    "compression" => &T_COMPRESS,
+                    "decompression" => &T_DECOMPRESS,
+                    "disk-read" => &T_DISK_READ,
+                    "disk-write" => &T_DISK_WRITE,
+                    "compile" => &T_COMPILE,
+                    "promotion" => &T_PROMOTE,
+                    "single-flight-wait" => &T_SINGLE_FLIGHT,
+                    "resident-rehydration" => &T_REHYDRATE,
+                    _ => return,
+                };
+                target.fetch_add(elapsed_ns, Ordering::Relaxed);
+            }
+            MetricEvent::CompressionRatio {
+                uncompressed_bytes,
+                compressed_bytes,
+            } => {
+                UNCOMPRESSED_BYTES.fetch_add(uncompressed_bytes, Ordering::Relaxed);
+                COMPRESSED_BYTES.fetch_add(compressed_bytes, Ordering::Relaxed);
+            }
+            MetricEvent::CacheBytes {
+                cache,
+                current_bytes,
+                budget_bytes,
+            } => {
+                if cache == "t1-compressed-artifacts" {
+                    T1_BYTES.store(current_bytes, Ordering::Relaxed);
+                    T1_BUDGET.store(budget_bytes, Ordering::Relaxed);
+                }
+            }
+            MetricEvent::CacheEviction { bytes, .. } => {
+                EVICTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn ms(ns: u64) -> f64 {
@@ -167,15 +434,18 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
     );
     let total = ti + td + to;
     let host = ti + to;
-    let (owned, bounced) = (
-        N_ARGS_OWNED.load(Ordering::Relaxed),
-        N_ARGS_BOUNCED.load(Ordering::Relaxed),
-    );
+    let direct = N_DIRECT_BINDINGS.load(Ordering::Relaxed);
+    let shared = N_SHARED_BINDINGS.load(Ordering::Relaxed);
+    let imported = N_IMPORTED_BINDINGS.load(Ordering::Relaxed);
+    let staged = N_STAGED_OCCURRENCES.load(Ordering::Relaxed);
+    let staged_allocations = N_STAGED_ALLOCATIONS.load(Ordering::Relaxed);
+    let staged_bytes = STAGED_BYTES.load(Ordering::Relaxed);
+    let staged_allocation_bytes = STAGED_ALLOCATION_BYTES.load(Ordering::Relaxed);
     let (bin, bout) = (
         BYTES_IN.load(Ordering::Relaxed),
         BYTES_OUT.load(Ordering::Relaxed),
     );
-    let args = owned + bounced;
+    let bindings = direct + shared + imported + staged;
 
     let s = alloc::format!(
         "\n[ggml-npu profile]  dispatches={n}   measured host+device wall={:.3} ms ({:.3} us/disp)\n\
@@ -185,7 +455,13 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
          \x20   \\- sync   (wait NPU)  : {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
          \x20 copy-out (bounce->host) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 ---- host copy total    : {:>9.3} ms  ({:.1}%)     device total: {:.3} ms ({:.1}%)\n\
-         \x20 args: {owned} owned (zero-copy) / {bounced} bounced  ({:.1}% zero-copy of {args})\n",
+         \x20 bindings: {direct} direct / {shared} shared / {imported} imported / {staged} staged occurrences ({:.1}% no-copy of {bindings})\n\
+         \x20 bounce allocations: {staged_allocations} unique, {:.2} MiB allocated; {:.2} MiB copied across occurrences\n\
+         \x20 direct memory: resident {:.2} MiB, resident high {:.2} MiB, accounted high {:.2} MiB, limit {:.2} MiB, evicted {:.2} MiB\n\
+         \x20 latest program: executable {:.2} MiB, bindings {:.2} MiB, HPI {:.2} MiB, command {:.2} MiB, preemption {:.2} MiB\n\
+         \x20 cache tiers: T0 {} hit / {} miss; T1 {} / {}; T2 {} / {}; bypasses {}; corruption {}\n\
+         \x20 cache latency: compress {:.3} ms, decompress {:.3} ms, disk read {:.3} ms, disk write {:.3} ms, compile {:.3} ms, promote {:.3} ms, flight wait {:.3} ms, rehydrate {:.3} ms\n\
+         \x20 compressed artifacts: {:.2} MiB / {:.2} MiB input ({:.3}x), T1 {:.2} / {:.2} MiB\n",
         ms(total),
         us_per(total, n),
         ms(ti),
@@ -209,7 +485,43 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         pct(host, total),
         ms(td),
         pct(td, total),
-        pct(owned, args.max(1)),
+        pct(direct + shared + imported, bindings.max(1)),
+        staged_allocation_bytes as f64 / 1.048576e6,
+        staged_bytes as f64 / 1.048576e6,
+        RESIDENT_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        RESIDENT_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        ACCOUNTED_HIGH_WATER.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        RESIDENT_LIMIT.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        EVICTED_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        EXECUTABLE_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        BINDING_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        HPI_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        COMMAND_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        PREEMPTION_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        T0_HITS.load(Ordering::Relaxed),
+        T0_MISSES.load(Ordering::Relaxed),
+        T1_HITS.load(Ordering::Relaxed),
+        T1_MISSES.load(Ordering::Relaxed),
+        T2_HITS.load(Ordering::Relaxed),
+        T2_MISSES.load(Ordering::Relaxed),
+        CACHE_BYPASSES.load(Ordering::Relaxed),
+        CACHE_CORRUPTIONS.load(Ordering::Relaxed),
+        ms(T_COMPRESS.load(Ordering::Relaxed)),
+        ms(T_DECOMPRESS.load(Ordering::Relaxed)),
+        ms(T_DISK_READ.load(Ordering::Relaxed)),
+        ms(T_DISK_WRITE.load(Ordering::Relaxed)),
+        ms(T_COMPILE.load(Ordering::Relaxed)),
+        ms(T_PROMOTE.load(Ordering::Relaxed)),
+        ms(T_SINGLE_FLIGHT.load(Ordering::Relaxed)),
+        ms(T_REHYDRATE.load(Ordering::Relaxed)),
+        COMPRESSED_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        UNCOMPRESSED_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        UNCOMPRESSED_BYTES.load(Ordering::Relaxed) as f64
+            / COMPRESSED_BYTES.load(Ordering::Relaxed).max(1) as f64,
+        T1_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,
+        T1_BUDGET.load(Ordering::Relaxed) as f64 / 1.048576e6,
     );
-    unsafe { write(2, s.as_ptr(), s.len()) };
+    crate::host::builtin()
+        .diagnostics()
+        .write_stderr(s.as_bytes());
 }

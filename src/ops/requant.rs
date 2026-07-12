@@ -23,6 +23,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ffi::{ggml_get_type_traits, GGML_TYPE_F32};
+use crate::host::{HostEnvironment, MathService};
 use crate::ops::Operand;
 
 /// A weight re-quantized to a grouped low-bit form. `weight` is `[N, K]` row-major, one value per
@@ -87,7 +88,13 @@ unsafe fn to_f32(weight: &Operand, elems: usize) -> Option<Vec<f32>> {
 /// Re-quantize `weight` (`[N, K]` row-major) to `bits`-wide grouped form. `asymmetric` → unsigned
 /// `q` + per-group zero-point (canonical, compressible); else symmetric signed. `bits == 16` → f16.
 /// `None` if the source can't be materialized or K isn't groupable (caller → CPU).
-pub fn requant(weight: &Operand, k: usize, n: usize, bits: i32, asymmetric: bool) -> Option<Requant> {
+pub fn requant(
+    weight: &Operand,
+    k: usize,
+    n: usize,
+    bits: i32,
+    asymmetric: bool,
+) -> Option<Requant> {
     if k == 0 || n == 0 || weight.ptr.is_null() {
         return None;
     }
@@ -100,7 +107,13 @@ pub fn requant(weight: &Operand, k: usize, n: usize, bits: i32, asymmetric: bool
         for &v in &f {
             push_f16(&mut wq, v);
         }
-        return Some(Requant { weight: wq, zeros: Vec::new(), scales: Vec::new(), bits: 16, group: 0 });
+        return Some(Requant {
+            weight: wq,
+            zeros: Vec::new(),
+            scales: Vec::new(),
+            bits: 16,
+            group: 0,
+        });
     }
 
     let group = pick_group(k)?;
@@ -173,23 +186,20 @@ pub fn requant(weight: &Operand, k: usize, n: usize, bits: i32, asymmetric: bool
         }
     }
 
-    Some(Requant { weight: wq, zeros, scales, bits, group: group as i32 })
+    Some(Requant {
+        weight: wq,
+        zeros,
+        scales,
+        bits,
+        group: group as i32,
+    })
 }
 
-// The scalar float ops `core` doesn't expose (they may lower to libm) resolve from the host's libm
-// at dlopen — the same way `malloc`/`getenv`/`clock_gettime` do elsewhere, so the crate keeps its
-// zero runtime Cargo deps. `roundf` is round-half-away-from-zero, matching the quantizer's rounding.
-extern "C" {
-    fn roundf(x: f32) -> f32;
-    fn fabsf(x: f32) -> f32;
-}
-
-/// Round half away from zero to `i32` (host libm `roundf`).
+/// Round half away from zero to `i32` through the selected host math service.
 fn round_i(v: f32) -> i32 {
-    unsafe { roundf(v) as i32 }
+    crate::host::builtin().math().round_f32(v) as i32
 }
 
-/// `|x|` (host libm `fabsf`).
 fn fabs(x: f32) -> f32 {
-    unsafe { fabsf(x) }
+    x.abs()
 }

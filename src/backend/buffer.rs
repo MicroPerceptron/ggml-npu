@@ -9,6 +9,7 @@
 
 use core::ffi::{c_char, c_void};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::ffi::*;
 
@@ -17,6 +18,21 @@ use crate::ffi::*;
 /// every bound argument pointer (`base + offset`) is page-aligned, which the NPU DMA path wants.
 /// Weights are large, so the padding is negligible.
 const BUFFER_ALIGN: usize = 4096;
+
+/// Generation of model-resident NPU buffers. Compiled graphs bake model weights, so an address is
+/// only a valid identity within the lifetime of the buffer allocation that owns it. Incrementing
+/// this generation on buffer destruction prevents a later model allocation at the same virtual
+/// address from reusing a graph with stale baked weights.
+static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn generation() -> u64 {
+    BUFFER_GENERATION.load(Ordering::Acquire)
+}
+
+pub(super) fn allocated_bytes() -> usize {
+    ALLOCATED_BYTES.load(Ordering::Acquire)
+}
 
 // ---------------------------------------------------------------------------
 // Buffer type
@@ -48,6 +64,7 @@ unsafe extern "C" fn buft_alloc_buffer(
     if base.is_null() {
         return ptr::null_mut();
     }
+    ALLOCATED_BYTES.fetch_add(size, Ordering::AcqRel);
     // ggml constructs the ggml_backend_buffer; its `context` is our base pointer,
     // which buffer_get_base returns.
     ggml_backend_buffer_init(buft, BUFFER_IFACE, base, size)
@@ -87,8 +104,10 @@ unsafe extern "C" fn buffer_free_buffer(buffer: ggml_backend_buffer_t) {
         return;
     }
     if let Some(v) = crate::vendor::present() {
-        v.free_host(base);
+        v.free_host(base, (*buffer).size);
     }
+    ALLOCATED_BYTES.fetch_sub((*buffer).size, Ordering::AcqRel);
+    BUFFER_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 unsafe extern "C" fn buffer_get_base(buffer: ggml_backend_buffer_t) -> *mut c_void {

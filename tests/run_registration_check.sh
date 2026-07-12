@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 gate: compile the self-contained loader harness and run it against the
+# Registration gate: compile the self-contained loader harness and run it against the
 # built cdylib. Mimics ggml's dynamic-backend loader without building llama.cpp.
 #
 # Usage: ./tests/run_registration_check.sh [path/to/libggml_npu.so]
@@ -27,4 +27,7 @@ CC="${CC:-cc}"
 "$CC" -rdynamic -Wall -I"$GGML/ggml/include" -I"$GGML/ggml/src" \
     "$CRATE/tests/registration_check.c" -o "$OUTDIR/registration_check" -ldl
 
-exec "$OUTDIR/registration_check" "$SO"
+env -u GGML_NPU_DEVICE_CLASS "$OUTDIR/registration_check" "$SO"
+for cls in accel gpu igpu npu; do
+    GGML_NPU_DEVICE_CLASS="$cls" "$OUTDIR/registration_check" "$SO"
+done

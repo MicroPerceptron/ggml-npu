@@ -128,6 +128,16 @@ pub(crate) unsafe fn owns_tensor(tensor: *const ggml_tensor) -> bool {
     !buf.is_null() && (*buf).buft == buffer_type()
 }
 
+/// Identity epoch for model-resident NPU buffers. Graph caches include this value because their
+/// programs bake weights and therefore must not survive an unload/reload address reuse.
+pub(crate) fn buffer_generation() -> u64 {
+    buffer::generation()
+}
+
+pub(crate) fn allocated_bytes() -> usize {
+    buffer::allocated_bytes()
+}
+
 fn backend_instance() -> *mut ggml_backend {
     unsafe { &mut (*get_or_init()).backend }
 }
