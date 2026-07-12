@@ -60,14 +60,48 @@ unsafe fn has_shortconv_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
             .any(|src| has_shortconv_ancestor(src, depth - 1))
 }
 
+/// LFM ShortConv recurrent cache is `cache_r_lN` (see llama.cpp `pattern_r_cache`). Attention KV
+/// uses `cache_k` / `cache_v` and must stay out of this opt-in pull path (#9 / #10).
+unsafe fn touches_shortconv_state(t: *const ggml_tensor) -> bool {
+    if t.is_null() {
+        return false;
+    }
+    if name_contains(t, b"cache_r") {
+        return true;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| name_contains(src, b"cache_r"))
+}
+
+fn is_shortconv_state_op(op: ggml_op) -> bool {
+    matches!(
+        op,
+        GGML_OP_SSM_CONV | GGML_OP_SET_ROWS | GGML_OP_GET_ROWS | GGML_OP_CPY
+    )
+}
+
 unsafe fn is_shortconv_candidate(t: *const ggml_tensor) -> bool {
     // Explicit architecture boundaries stop ancestry from leaking through the residual stream
     // into the following FFN/attention block. Depth 12 covers LFM ShortConv gather/state spans
     // that previously fragmented across CPU/NPU when ancestry stopped at 6 (#5).
+    // Gather/write of `cache_r*` often sits *before* SSM_CONV in the DAG (no conv ancestor), so
+    // also admit those state edges by cache name (#9).
     !name_contains(t, b"ffn")
         && !name_contains(t, b"self_attn")
         && !name_contains(t, b"operator_norm")
-        && has_shortconv_ancestor(t, 12)
+        && (has_shortconv_ancestor(t, 12) || touches_shortconv_state(t))
+}
+
+fn shortconv_should_pull(placement: PlacementClass, op: ggml_op) -> bool {
+    match placement {
+        // Stateful SET_ROWS / SSM_CONV are first-class ShortConv state edges; other Stateful
+        // ops stay gated so attention-side state does not ride this opt-in.
+        PlacementClass::Stateful => is_shortconv_state_op(op),
+        _ => true,
+    }
 }
 
 unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
@@ -202,7 +236,7 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     if crate::host::builtin()
         .config()
         .is_set(c"GGML_NPU_LFM_SHORTCONV")
-        && (spec.placement != PlacementClass::Stateful || x.op == GGML_OP_SSM_CONV)
+        && shortconv_should_pull(spec.placement, x.op)
         && is_shortconv_candidate(node)
     {
         return true;
@@ -216,7 +250,7 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         // dispatches merely because force mode was requested. Depth matches supports_region (#5).
         return match spec.placement {
             PlacementClass::Anchor | PlacementClass::StandaloneIfProfitable => true,
-            PlacementClass::Stateful => x.op == GGML_OP_SSM_CONV,
+            PlacementClass::Stateful => is_shortconv_state_op(x.op),
             PlacementClass::FusibleOnly | PlacementClass::Metadata => has_anchor_ancestor(node, 12),
         };
     }
@@ -337,6 +371,31 @@ mod tests {
             PlacementClass::Anchor,
             true,
             true
+        ));
+    }
+
+    #[test]
+    fn shortconv_opt_in_pulls_stateful_set_rows_and_ssm_conv() {
+        assert!(shortconv_should_pull(
+            PlacementClass::Stateful,
+            GGML_OP_SSM_CONV
+        ));
+        assert!(shortconv_should_pull(
+            PlacementClass::Stateful,
+            GGML_OP_SET_ROWS
+        ));
+        assert!(shortconv_should_pull(
+            PlacementClass::FusibleOnly,
+            GGML_OP_GET_ROWS
+        ));
+        assert!(shortconv_should_pull(
+            PlacementClass::FusibleOnly,
+            GGML_OP_CPY
+        ));
+        // Unknown Stateful ops stay refused under the ShortConv opt-in.
+        assert!(!shortconv_should_pull(
+            PlacementClass::Stateful,
+            GGML_OP_FLASH_ATTN_EXT
         ));
     }
 }

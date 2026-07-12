@@ -340,13 +340,12 @@ fn traits_for(wire: WireOp) -> OpTraits {
             WireOp::Reshape | WireOp::View | WireOp::Cont | WireOp::Transpose | WireOp::Permute
         ),
         stateful: matches!(wire, WireOp::SsmConv | WireOp::SetRows),
+        // SetRows is mutable-state scatter (ShortConv / recurrent caches), not attention.
+        // Gating it behind GGML_NPU_ATTENTION=full forced ShortConv state-write regions onto
+        // CPU islands (#9). Attention KV writes remain optional via SoftMax/FA/Rope policy.
         attention: matches!(
             wire,
-            WireOp::Rope
-                | WireOp::SoftMax
-                | WireOp::Permute
-                | WireOp::FlashAttention
-                | WireOp::SetRows
+            WireOp::Rope | WireOp::SoftMax | WireOp::Permute | WireOp::FlashAttention
         ),
         moe: matches!(
             wire,
@@ -1212,8 +1211,8 @@ mod tests {
         );
         assert_eq!(
             decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3)
-                .map(|spec| (spec.wire, spec.traits.stateful)),
-            Ok((WireOp::SetRows, true))
+                .map(|spec| (spec.wire, spec.traits.stateful, spec.traits.attention)),
+            Ok((WireOp::SetRows, true, false))
         );
     }
 
@@ -1240,5 +1239,96 @@ mod tests {
             decode_spec(GGML_OP_SSM_CONV, 0, 0.0, 0, 2).map(|spec| spec.placement),
             Ok(PlacementClass::Stateful)
         );
+    }
+
+    #[test]
+    fn connected_shortconv_gather_conv_write_stays_one_region() {
+        // LFM ShortConv-shaped DAG: gather state → SSM_CONV → SetRows writeback.
+        // Connected mutable effects must not open a MutableStateBoundary (#9).
+        let mut state_in = value(TensorRole::MutableState, 1, Dim::Static(4));
+        state_in.owned = true;
+        let values = vec![
+            state_in,                                                 // 0 base state
+            value(TensorRole::RuntimeInput, 2, Dim::Static(2)),       // 1 gather indices
+            value(TensorRole::Intermediate, 3, Dim::Static(4)),       // 2 gathered rows
+            value(TensorRole::Constant, 4, Dim::Static(3)),           // 3 conv kernel
+            value(TensorRole::Intermediate, 5, Dim::Static(2)),       // 4 conv output
+            value(TensorRole::RuntimeInput, 6, Dim::Static(2)),       // 5 write indices
+            value(TensorRole::MutableState, 7, Dim::Static(4)),       // 6 written state
+        ];
+        let get_rows = Node {
+            op: GGML_OP_GET_ROWS,
+            spec: decode_spec(GGML_OP_GET_ROWS, 0, 0.0, 0, 2),
+            inputs: vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let ssm = Node {
+            op: GGML_OP_SSM_CONV,
+            spec: decode_spec(GGML_OP_SSM_CONV, 0, 0.0, 0, 2),
+            inputs: vec![2, 3],
+            output: 4,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let set_rows = Node {
+            op: GGML_OP_SET_ROWS,
+            spec: decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3),
+            inputs: vec![4, 5, 0],
+            output: 6,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![get_rows, ssm, set_rows],
+            inputs: vec![0, 1, 3, 5],
+            outputs: vec![6],
+        };
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].graph.nodes.len(), 3);
+        assert_eq!(regions[0].reason, PartitionReason::WholeGraph);
+    }
+
+    #[test]
+    fn disconnected_mutable_state_effects_still_partition() {
+        let mut state_a = value(TensorRole::MutableState, 1, Dim::Static(4));
+        state_a.owned = true;
+        let mut state_b = value(TensorRole::MutableState, 2, Dim::Static(4));
+        state_b.owned = true;
+        let values = vec![
+            state_a,                                                  // 0
+            value(TensorRole::RuntimeInput, 3, Dim::Static(2)),       // 1 updates a
+            value(TensorRole::RuntimeInput, 4, Dim::Static(1)),       // 2 indices a
+            value(TensorRole::MutableState, 5, Dim::Static(4)),       // 3 written a
+            state_b,                                                  // 4
+            value(TensorRole::RuntimeInput, 6, Dim::Static(2)),       // 5 updates b
+            value(TensorRole::RuntimeInput, 7, Dim::Static(1)),       // 6 indices b
+            value(TensorRole::MutableState, 8, Dim::Static(4)),       // 7 written b
+        ];
+        let first = Node {
+            op: GGML_OP_SET_ROWS,
+            spec: decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3),
+            inputs: vec![1, 2, 0],
+            output: 3,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let second = Node {
+            op: GGML_OP_SET_ROWS,
+            spec: decode_spec(GGML_OP_SET_ROWS, 0, 0.0, 0, 3),
+            inputs: vec![5, 6, 4],
+            output: 7,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![first, second],
+            inputs: vec![0, 1, 2, 4, 5, 6],
+            outputs: vec![3, 7],
+        };
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].reason, PartitionReason::MutableStateBoundary);
     }
 }
