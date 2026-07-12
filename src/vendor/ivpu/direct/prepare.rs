@@ -89,6 +89,13 @@ pub struct BindingBuffer<'device> {
     pub host_address: Option<core::ptr::NonNull<u8>>,
 }
 
+/// Host-side state that lets a prepared program re-JIT IO bindings without re-staging the ELF.
+/// Only retained for small artifacts so warm reuse cannot double-keep baked-weight blobs (#5).
+pub struct WarmRebindState {
+    pub pre_jit_sections: Vec<(usize, Vec<u8>)>,
+    pub jit_relocations: usize,
+}
+
 pub struct PreparedInference<'device> {
     pub staged: StagedProgram<'device>,
     pub bindings: Vec<BindingBuffer<'device>>,
@@ -106,6 +113,7 @@ pub struct PreparedInference<'device> {
     pub inference_id: u64,
     pub command_digest: SemanticDigest,
     pub timings: PreparationTimings,
+    pub warm_rebind: Option<WarmRebindState>,
 }
 
 impl PreparedInference<'_> {
@@ -710,6 +718,18 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
     let (bindings, binding_placements, binding_bo_bytes, mut timings) =
         create_bindings(device, &requirements, input_data, input_views, output_views)?;
     timings.stage_program_ns = stage_program_ns;
+    let jit_relocations = staged.jit_relocations;
+    let warm_rebind = if jit_relocations > 0 {
+        match staged.snapshot_logical_bytes() {
+            Ok(pre_jit_sections) => Some(WarmRebindState {
+                pre_jit_sections,
+                jit_relocations,
+            }),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let started = if measure {
         super::super::profile::now_ns()
     } else {
@@ -912,12 +932,88 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
         inference_id,
         command_digest,
         timings,
+        warm_rebind,
     };
     prepared.zero_outputs()?;
     if !prepared.outputs_are_zero()? {
         return Err(PrepareError::InvalidMetadata);
     }
     Ok(prepared)
+}
+
+fn rebuild_handles(
+    staged: &StagedProgram<'_>,
+    hpi: &BufferObject<'_>,
+    command: &BufferObject<'_>,
+    bindings: &[BindingBuffer<'_>],
+) -> Result<Vec<u32>, PrepareError> {
+    let handle_count = 1 + staged.sections().len() + 1 + bindings.len();
+    if handle_count > MAX_PREPARED_HANDLES {
+        return Err(PrepareError::BudgetExceeded);
+    }
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(handle_count)
+        .map_err(|_| PrepareError::Allocation)?;
+    handles.push(command.handle());
+    handles.extend(staged.sections().iter().map(|section| section.bo.handle()));
+    handles.push(hpi.handle());
+    for binding in bindings {
+        let handle = binding.bo.handle();
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
+    for (index, &handle) in handles.iter().enumerate() {
+        if handle == 0 || handles[..index].contains(&handle) {
+            return Err(PrepareError::InvalidMetadata);
+        }
+    }
+    Ok(handles)
+}
+
+/// Re-JIT IO bindings onto an already-staged program using its warm pre-JIT snapshot.
+/// Keeps executable/HPI/command BOs; only binding imports and JIT patches change (#5).
+pub(in crate::vendor::ivpu) fn rebind_inference_shared<'device>(
+    device: &'device IvpuDevice,
+    prepared: &mut PreparedInference<'device>,
+    elf: &ParsedIntelElf<'_>,
+    input_data: &[&[u8]],
+    input_views: &[Option<SharedAllocationView>],
+    output_views: &[Option<SharedAllocationView>],
+) -> Result<(), PrepareError> {
+    let warm = prepared
+        .warm_rebind
+        .as_ref()
+        .ok_or(PrepareError::InvalidMetadata)?;
+    prepared
+        .staged
+        .restore_logical_bytes(&warm.pre_jit_sections, warm.jit_relocations)
+        .map_err(PrepareError::Load)?;
+    let requirements = collect_bindings(elf)?;
+    let (bindings, binding_placements, binding_bo_bytes, _) =
+        create_bindings(device, &requirements, input_data, input_views, output_views)?;
+    prepared
+        .staged
+        .apply_jit_bindings(elf, &binding_placements)
+        .map_err(PrepareError::Load)?;
+    let handles = rebuild_handles(&prepared.staged, &prepared.hpi, &prepared.command, &bindings)?;
+    let total_user_bo_bytes = prepared
+        .executable_bo_bytes
+        .checked_add(binding_bo_bytes)
+        .and_then(|total| total.checked_add(prepared.hpi_bo_bytes))
+        .and_then(|total| total.checked_add(prepared.command_bo_bytes))
+        .ok_or(PrepareError::BudgetExceeded)?;
+    let total_accounted_bytes = total_user_bo_bytes
+        .checked_add(prepared.preemption_bytes)
+        .ok_or(PrepareError::BudgetExceeded)?;
+    prepared.bindings = bindings;
+    prepared.handles = handles;
+    prepared.binding_bo_bytes = binding_bo_bytes;
+    prepared.total_user_bo_bytes = total_user_bo_bytes;
+    prepared.total_accounted_bytes = total_accounted_bytes;
+    prepared.zero_outputs()?;
+    Ok(())
 }
 
 #[cfg(test)]

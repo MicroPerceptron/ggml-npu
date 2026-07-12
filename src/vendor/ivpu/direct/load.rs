@@ -63,6 +63,54 @@ impl StagedProgram<'_> {
         drop(self);
     }
 
+    /// Host copy of each section's logical bytes after static link and before JIT binding patches.
+    /// Used to re-apply JIT for a new IO binding set without re-staging the ELF (#5 warm reuse).
+    pub fn snapshot_logical_bytes(&self) -> Result<Vec<(usize, Vec<u8>)>, LoadError> {
+        let mut snap = Vec::new();
+        snap.try_reserve_exact(self.sections.len())
+            .map_err(|_| LoadError::Allocation)?;
+        for section in &self.sections {
+            let mapping = section.bo.map(false).map_err(LoadError::Runtime)?;
+            let logical =
+                usize::try_from(section.logical_bytes).map_err(|_| LoadError::InvalidSection)?;
+            if logical > mapping.len() {
+                return Err(LoadError::InvalidSection);
+            }
+            acquire_device_writes();
+            // SAFETY: read-only copy of the live, bounds-checked mapping.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(mapping.address().as_ptr(), logical) };
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(logical)
+                .map_err(|_| LoadError::Allocation)?;
+            owned.extend_from_slice(bytes);
+            snap.push((section.section, owned));
+        }
+        Ok(snap)
+    }
+
+    pub fn restore_logical_bytes(
+        &mut self,
+        snapshot: &[(usize, Vec<u8>)],
+        jit_relocations: usize,
+    ) -> Result<(), LoadError> {
+        if snapshot.len() != self.sections.len() {
+            return Err(LoadError::InvalidSection);
+        }
+        for (section, bytes) in self.sections.iter().zip(snapshot.iter()) {
+            if section.section != bytes.0
+                || bytes.1.len() as u64 != section.logical_bytes
+            {
+                return Err(LoadError::InvalidSection);
+            }
+            stage_bytes(section, Some(&bytes.1))?;
+        }
+        self.jit_relocations = jit_relocations;
+        self.linked_digest = linked_digest(&self.sections)?;
+        Ok(())
+    }
+
     pub fn apply_jit_bindings(
         &mut self,
         elf: &ParsedIntelElf<'_>,
