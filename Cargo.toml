@@ -9,7 +9,7 @@ publish = false
 [lib]
 # What ggml dlopens. Cargo emits `libggml_npu.so` (underscore); load it explicitly
 # via GGML_BACKEND_PATH, so the exact filename does not matter for discovery.
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["direct-ivpu"]
@@ -18,6 +18,7 @@ direct-ivpu = ["dep:goblin"]
 level-zero-compat = []
 bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
+test-support = []
 
 [dependencies]
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
@@ -53,6 +54,11 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "async_runtime"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "artifact_cache"
 harness = false
 required-features = ["bench"]
@@ -61,3 +67,7 @@ required-features = ["bench"]
 name = "hardware"
 harness = false
 required-features = ["bench-hardware"]
+
+[[test]]
+name = "async_runtime"
+required-features = ["test-support"]

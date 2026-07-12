@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod artifact;
+pub mod async_runtime;
 
 use core::fmt;
 use core::num::NonZeroU64;

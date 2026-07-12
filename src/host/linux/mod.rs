@@ -7,9 +7,12 @@ pub(crate) mod file;
 pub(crate) mod ioctl;
 pub(crate) mod mapping;
 mod process;
+mod reactor;
+mod wait;
 
 pub(crate) use process::LinuxLibrary as BuiltinLibrary;
 
+use super::async_services::CallerDrivenBlockingFactory;
 use super::HostEnvironment;
 use cache::{LinuxArtifactStore, LinuxCompression, LinuxWait};
 use file::LinuxFiles;
@@ -17,6 +20,7 @@ use process::{
     LinuxAllocator, LinuxArtifacts, LinuxClock, LinuxConfig, LinuxDiagnostics, LinuxLibraries,
     LinuxMath, LinuxMemoryStatus,
 };
+use reactor::LinuxReactorFactory;
 
 pub(crate) const ERROR_DOMAIN: u32 = u32::from_be_bytes(*b"LNX ");
 
@@ -30,6 +34,9 @@ pub(crate) struct BuiltinHost {
     diagnostics: LinuxDiagnostics,
     allocator: LinuxAllocator,
     libraries: LinuxLibraries,
+    atomic_wait: wait::LinuxAtomicWait,
+    reactor_factory: LinuxReactorFactory,
+    blocking_executor_factory: CallerDrivenBlockingFactory,
     compression: LinuxCompression,
     artifact_cache: LinuxArtifactStore,
     wait: LinuxWait,
@@ -45,6 +52,9 @@ impl HostEnvironment for BuiltinHost {
     type Diagnostics = LinuxDiagnostics;
     type Allocator = LinuxAllocator;
     type Libraries = LinuxLibraries;
+    type AtomicWait = wait::LinuxAtomicWait;
+    type ReactorFactory = LinuxReactorFactory;
+    type BlockingExecutorFactory = CallerDrivenBlockingFactory;
     type Compression = LinuxCompression;
     type ArtifactCache = LinuxArtifactStore;
     type Wait = LinuxWait;
@@ -85,6 +95,18 @@ impl HostEnvironment for BuiltinHost {
         &self.libraries
     }
 
+    fn atomic_wait(&self) -> &Self::AtomicWait {
+        &self.atomic_wait
+    }
+
+    fn reactor_factory(&self) -> &Self::ReactorFactory {
+        &self.reactor_factory
+    }
+
+    fn blocking_executor_factory(&self) -> &Self::BlockingExecutorFactory {
+        &self.blocking_executor_factory
+    }
+
     fn compression(&self) -> &Self::Compression {
         &self.compression
     }
@@ -108,6 +130,9 @@ static BUILTIN: BuiltinHost = BuiltinHost {
     diagnostics: LinuxDiagnostics,
     allocator: LinuxAllocator,
     libraries: LinuxLibraries,
+    atomic_wait: wait::LinuxAtomicWait,
+    reactor_factory: LinuxReactorFactory,
+    blocking_executor_factory: CallerDrivenBlockingFactory,
     compression: LinuxCompression,
     artifact_cache: LinuxArtifactStore::from_environment(),
     wait: LinuxWait,
