@@ -184,72 +184,199 @@ static std::shared_ptr<ov::Node> reshape_output(const ov::Output<ov::Node>& x,
     return std::make_shared<ov::op::v1::Reshape>(x, c, false);
 }
 
-// Build the dequantized f16 weight node `[N, K]` for a baked Constant. bits 16 → f16 Constant (no
-// dequant). bits 8/4 → grouped low-bit Constant `[N, K/group, group]` + per-group f16 scale, dequant
-// in-graph. `zeros != nullptr` selects the **canonical asymmetric-unsigned** form the NPU compiler
-// keeps compressed (u4/u8 stays low-bit in device memory, dequant fused in-kernel):
-//   `(Convert(u4 weight) - Convert(u4 zero)) * f16 scale`.
-// `zeros == nullptr` is the symmetric signed form (i4/i8, no zero-point). The weight/zeros arrive
-// **unpacked** (one value per byte); `Constant::create` packs the sub-byte types. Returns nullptr on
-// a bad request. Shared by the single-matmul and fused-subgraph compile paths.
-static std::shared_ptr<ov::Node> make_weight(int32_t bits, int32_t group, int64_t N, int64_t K,
-                                             const uint8_t* weight, const uint8_t* scales,
-                                             const uint8_t* zeros) {
-    namespace v0 = ov::op::v0;
-    namespace v1 = ov::op::v1;
-    if (bits == 16) {
-        return std::make_shared<v0::Constant>(ov::element::f16, ov::Shape{(size_t)N, (size_t)K},
-                                              (const void*)weight);
-    }
-    if (!scales || group <= 0 || K % group != 0) {
-        return nullptr;
-    }
-    const int64_t KG = K / group;
-    const bool asym = (zeros != nullptr);
-    const ov::Shape wshape{(size_t)N, (size_t)KG, (size_t)group};
-    const ov::Shape gshape{(size_t)N, (size_t)KG, 1};
+enum npu_numeric_kind { NPU_NUMERIC_FLOAT = 0, NPU_NUMERIC_INTEGER = 1 };
+enum npu_signedness { NPU_SIGN_NONE = 0, NPU_UNSIGNED = 1, NPU_SIGNED = 2 };
+enum npu_packing { NPU_UNPACKED = 0, NPU_DENSE_LSB = 1 };
+enum npu_scale_encoding {
+    NPU_SCALE_NONE = 0,
+    NPU_SCALE_GROUP_F16 = 1,
+    NPU_SCALE_BLOCK_F16_GROUP_U8 = 2,
+    NPU_SCALE_BLOCK_F16_GROUP_I8 = 3,
+};
+enum npu_offset_encoding {
+    NPU_OFFSET_NONE = 0,
+    NPU_OFFSET_ZERO_U8 = 1,
+    NPU_OFFSET_NEG_BLOCK_F16_GROUP_U8 = 2,
+};
+enum npu_exactness { NPU_REQUANTIZED = 0, NPU_SOURCE_NUMERIC = 1, NPU_SOURCE_BYTES = 2 };
 
-    if (std::getenv("GGML_NPU_DEBUG")) {
-        std::fprintf(stderr, "[mw] bits=%d group=%d N=%ld K=%ld asym=%d  w[0..7]=", bits, group, (long)N, (long)K, asym);
-        for (int i = 0; i < 8 && i < N * K; i++) std::fprintf(stderr, "%u ", weight[i]);
-        std::fprintf(stderr, " zp[0..3]=");
-        for (int i = 0; zeros && i < 4; i++) std::fprintf(stderr, "%u ", zeros[i]);
-        const uint16_t* sh = (const uint16_t*)scales;
-        std::fprintf(stderr, " sc[0..3]=");
-        for (int i = 0; i < 4; i++) std::fprintf(stderr, "%.4f ", (float)*(const ov::float16*)&sh[i]);
-        std::fprintf(stderr, "\n");
-    }
+// Compiler-facing constant contract. It intentionally contains semantic fields rather than source
+// format or Intel names; this shim alone maps the contract to OpenVINO graph patterns.
+struct npu_constant_desc {
+    int32_t numeric_kind, bit_width, storage_bits, signedness;
+    int32_t block_elems, group_elems, packing;
+    int32_t scale_encoding, offset_encoding, exactness;
+    const uint8_t* values;
+    size_t values_len;
+    const uint8_t* scale_base;
+    size_t scale_base_len;
+    const uint8_t* scale_factor;
+    size_t scale_factor_len;
+    const uint8_t* offset_base;
+    size_t offset_base_len;
+    const uint8_t* offset_factor;
+    size_t offset_factor_len;
+};
 
-    // Weight Constant (unsigned when asymmetric, signed otherwise). int4/int8 arrive unpacked.
-    std::shared_ptr<ov::Node> bc;
-    if (bits == 4) {
-        if (asym) {
-            std::vector<uint8_t> v(weight, weight + (size_t)N * K);
-            bc = v0::Constant::create(ov::element::u4, wshape, v);
-        } else {
-            std::vector<int8_t> v(reinterpret_cast<const int8_t*>(weight),
-                                  reinterpret_cast<const int8_t*>(weight) + (size_t)N * K);
-            bc = v0::Constant::create(ov::element::i4, wshape, v);
+static bool expected_packed_bytes(size_t count, int32_t bits, size_t& bytes) {
+    if (bits <= 0 || bits > 16 || count > (SIZE_MAX - 7) / (size_t)bits) return false;
+    bytes = (count * (size_t)bits + 7) / 8;
+    return true;
+}
+
+static uint16_t packed_value(const uint8_t* source, size_t index, int32_t bits) {
+    const size_t bit = index * (size_t)bits;
+    const size_t byte = bit / 8;
+    const int shift = (int)(bit % 8);
+    uint16_t value = (uint16_t)(source[byte] >> shift);
+    if (shift + bits > 8) value |= (uint16_t)source[byte + 1] << (8 - shift);
+    return value & (uint16_t)((1u << bits) - 1u);
+}
+
+static bool unpack_integers(const npu_constant_desc& desc, size_t count,
+                            std::vector<uint8_t>& unsigned_values,
+                            std::vector<int8_t>& signed_values) {
+    size_t expected = 0;
+    if (desc.packing == NPU_DENSE_LSB) {
+        if (!expected_packed_bytes(count, desc.storage_bits, expected) ||
+            desc.values_len != expected || desc.storage_bits != desc.bit_width) return false;
+    } else if (desc.packing == NPU_UNPACKED) {
+        expected = count;
+        if (desc.values_len != expected || desc.storage_bits != 8) return false;
+    } else {
+        return false;
+    }
+    if (desc.signedness == NPU_SIGNED) {
+        signed_values.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            uint8_t raw = desc.packing == NPU_DENSE_LSB
+                ? (uint8_t)packed_value(desc.values, i, desc.bit_width)
+                : desc.values[i];
+            if (desc.bit_width < 8) {
+                const int shift = 8 - desc.bit_width;
+                signed_values[i] = (int8_t)((int8_t)(raw << shift) >> shift);
+            } else {
+                signed_values[i] = (int8_t)raw;
+            }
+        }
+    } else if (desc.signedness == NPU_UNSIGNED) {
+        unsigned_values.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            unsigned_values[i] = desc.packing == NPU_DENSE_LSB
+                ? (uint8_t)packed_value(desc.values, i, desc.bit_width)
+                : desc.values[i];
         }
     } else {
-        bc = std::make_shared<v0::Constant>(asym ? ov::element::u8 : ov::element::i8, wshape,
-                                            (const void*)weight);
+        return false;
     }
-    std::shared_ptr<ov::Node> deq = std::make_shared<v0::Convert>(bc, ov::element::f16);
+    return true;
+}
 
-    if (asym) {
-        std::shared_ptr<ov::Node> zc;
-        if (bits == 4) {
-            std::vector<uint8_t> z(zeros, zeros + (size_t)N * KG);
-            zc = v0::Constant::create(ov::element::u4, gshape, z);
-        } else {
-            zc = std::make_shared<v0::Constant>(ov::element::u8, gshape, (const void*)zeros);
-        }
-        auto zcf = std::make_shared<v0::Convert>(zc, ov::element::f16);
-        deq = std::make_shared<v1::Subtract>(deq, zcf);
+static std::shared_ptr<ov::Node> integer_constant(const npu_constant_desc& desc,
+                                                  const ov::Shape& shape, size_t count) {
+    namespace v0 = ov::op::v0;
+    std::vector<uint8_t> unsigned_values;
+    std::vector<int8_t> signed_values;
+    if (!desc.values || !unpack_integers(desc, count, unsigned_values, signed_values)) return nullptr;
+    if (desc.signedness == NPU_UNSIGNED && desc.bit_width == 4) {
+        return v0::Constant::create(ov::element::u4, shape, unsigned_values);
     }
-    auto sc = std::make_shared<v0::Constant>(ov::element::f16, gshape, (const void*)scales);
-    return reshape_to(std::make_shared<v1::Multiply>(deq, sc), {N, K});
+    if (desc.signedness == NPU_SIGNED && desc.bit_width == 4) {
+        return v0::Constant::create(ov::element::i4, shape, signed_values);
+    }
+    if (desc.signedness == NPU_SIGNED) {
+        return v0::Constant::create(ov::element::i8, shape, signed_values);
+    }
+    return v0::Constant::create(ov::element::u8, shape, unsigned_values);
+}
+
+// Build the dequantized f16 `[N,K]` constant. Source-native affine metadata remains factorized:
+// Q4-style values use `q * (block_scale * group_scale) - block_min * group_min`; signed values use
+// `q * (block_scale * group_scale)`. Canonical fallback retains `(q-zero)*scale` byte-for-byte.
+static std::shared_ptr<ov::Node> make_weight(const npu_constant_desc& desc, int64_t N, int64_t K) {
+    namespace v0 = ov::op::v0;
+    namespace v1 = ov::op::v1;
+    if (N <= 0 || K <= 0 || !desc.values) return nullptr;
+    const size_t count = (size_t)N * (size_t)K;
+    if (desc.numeric_kind == NPU_NUMERIC_FLOAT) {
+        if (desc.bit_width != 16 || desc.storage_bits != 16 || desc.packing != NPU_UNPACKED ||
+            desc.values_len != count * 2 || desc.scale_encoding != NPU_SCALE_NONE ||
+            desc.offset_encoding != NPU_OFFSET_NONE) return nullptr;
+        return std::make_shared<v0::Constant>(ov::element::f16, ov::Shape{(size_t)N, (size_t)K},
+                                              (const void*)desc.values);
+    }
+    if (desc.numeric_kind != NPU_NUMERIC_INTEGER || desc.group_elems <= 0 ||
+        desc.block_elems <= 0 || K % desc.block_elems != 0 ||
+        desc.block_elems % desc.group_elems != 0) {
+        return nullptr;
+    }
+    const int64_t blocks = K / desc.block_elems;
+    const int64_t groups_per_block = desc.block_elems / desc.group_elems;
+    const int64_t groups = K / desc.group_elems;
+    const ov::Shape wshape{
+        (size_t)N, (size_t)blocks, (size_t)groups_per_block, (size_t)desc.group_elems};
+    const ov::Shape gshape{(size_t)N, (size_t)blocks, (size_t)groups_per_block, 1};
+
+    if (std::getenv("GGML_NPU_DEBUG")) {
+        std::fprintf(stderr,
+            "[mw2] bits=%d storage=%d signed=%d block=%d group=%d packing=%d scale=%d offset=%d exact=%d N=%ld K=%ld\n",
+            desc.bit_width, desc.storage_bits, desc.signedness, desc.block_elems, desc.group_elems,
+            desc.packing, desc.scale_encoding, desc.offset_encoding, desc.exactness, (long)N, (long)K);
+    }
+
+    auto integer = integer_constant(desc, wshape, count);
+    if (!integer) return nullptr;
+    std::shared_ptr<ov::Node> deq = std::make_shared<v0::Convert>(integer, ov::element::f16);
+
+    if (desc.scale_encoding == NPU_SCALE_NONE) {
+        if (desc.offset_encoding != NPU_OFFSET_NONE) return nullptr;
+        return reshape_to(deq, {N, K});
+    }
+
+    if (desc.scale_encoding == NPU_SCALE_GROUP_F16) {
+        if (!desc.scale_base || desc.scale_base_len != (size_t)N * (size_t)groups * 2) return nullptr;
+        if (desc.offset_encoding == NPU_OFFSET_ZERO_U8) {
+            if (!desc.offset_base || desc.offset_base_len != (size_t)N * (size_t)groups) return nullptr;
+            auto zero = std::make_shared<v0::Constant>(
+                ov::element::u8, gshape, (const void*)desc.offset_base);
+            deq = std::make_shared<v1::Subtract>(
+                deq, std::make_shared<v0::Convert>(zero, ov::element::f16));
+        } else if (desc.offset_encoding != NPU_OFFSET_NONE) {
+            return nullptr;
+        }
+        auto scale = std::make_shared<v0::Constant>(
+            ov::element::f16, gshape, (const void*)desc.scale_base);
+        return reshape_to(std::make_shared<v1::Multiply>(deq, scale), {N, K});
+    }
+
+    const bool signed_factor = desc.scale_encoding == NPU_SCALE_BLOCK_F16_GROUP_I8;
+    if (!signed_factor && desc.scale_encoding != NPU_SCALE_BLOCK_F16_GROUP_U8) return nullptr;
+    if (!desc.scale_base || desc.scale_base_len != (size_t)N * (size_t)blocks * 2 ||
+        !desc.scale_factor || desc.scale_factor_len != (size_t)N * (size_t)groups) return nullptr;
+    const ov::Shape bshape{(size_t)N, (size_t)blocks, 1, 1};
+    auto scale_base = std::make_shared<v0::Constant>(
+        ov::element::f16, bshape, (const void*)desc.scale_base);
+    auto scale_factor = std::make_shared<v0::Constant>(
+        signed_factor ? ov::element::i8 : ov::element::u8, gshape,
+        (const void*)desc.scale_factor);
+    auto scale = std::make_shared<v1::Multiply>(
+        scale_base, std::make_shared<v0::Convert>(scale_factor, ov::element::f16));
+    deq = std::make_shared<v1::Multiply>(deq, scale);
+
+    if (desc.offset_encoding == NPU_OFFSET_NEG_BLOCK_F16_GROUP_U8) {
+        if (!desc.offset_base || desc.offset_base_len != (size_t)N * (size_t)blocks * 2 ||
+            !desc.offset_factor || desc.offset_factor_len != (size_t)N * (size_t)groups) return nullptr;
+        auto offset_base = std::make_shared<v0::Constant>(
+            ov::element::f16, bshape, (const void*)desc.offset_base);
+        auto offset_factor = std::make_shared<v0::Constant>(
+            ov::element::u8, gshape, (const void*)desc.offset_factor);
+        auto offset = std::make_shared<v1::Multiply>(
+            offset_base, std::make_shared<v0::Convert>(offset_factor, ov::element::f16));
+        deq = std::make_shared<v1::Subtract>(deq, offset);
+    } else if (desc.offset_encoding != NPU_OFFSET_NONE) {
+        return nullptr;
+    }
+    return reshape_to(deq, {N, K});
 }
 
 // ---------------------------------------------------------------------------
@@ -270,13 +397,8 @@ struct npu_sg_node {
 };
 
 struct npu_sg_const {
-    int32_t bits, group, n, k;
-    const uint8_t* weight;
-    size_t weight_len;
-    const uint8_t* scales;
-    size_t scales_len;
-    const uint8_t* zeros;  // per-group zero-points (asymmetric); null/empty → symmetric
-    size_t zeros_len;
+    int32_t n, k;
+    struct npu_constant_desc constant;
 };
 
 // Graph IR v2 wire ABI. Opcodes are backend-owned (not ggml enum values), allowing the Rust
@@ -298,13 +420,7 @@ static constexpr int NPU_IR_PARAM_BYTES = 64;
 struct npu_ir_tensor {
     int32_t role, dtype;
     int64_t ne[4];
-    int32_t bits, group;
-    const uint8_t* weight;
-    size_t weight_len;
-    const uint8_t* scales;
-    size_t scales_len;
-    const uint8_t* zeros;
-    size_t zeros_len;
+    struct npu_constant_desc constant;
 };
 
 struct npu_ir_node {
@@ -374,14 +490,10 @@ int ggml_npu_ov_compile_matmul(int32_t M, int32_t K, int32_t N, uint8_t** blob, 
 // compilation entirely and just returns the stored bytes — the same NATIVE blob the Level Zero
 // path loads via pfnCreate. On success writes a malloc'd blob to *blob/*len (free with
 // ggml_npu_ov_free) and returns 0.
-int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bits, int32_t group,
-                                     const uint8_t* weight, size_t weight_len,
-                                     const uint8_t* scales, size_t scales_len,
-                                     const uint8_t* zeros, size_t zeros_len,
-                                     const char* cache_key, uint8_t** blob, size_t* len) {
-    (void)weight_len;
-    (void)scales_len;
-    if (!blob || !len || M <= 0 || K <= 0 || N <= 0 || !weight) {
+int ggml_npu_ov_compile_matmul_constant_v2(int32_t M, int32_t K, int32_t N,
+                                            const struct npu_constant_desc* constant,
+                                            const char* cache_key, uint8_t** blob, size_t* len) {
+    if (!blob || !len || M <= 0 || K <= 0 || N <= 0 || !constant || !constant->values) {
         return -1;
     }
     *blob = nullptr;
@@ -405,7 +517,7 @@ int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bi
         auto a = std::make_shared<v0::Parameter>(ov::element::f32, ov::Shape{(size_t)M, (size_t)K});
         auto a16 = std::make_shared<v0::Convert>(a, ov::element::f16);
 
-        auto w = make_weight(bits, group, N, K, weight, scales, (zeros && zeros_len) ? zeros : nullptr);
+        auto w = make_weight(*constant, N, K);
         if (!w) {
             return -1;
         }
@@ -443,11 +555,11 @@ int ggml_npu_ov_compile_matmul_const(int32_t M, int32_t K, int32_t N, int32_t bi
 // the single output (`out_node`) is Converted back to f32. Weights are baked as Constants. The
 // native blob is disk-cached under `cache_key` (see cache_dir). On success writes a malloc'd blob
 // to *blob/*len (free with ggml_npu_ov_free) and returns 0.
-int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* input_k,
-                                 int32_t n_nodes, const struct npu_sg_node* nodes,
-                                 int32_t n_consts, const struct npu_sg_const* consts,
-                                 const int32_t* out_nodes, int32_t n_outs, const char* cache_key,
-                                 uint8_t** blob, size_t* len) {
+int ggml_npu_ov_compile_subgraph_v2(int32_t M, int32_t n_inputs, const int32_t* input_k,
+                                    int32_t n_nodes, const struct npu_sg_node* nodes,
+                                    int32_t n_consts, const struct npu_sg_const* consts,
+                                    const int32_t* out_nodes, int32_t n_outs, const char* cache_key,
+                                    uint8_t** blob, size_t* len) {
     if (!blob || !len || M <= 0 || n_inputs <= 0 || n_nodes <= 0 || !input_k || !nodes) {
         return -1;
     }
@@ -470,9 +582,10 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
             std::fprintf(stderr, "[sg]  node[%d] op=%d a=%d b=%d const=%d out_n=%d\n", j, nodes[j].op,
                          nodes[j].a, nodes[j].b, nodes[j].const_idx, nodes[j].out_n);
         for (int c = 0; c < n_consts; c++)
-            std::fprintf(stderr, "[sg]  const[%d] bits=%d group=%d n=%d k=%d wlen=%zu slen=%zu\n", c,
-                         consts[c].bits, consts[c].group, consts[c].n, consts[c].k,
-                         consts[c].weight_len, consts[c].scales_len);
+            std::fprintf(stderr, "[sg]  const[%d] bits=%d group=%d n=%d k=%d values=%zu exact=%d\n", c,
+                         consts[c].constant.bit_width, consts[c].constant.group_elems,
+                         consts[c].n, consts[c].k, consts[c].constant.values_len,
+                         consts[c].constant.exactness);
         for (int i = 0; i < n_outs; i++) std::fprintf(stderr, "[sg]  out[%d] node=%d\n", i, out_nodes[i]);
     }
 
@@ -523,8 +636,7 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
                 case NPU_SG_MATMUL: {
                     if (!value(nd.a, a) || nd.const_idx < 0 || nd.const_idx >= n_consts) return -1;
                     const npu_sg_const& c = consts[(size_t)nd.const_idx];
-                    auto w = make_weight(c.bits, c.group, c.n, c.k, c.weight, c.scales,
-                                         (c.zeros && c.zeros_len) ? c.zeros : nullptr);
+                    auto w = make_weight(c.constant, c.n, c.k);
                     if (!w) return -1;
                     node_val[(size_t)j] =
                         std::make_shared<v0::MatMul>(a, w, /*transpose_a=*/false, /*transpose_b=*/true);
@@ -603,11 +715,11 @@ int ggml_npu_ov_compile_subgraph(int32_t M, int32_t n_inputs, const int32_t* inp
 // LFM ShortConv building blocks; unsupported opcodes fail capability probing in Rust and remain on
 // CPU/GPU. Runtime tensors are f32 graph arguments with an f16 interior. Constants arrive already
 // requantized and use the same fused low-bit decompression form as the mature matmul path.
-int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* tensors,
-                              int32_t n_nodes, const struct npu_ir_node* nodes,
-                              int32_t n_inputs, const uint32_t* input_ids,
-                              int32_t n_outputs, const uint32_t* output_ids,
-                              const char* cache_key, uint8_t** blob, size_t* len) {
+int ggml_npu_ov_compile_graph_v3(int32_t n_tensors, const struct npu_ir_tensor* tensors,
+                                 int32_t n_nodes, const struct npu_ir_node* nodes,
+                                 int32_t n_inputs, const uint32_t* input_ids,
+                                 int32_t n_outputs, const uint32_t* output_ids,
+                                 const char* cache_key, uint8_t** blob, size_t* len) {
     if (!blob || !len || n_tensors <= 0 || !tensors || n_nodes <= 0 || !nodes ||
         n_inputs <= 0 || !input_ids || n_outputs <= 0 || !output_ids) {
         return -1;
@@ -685,15 +797,14 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
         for (int32_t id = 0; id < n_tensors; ++id) {
             const auto& t = tensors[id];
             if (t.role != NPU_IR_CONSTANT) continue;
-            if (!t.weight || t.ne[0] <= 0) return -1;
+            if (!t.constant.values || t.ne[0] <= 0) return -1;
             // Routed banks are gathered while still compressed and dequantized only after the
             // runtime expert selection. Eagerly expanding the whole bank makes OpenVINO spend
             // minutes folding hundreds of MiB of unused experts.
             if (routed_weight[(size_t)id]) continue;
             const int64_t K = t.ne[0];
             const int64_t N = t.ne[1] * t.ne[2] * t.ne[3];
-            auto w = make_weight(t.bits, t.group, N, K, t.weight, t.scales,
-                                 (t.zeros && t.zeros_len) ? t.zeros : nullptr);
+            auto w = make_weight(t.constant, N, K);
             if (!w) return -1;
             values[(size_t)id] = reshape_to(w, shape_i64(id));
         }
@@ -1030,55 +1141,56 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
                         ids = std::make_shared<v0::Convert>(ids, ov::element::i32);
                     }
                     const auto& wt = tensors[nd.inputs[0]];
+                    const auto& constant = wt.constant;
                     const auto& it = tensors[nd.inputs[2]];
                     const int64_t K = wt.ne[0], N = wt.ne[1], E = wt.ne[2];
                     const int64_t U = it.ne[0], T = it.ne[1];
-                    if (K <= 0 || N <= 0 || E <= 0 || U <= 0 || T <= 0 || !wt.weight) return -1;
+                    if (K <= 0 || N <= 0 || E <= 0 || U <= 0 || T <= 0 ||
+                        !constant.values || constant.exactness != NPU_REQUANTIZED) return -1;
                     auto ids_flat = reshape_output(ids, {T * U});
                     auto axis = v0::Constant::create(ov::element::i32, {}, std::vector<int32_t>{0});
                     ov::Output<ov::Node> selected;
-                    if (wt.bits == 16) {
+                    if (constant.numeric_kind == NPU_NUMERIC_FLOAT && constant.bit_width == 16) {
                         auto bank = std::make_shared<v0::Constant>(
                             ov::element::f16, ov::Shape{(size_t)E, (size_t)N, (size_t)K},
-                            (const void*)wt.weight);
+                            (const void*)constant.values);
                         selected = std::make_shared<ov::op::v8::Gather>(bank, ids_flat, axis);
                         selected = reshape_to(
                             selected.get_node_shared_ptr(), {T, U, N, K});
                     } else {
-                        if ((wt.bits != 4 && wt.bits != 8) || wt.group <= 0 ||
-                            K % wt.group != 0 || !wt.scales) return -1;
-                        const int64_t KG = K / wt.group;
+                        if ((constant.bit_width != 4 && constant.bit_width != 8) ||
+                            constant.storage_bits != 8 || constant.packing != NPU_UNPACKED ||
+                            constant.group_elems <= 0 || K % constant.group_elems != 0 ||
+                            constant.scale_encoding != NPU_SCALE_GROUP_F16 ||
+                            !constant.scale_base) return -1;
+                        const int64_t KG = K / constant.group_elems;
                         const ov::Shape wshape{
-                            (size_t)E, (size_t)N, (size_t)KG, (size_t)wt.group};
+                            (size_t)E, (size_t)N, (size_t)KG, (size_t)constant.group_elems};
                         const ov::Shape gshape{(size_t)E, (size_t)N, (size_t)KG, 1};
                         std::shared_ptr<ov::Node> packed;
-                        if (wt.bits == 4) {
-                            if (wt.zeros && wt.zeros_len) {
+                        if (constant.bit_width == 4) {
+                            if (constant.offset_encoding == NPU_OFFSET_ZERO_U8) {
                                 // Dynamic Gather on sub-byte constants is not representable by the
                                 // current NPU register ABI. Keep the host's already-unpacked nibbles
                                 // as u8; selection still happens before f16 dequantization.
                                 packed = std::make_shared<v0::Constant>(
-                                    ov::element::u8, wshape, (const void*)wt.weight);
+                                    ov::element::u8, wshape, (const void*)constant.values);
                             } else {
                                 packed = std::make_shared<v0::Constant>(
-                                    ov::element::i8, wshape, (const void*)wt.weight);
+                                    ov::element::i8, wshape, (const void*)constant.values);
                             }
                         } else {
                             packed = std::make_shared<v0::Constant>(
-                                (wt.zeros && wt.zeros_len) ? ov::element::u8 : ov::element::i8,
-                                wshape, (const void*)wt.weight);
+                                constant.offset_encoding == NPU_OFFSET_ZERO_U8
+                                    ? ov::element::u8 : ov::element::i8,
+                                wshape, (const void*)constant.values);
                         }
                         auto gathered = std::make_shared<ov::op::v8::Gather>(packed, ids_flat, axis);
                         selected = std::make_shared<v0::Convert>(gathered, ov::element::f16);
-                        if (wt.zeros && wt.zeros_len) {
-                            std::shared_ptr<ov::Node> zero;
-                            if (wt.bits == 4) {
-                                zero = std::make_shared<v0::Constant>(
-                                    ov::element::u8, gshape, (const void*)wt.zeros);
-                            } else {
-                                zero = std::make_shared<v0::Constant>(
-                                    ov::element::u8, gshape, (const void*)wt.zeros);
-                            }
+                        if (constant.offset_encoding == NPU_OFFSET_ZERO_U8) {
+                            if (!constant.offset_base) return -1;
+                            auto zero = std::make_shared<v0::Constant>(
+                                ov::element::u8, gshape, (const void*)constant.offset_base);
                             auto selected_zero =
                                 std::make_shared<ov::op::v8::Gather>(zero, ids_flat, axis);
                             selected = std::make_shared<v1::Subtract>(
@@ -1087,7 +1199,7 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
                                     selected_zero, ov::element::f16));
                         }
                         auto scale = std::make_shared<v0::Constant>(
-                            ov::element::f16, gshape, (const void*)wt.scales);
+                            ov::element::f16, gshape, (const void*)constant.scale_base);
                         auto selected_scale =
                             std::make_shared<ov::op::v8::Gather>(scale, ids_flat, axis);
                         selected =
@@ -1166,6 +1278,44 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
         return -3;
     } catch (...) {
         return -4;
+    }
+}
+
+enum npu_constant_inspection {
+    NPU_INSPECT_U4 = 1u << 0,
+    NPU_INSPECT_I8 = 1u << 1,
+    NPU_INSPECT_SCALE_MULTIPLY = 1u << 2,
+    NPU_INSPECT_AFFINE_SUBTRACT = 1u << 3,
+    NPU_INSPECT_F32_CONSTANT = 1u << 4,
+};
+
+// Test/diagnostic entry point: inspect the actual OpenVINO dequant graph before compilation.
+int ggml_npu_ov_inspect_constant_v2(const struct npu_constant_desc* constant,
+                                    int32_t N, int32_t K, uint32_t* flags) {
+    if (!constant || !flags || N <= 0 || K <= 0) return -1;
+    try {
+        auto weight = make_weight(*constant, N, K);
+        if (!weight) return -1;
+        auto result = std::make_shared<ov::op::v0::Result>(weight);
+        auto model = std::make_shared<ov::Model>(
+            ov::ResultVector{result}, ov::ParameterVector{});
+        uint32_t observed = 0;
+        for (const auto& node : model->get_ordered_ops()) {
+            if (const auto constant_node =
+                    std::dynamic_pointer_cast<ov::op::v0::Constant>(node)) {
+                const auto type = constant_node->get_element_type();
+                if (type == ov::element::u4) observed |= NPU_INSPECT_U4;
+                if (type == ov::element::i8) observed |= NPU_INSPECT_I8;
+                if (type == ov::element::f32) observed |= NPU_INSPECT_F32_CONSTANT;
+            }
+            const std::string type_name = node->get_type_name();
+            if (type_name == "Multiply") observed |= NPU_INSPECT_SCALE_MULTIPLY;
+            if (type_name == "Subtract") observed |= NPU_INSPECT_AFFINE_SUBTRACT;
+        }
+        *flags = observed;
+        return 0;
+    } catch (...) {
+        return -2;
     }
 }
 

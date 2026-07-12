@@ -12,16 +12,20 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["direct-ivpu"]
+default = ["direct-ivpu", "portable-simd"]
 # Linux intel_vpu discovery, checked UAPI wrappers, and release-pinned firmware command validation.
 direct-ivpu = ["dep:goblin"]
 level-zero-compat = []
 bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
 test-support = []
+# Production quant-transcode implementation. The crate's pinned nightly enables `portable_simd`;
+# unsupported architectures retain the scalar implementation.
+portable-simd = ["dep:cpufeatures"]
 
 [dependencies]
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
+cpufeatures = { version = "0.3.0", default-features = false, optional = true }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
 goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
 # Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
@@ -71,3 +75,17 @@ required-features = ["bench-hardware"]
 [[test]]
 name = "async_runtime"
 required-features = ["test-support"]
+
+[[bench]]
+name = "quant_kernels"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "quant_cycles"
+harness = false
+
+[[bench]]
+name = "quant_asm"
+harness = false
+required-features = ["portable-simd"]

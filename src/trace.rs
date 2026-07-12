@@ -5,7 +5,7 @@
 //! without linking a logging framework into this `no_std` cdylib.
 
 use alloc::format;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::ffi::*;
 use crate::graph::{Dim, GraphIr, TensorRole};
@@ -136,6 +136,15 @@ pub(crate) fn graph(event: &str, graph: &GraphIr, reason: &str) {
                 dim_value(value.dims[3]),
             ),
         );
+    }
+}
+
+
+/// Report the production quant-transcode kernel once when normal tracing is enabled.
+pub(crate) fn quant_kernel(name: &str) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if enabled() && !REPORTED.swap(true, Ordering::Relaxed) {
+        emit(&format!("[ggml-npu trace] quant-kernel={name}\n"));
     }
 }
 

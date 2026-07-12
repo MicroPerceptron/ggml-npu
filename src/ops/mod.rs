@@ -3,7 +3,10 @@
 //! identifies the compiled artifact. Lowering (op + shape → artifact) lives per-vendor under
 //! [`crate::vendor`].
 
+pub mod constant;
+pub mod ggml_quant;
 pub mod matmul;
+pub mod quant_kernel;
 pub mod requant;
 pub mod subgraph;
 
