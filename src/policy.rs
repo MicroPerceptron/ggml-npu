@@ -194,6 +194,15 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         // expensive anchor; pulling them independently creates synchronization islands.
         _ => return false,
     };
+    // Orphan/attention-side matmuls (not FFN-local) pay full handoff cost as unitary programs.
+    // Opt-in higher floor via GGML_NPU_MIN_UNITARY_OFFLOAD_WORK (defaults to MIN_OFFLOAD_WORK).
+    let min_work = if x.op == GGML_OP_MUL_MAT
+        && !crate::ops::subgraph::is_ffn_shaped_matmul(node)
+    {
+        env_u64(c"GGML_NPU_MIN_UNITARY_OFFLOAD_WORK", min_work).max(min_work)
+    } else {
+        min_work
+    };
     work >= min_work
 }
 
