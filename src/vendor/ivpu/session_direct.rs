@@ -12,7 +12,9 @@ use super::direct::budget::RuntimeBudget;
 use super::direct::elf::parse_intel_elf_with_resident_limit;
 use super::direct::hpi::inspect_hpi_requirements;
 use super::direct::link::{visit_binding_requirements, DeviceMemoryClass};
-use super::direct::prepare::{prepare_inference, prepare_inference_shared, PreparedInference};
+use super::direct::prepare::{
+    prepare_inference, prepare_inference_shared, rebind_inference_shared, PreparedInference,
+};
 use super::direct::transport::release_host_writes;
 use super::direct::{CommandQueue, IvpuDevice};
 use super::profile;
@@ -60,8 +62,13 @@ fn context() -> Result<&'static DirectContext, RuntimeError> {
 
 struct ResidentProgram {
     generation: u64,
+    /// Resident-cache identity (program key for warm-reusable artifacts, else full binding key).
     key: ExactSemanticKey,
-    prepared: PreparedInference<'static>,
+    program_key: ExactSemanticKey,
+    binding_fp: UnsafeCell<ExactSemanticKey>,
+    prepared: UnsafeCell<PreparedInference<'static>>,
+    /// Retained only for small artifacts so binding sets can re-JIT without recompile (#5).
+    warm_artifact: Option<alloc::sync::Arc<[u8]>>,
     resident_bytes: u64,
     accounted_bytes: u64,
     last_used: AtomicU64,
@@ -225,6 +232,28 @@ struct DispatchGuard<'a> {
 }
 
 impl ResidentProgram {
+    fn prepared(&self) -> &PreparedInference<'static> {
+        // SAFETY: exclusive dispatch lock or single-threaded construction before publish.
+        unsafe { &*self.prepared.get() }
+    }
+
+    fn prepared_mut(&self) -> &mut PreparedInference<'static> {
+        // SAFETY: caller holds `dispatch_locked` exclusively for this program.
+        unsafe { &mut *self.prepared.get() }
+    }
+
+    fn binding_fp(&self) -> &ExactSemanticKey {
+        // SAFETY: exclusive dispatch lock or cache lock during lookup publication.
+        unsafe { &*self.binding_fp.get() }
+    }
+
+    fn set_binding_fp(&self, fingerprint: ExactSemanticKey) {
+        // SAFETY: caller holds `dispatch_locked` exclusively for this program.
+        unsafe {
+            *self.binding_fp.get() = fingerprint;
+        }
+    }
+
     fn lock_dispatch(&self) -> DispatchGuard<'_> {
         while self
             .dispatch_locked
@@ -519,10 +548,15 @@ struct PreparedCandidate {
     resident_bytes: u64,
     accounted_bytes: u64,
     reservation: ReservationGuard,
+    artifact: alloc::sync::Arc<[u8]>,
 }
 
-fn binding_key(
-    key: ExactSemanticKey,
+/// Small weightless/glue artifacts can keep a host copy for warm IO rebind across similar programs
+/// without double-keeping baked-weight blobs that dominate resident FFN programs (#5).
+const WARM_REUSE_MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+
+fn binding_fingerprint(
+    key: &ExactSemanticKey,
     inputs: &[&Operand],
     outputs: &[&Operand],
 ) -> ExactSemanticKey {
@@ -548,6 +582,24 @@ fn binding_key(
     builder.finish()
 }
 
+/// Cache identity for a prepared program: warm-reusable artifacts share one resident entry across
+/// binding sets (L0 SG_GRAPHS analogue); large baked programs keep the binding-set fold.
+fn resident_cache_key(
+    program_key: ExactSemanticKey,
+    binding_fp: ExactSemanticKey,
+    artifact_len: usize,
+) -> ExactSemanticKey {
+    if artifact_len <= WARM_REUSE_MAX_ARTIFACT_BYTES {
+        program_key
+    } else {
+        binding_fp
+    }
+}
+
+fn warm_reuse_eligible(artifact_len: usize, prepared: &PreparedInference<'_>) -> bool {
+    artifact_len <= WARM_REUSE_MAX_ARTIFACT_BYTES && prepared.warm_rebind.is_some()
+}
+
 fn prepare_candidate(
     context: &DirectContext,
     parameters: &super::direct::DeviceParameters,
@@ -560,7 +612,8 @@ fn prepare_candidate(
         "[npu direct] artifact bytes={} compiled/cache-loaded\n",
         blob.len()
     ));
-    let elf = match parse_intel_elf_with_resident_limit(&blob, budget.resident_program_bytes) {
+    let artifact: alloc::sync::Arc<[u8]> = alloc::sync::Arc::from(blob.into_boxed_slice());
+    let elf = match parse_intel_elf_with_resident_limit(&artifact, budget.resident_program_bytes) {
         Ok(elf) => elf,
         Err(error) => {
             profile::note(&alloc::format!(
@@ -684,22 +737,111 @@ fn prepare_candidate(
         resident_bytes,
         accounted_bytes,
         reservation,
+        artifact,
     })
+}
+
+fn try_warm_rebind(
+    context: &DirectContext,
+    budget: RuntimeBudget,
+    program: &ResidentProgram,
+    binding_fp: &ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+) -> bool {
+    if program.binding_fp() == binding_fp {
+        return true;
+    }
+    let Some(artifact) = program.warm_artifact.as_ref() else {
+        profile::note("[npu direct] binding set changed without warm artifact; miss\n");
+        return false;
+    };
+    if program.prepared().warm_rebind.is_none() {
+        return false;
+    }
+    let elf = match parse_intel_elf_with_resident_limit(artifact, budget.resident_program_bytes) {
+        Ok(elf) => elf,
+        Err(_) => return false,
+    };
+    let mut initial_inputs = Vec::new();
+    if initial_inputs.try_reserve_exact(inputs.len()).is_err() {
+        return false;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(bytes) = program.prepared().input_bytes(index) else {
+            return false;
+        };
+        let Some(data) = operand_bytes(input, bytes) else {
+            return false;
+        };
+        initial_inputs.push(data);
+    }
+    let shared_bindings = !crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_DISABLE_SHARED_BINDINGS");
+    let input_views: alloc::vec::Vec<_> = inputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    let output_views: alloc::vec::Vec<_> = outputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    match rebind_inference_shared(
+        context.device,
+        program.prepared_mut(),
+        &elf,
+        &initial_inputs,
+        &input_views,
+        &output_views,
+    ) {
+        Ok(()) => {
+            program.set_binding_fp(binding_fp.clone());
+            profile::note("[npu direct] warm binding rebind\n");
+            true
+        }
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] warm binding rebind failed: {error:?}\n"
+            ));
+            false
+        }
+    }
+}
+
+fn evict_unpinned(program: &Arc<ResidentProgram>) {
+    let mut guard = PROGRAMS.lock();
+    let state = guard.state();
+    if let Some(index) = state
+        .entries
+        .iter()
+        .position(|entry| Arc::ptr_eq(entry, program) && entry.pins.load(Ordering::Acquire) == 0)
+    {
+        let entry = state.entries.swap_remove(index);
+        state.resident_bytes = state.resident_bytes.saturating_sub(entry.resident_bytes);
+        profile::event(MetricEvent::CacheEviction {
+            cache: "direct-programs",
+            reason: "rebind-miss",
+            bytes: entry.resident_bytes,
+        });
+        drop(entry);
+    }
 }
 
 fn run_program(
     generation: u64,
-    key: ExactSemanticKey,
+    program_key: ExactSemanticKey,
     inputs: &[&Operand],
     outputs: &[&Operand],
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
-    let key = binding_key(key, inputs, outputs);
+    let binding_fp = binding_fingerprint(&program_key, inputs, outputs);
     profile::note(&alloc::format!(
-        "[npu direct] run generation={generation} inputs={} outputs={} key={}\n",
+        "[npu direct] run generation={generation} inputs={} outputs={} program={} bindings={}\n",
         inputs.len(),
         outputs.len(),
-        key.digest().hex()
+        program_key.digest().hex(),
+        binding_fp.digest().hex()
     ));
     if DEVICE_FAILED.load(Ordering::Acquire) {
         profile::note("[npu direct] device fault latched; refusing automatic retry\n");
@@ -731,6 +873,8 @@ fn run_program(
         }
     };
     let mut compile = Some(compile);
+    // First probe: warm program-key entry, then exact binding-key entry (large programs).
+    let lookup_keys = [program_key.clone(), binding_fp.clone()];
     loop {
         let (action, stale) = {
             let mut guard = PROGRAMS.lock();
@@ -762,7 +906,10 @@ fn run_program(
             let hit = state
                 .entries
                 .iter()
-                .find(|entry| entry.generation == generation && entry.key == key)
+                .find(|entry| {
+                    entry.generation == generation
+                        && lookup_keys.iter().any(|key| entry.key == *key)
+                })
                 .map(|entry| {
                     entry.pins.fetch_add(1, Ordering::AcqRel);
                     entry.last_used.store(clock, Ordering::Relaxed);
@@ -772,20 +919,20 @@ fn run_program(
                 });
             let action = if let Some(hit) = hit {
                 ResidentAction::Hit(hit)
-            } else if let Some(loading) = state
-                .loading
-                .iter()
-                .find(|loading| loading.generation == generation && loading.key == key)
-            {
+            } else if let Some(loading) = state.loading.iter().find(|loading| {
+                loading.generation == generation
+                    && lookup_keys.iter().any(|key| loading.key == *key)
+            }) {
                 ResidentAction::Wait(Arc::clone(&loading.state))
             } else {
+                // Reserve under the program key; final resident key is chosen after compile.
                 if state.loading.try_reserve(1).is_err() {
                     return false;
                 }
                 let loading_state = Arc::new(AtomicU32::new(LOAD_RUNNING));
                 state.loading.push(LoadingProgram {
                     generation,
-                    key: key.clone(),
+                    key: program_key.clone(),
                     state: Arc::clone(&loading_state),
                 });
                 ResidentAction::Load(LoadingGuard {
@@ -794,7 +941,6 @@ fn run_program(
             };
             (action, stale)
         };
-        // Device-resource destructors and every expensive operation happen after unlocking.
         drop(stale);
         match action {
             ResidentAction::Hit(pinned) => {
@@ -803,8 +949,23 @@ fn run_program(
                     bytes: pinned.program.resident_bytes,
                 });
                 profile::note("[npu direct] resident program hit\n");
-                let _dispatch_guard = pinned.program.lock_dispatch();
-                let result = dispatch(context, &pinned.program.prepared, inputs, outputs);
+                let program = Arc::clone(&pinned.program);
+                let _dispatch_guard = program.lock_dispatch();
+                if !try_warm_rebind(
+                    context,
+                    budget,
+                    &program,
+                    &binding_fp,
+                    inputs,
+                    outputs,
+                ) {
+                    profile::note("[npu direct] resident hit cannot rebind; reloading\n");
+                    drop(_dispatch_guard);
+                    drop(pinned);
+                    evict_unpinned(&program);
+                    continue;
+                }
+                let result = dispatch(context, program.prepared(), inputs, outputs);
                 profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
                 return result;
             }
@@ -824,15 +985,23 @@ fn run_program(
                     profile::note("[npu direct] compiler returned no artifact\n");
                     return false;
                 };
+                let artifact_len = blob.len();
                 let Some(mut candidate) =
                     prepare_candidate(context, &parameters, budget, inputs, outputs, blob)
                 else {
                     return false;
                 };
+                let cache_key =
+                    resident_cache_key(program_key.clone(), binding_fp.clone(), artifact_len);
+                let warm_artifact = warm_reuse_eligible(artifact_len, &candidate.prepared)
+                    .then(|| alloc::sync::Arc::clone(&candidate.artifact));
                 let program = Arc::new(ResidentProgram {
                     generation,
-                    key: key.clone(),
-                    prepared: candidate.prepared,
+                    key: cache_key,
+                    program_key: program_key.clone(),
+                    binding_fp: UnsafeCell::new(binding_fp.clone()),
+                    prepared: UnsafeCell::new(candidate.prepared),
+                    warm_artifact,
                     resident_bytes: candidate.resident_bytes,
                     accounted_bytes: candidate.accounted_bytes,
                     last_used: AtomicU64::new(0),
@@ -881,13 +1050,14 @@ fn run_program(
                 drop(evicted);
                 drop(loading);
                 profile::note(&alloc::format!(
-                    "[npu direct] loaded resident={} accounted={} cache_resident\n",
+                    "[npu direct] loaded resident={} accounted={} cache_resident warm={}\n",
                     program.resident_bytes,
-                    program.accounted_bytes
+                    program.accounted_bytes,
+                    program.warm_artifact.is_some()
                 ));
                 let pinned = PinnedProgram { program };
                 let _dispatch_guard = pinned.program.lock_dispatch();
-                let result = dispatch(context, &pinned.program.prepared, inputs, outputs);
+                let result = dispatch(context, pinned.program.prepared(), inputs, outputs);
                 profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
                 return result;
             }
@@ -1086,12 +1256,45 @@ impl DirectBenchmarkFixture {
 
 #[cfg(test)]
 mod cache_policy_tests {
-    use super::oldest_unpinned;
+    use super::{
+        oldest_unpinned, resident_cache_key, WARM_REUSE_MAX_ARTIFACT_BYTES,
+    };
+    use crate::identity::ExactKeyBuilder;
 
     #[test]
     fn resident_eviction_never_selects_pinned_programs() {
         let entries = [(0, 1, 1), (1, 0, 3), (2, 0, 2)];
         assert_eq!(oldest_unpinned(entries.into_iter()), Some(2));
         assert_eq!(oldest_unpinned([(0, 1, 1), (1, 2, 2)].into_iter()), None);
+    }
+
+    #[test]
+    fn warm_reusable_artifacts_cache_by_program_key_only() {
+        let mut program = ExactKeyBuilder::new(b"test/program");
+        program.u64(b"id", 1);
+        let program = program.finish();
+        let mut bindings = ExactKeyBuilder::new(b"test/bindings");
+        bindings.u64(b"id", 2);
+        let bindings = bindings.finish();
+        let key = resident_cache_key(program.clone(), bindings.clone(), 1024);
+        assert_eq!(key, program);
+        assert_ne!(key, bindings);
+    }
+
+    #[test]
+    fn large_artifacts_keep_binding_set_cache_key() {
+        let mut program = ExactKeyBuilder::new(b"test/program");
+        program.u64(b"id", 1);
+        let program = program.finish();
+        let mut bindings = ExactKeyBuilder::new(b"test/bindings");
+        bindings.u64(b"id", 2);
+        let bindings = bindings.finish();
+        let key = resident_cache_key(
+            program.clone(),
+            bindings.clone(),
+            WARM_REUSE_MAX_ARTIFACT_BYTES + 1,
+        );
+        assert_eq!(key, bindings);
+        assert_ne!(key, program);
     }
 }
