@@ -56,8 +56,11 @@ comma-separated multi-configuration `llama-bench` run order-dependent.
 
 NPU execution is never enabled implicitly. Review placement and keep a reboot path available.
 NPU runs are terminated after `NPU_TIMEOUT=180s` by default. Timeout, interrupt, and memory-guard
-cleanup kill the complete process group. The default MemAvailable floor is 4 GiB after a
-wrapper-only guard previously allowed an orphaned process to exhaust the host.
+cleanup kill the complete **session/process group** (recorded PGID via `setsid`, then SIGTERM→SIGKILL
+plus session `pkill`) so OpenVINO compiler children cannot outlive the waiter. Defaults: MemAvailable
+floor 4 GiB (raised to 6 GiB when ≥1 GiB swap is already used); refuse to start if swap used exceeds
+4 GiB or 40% (`ALLOW_HIGH_SWAP=1` override). Do **not** run locked fullperf inside a memory-stressed
+Cursor session — prefer a separate terminal/session. Smoke: `./benchmarks/test_lfm_process_guard.sh`.
 Commit representative result directories when changing lowering, quantization, cache, or scheduling
 policy so numerical and performance claims remain externally auditable.
 

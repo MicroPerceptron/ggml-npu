@@ -36,3 +36,6 @@ Only if one of these is true:
   a code change
 - PR #15 / handoff work: prefer unitary/split/program attribution counters and short profiles over
   another full pp512 unless the user asks
+- Do not run locked fullperf inside a memory-stressed Cursor session; prefer a separate
+  terminal/session. The LFM harness refuses high pre-existing swap and kills the bench session on
+  low MemAvailable (`benchmarks/lib/lfm_process_guard.sh`)

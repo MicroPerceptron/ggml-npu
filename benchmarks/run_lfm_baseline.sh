@@ -4,6 +4,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Process-group / MemAvailable contract: see benchmarks/lib/lfm_process_guard.sh
+# shellcheck source=benchmarks/lib/lfm_process_guard.sh
+source "$ROOT/benchmarks/lib/lfm_process_guard.sh"
 LLAMA_ROOT="${LLAMA_ROOT:-$ROOT/../llama.cpp}"
 MODEL="${MODEL:-}"
 MODE="${MODE:-cpu-native}" # cpu-native | cpu-openblas | cpu-flexiblas | cpu-mkl | vulkan | npu
@@ -162,17 +165,34 @@ fi
 echo "llama_bench_sha256=$(sha256sum "$BENCH" | awk '{print $1}')" >> "$OUT/environment.txt"
 
 bench_pid=""
+bench_pgid=""
 guard_pid=""
 monitor_pid=""
 ENERGY_FILE="${ENERGY_FILE:-/sys/class/powercap/intel-rapl:0/energy_uj}"
 energy_before=""
 [[ -r "$ENERGY_FILE" ]] && energy_before="$(<"$ENERGY_FILE")"
+
+if [[ "$MODE" == npu ]]; then
+    lfm_preflight_memory_or_die
+    MIN_AVAILABLE_KB="$(lfm_effective_min_available_kb)"
+    export MIN_AVAILABLE_KB
+    {
+        echo "mem_available_floor_kib=$MIN_AVAILABLE_KB"
+        echo "max_swap_used_kib=${MAX_SWAP_USED_KB:-4194304}"
+        echo "max_swap_used_pct=${MAX_SWAP_USED_PCT:-40}"
+        echo "guard_interval_sec=${GUARD_INTERVAL_SEC:-0.1}"
+        echo "guard_escalate_ms=${GUARD_ESCALATE_MS:-100}"
+    } >> "$OUT/environment.txt"
+fi
+
 cleanup() {
     [[ -n "$guard_pid" ]] && kill "$guard_pid" 2>/dev/null || true
     [[ -n "$monitor_pid" ]] && kill "$monitor_pid" 2>/dev/null || true
-    if [[ -n "$bench_pid" ]] && kill -0 "$bench_pid" 2>/dev/null; then
+    if [[ -n "$bench_pgid" ]]; then
+        lfm_kill_process_group "$bench_pgid"
+    elif [[ -n "$bench_pid" ]] && kill -0 "$bench_pid" 2>/dev/null; then
+        # Fallback if pgid never recorded.
         kill -TERM -- "-$bench_pid" 2>/dev/null || true
-        sleep 1
         kill -KILL -- "-$bench_pid" 2>/dev/null || true
     fi
 }
@@ -182,13 +202,16 @@ runner=()
 if [[ "$MODE" == npu ]]; then
     runner=(timeout --signal=TERM --kill-after=10s "${NPU_TIMEOUT:-180s}")
 fi
-# One process group makes timeout, memory-guard, interrupt, and shell-exit cleanup reach every
-# descendant (the old wrapper-only kill could leave llama-bench running after its parent exited).
-setsid "$TIME_BIN" -f \
+
+# Fresh session + recorded PGID so timeout, memguard, and EXIT cleanup always
+# reach llama-bench and OpenVINO compiler children (not only the setsid waiter).
+bench_pid="$(lfm_start_process_group "$OUT/bench.pgid" "$OUT/result.jsonl" "$OUT/stderr.txt" -- \
+    "$TIME_BIN" -f \
     '{"wall_seconds":%e,"user_seconds":%U,"system_seconds":%S,"max_rss_kib":%M,"exit_status":%x}' \
-    -o "$OUT/process.json" "${runner[@]}" "$BENCH" "${args[@]}" \
-    > "$OUT/result.jsonl" 2> "$OUT/stderr.txt" &
-bench_pid=$!
+    -o "$OUT/process.json" "${runner[@]}" "$BENCH" "${args[@]}")"
+bench_pgid="$(tr -d '[:space:]' < "$OUT/bench.pgid")"
+echo "bench_waiter_pid=$bench_pid" >> "$OUT/environment.txt"
+echo "bench_pgid=$bench_pgid" >> "$OUT/environment.txt"
 
 (
     printf 'monotonic_seconds\tllama_bench_rss_kib\tmem_available_kib\tswap_used_kib\tnpu_memory_bytes\tmemory_psi_some_total\tmemory_psi_full_total\n'
@@ -222,15 +245,30 @@ monitor_pid=$!
 
 if [[ "$MODE" == npu ]]; then
     (
-        while sleep 0.2; do
+        # Check first, then sleep — never open with sleep (avoids a free interval after breach).
+        while true; do
             avail_kb="$(awk '/MemAvailable:/ { print $2 }' /proc/meminfo)"
-            if (( avail_kb < ${MIN_AVAILABLE_KB:-4194304} )); then
-                echo "MemAvailable guard killed benchmark at ${avail_kb} KiB" >> "$OUT/guard.txt"
-                kill -TERM -- "-$bench_pid" 2>/dev/null || true
-                sleep 1
-                kill -KILL -- "-$bench_pid" 2>/dev/null || true
+            if (( avail_kb < MIN_AVAILABLE_KB )); then
+                {
+                    echo "MemAvailable guard killed benchmark at ${avail_kb} KiB"
+                    echo "bench_pgid=${bench_pgid}"
+                    echo "min_available_kib=${MIN_AVAILABLE_KB}"
+                } >> "$OUT/guard.txt"
+                lfm_kill_process_group "$bench_pgid"
+                # Confirm group members are gone; re-KILL if anything remains.
+                for _ in 1 2 3 4 5; do
+                    remaining="$(ps -o pid= -s "$bench_pgid" 2>/dev/null | tr -d ' ' | wc -l)"
+                    if (( remaining == 0 )); then
+                        break
+                    fi
+                    lfm_kill_process_group "$bench_pgid" 0
+                    sleep 0.05
+                done
                 exit 0
             fi
+            # Stop if the waiter already exited.
+            kill -0 "$bench_pid" 2>/dev/null || exit 0
+            sleep "${GUARD_INTERVAL_SEC:-0.1}"
         done
     ) &
     guard_pid=$!
@@ -241,6 +279,7 @@ wait "$bench_pid"
 status=$?
 set -e
 bench_pid=""
+bench_pgid=""
 [[ -n "$guard_pid" ]] && kill "$guard_pid" 2>/dev/null || true
 [[ -n "$monitor_pid" ]] && kill "$monitor_pid" 2>/dev/null || true
 [[ -n "$guard_pid" ]] && wait "$guard_pid" 2>/dev/null || true
