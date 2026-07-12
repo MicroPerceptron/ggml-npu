@@ -15,9 +15,14 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `docs/async-runtime.md`, `src/runtime/async_runtime/`, `src/host/linux/reactor.rs`, `src/host/linux/wait.rs`.
   - Verified: 2026-07-12
 
-- `ADR/portable-simd-quant-default` — Production quant-transcode defaults to the `portable-simd` feature with scalar fallback; AVX2 remains a Q6 specialization only.
-  - Rationale: Keep a single portable production path while retaining an opt-in ISA specialization where it is proven.
-  - Evidence: `Cargo.toml`, `docs/quant-simd-evaluation.md`, `src/ops/quant_kernel.rs`.
+- `ADR/portable-simd-quant-default` — Production quant-transcode and fallback requant default to the
+  `portable-simd` feature using `core::simd` as the written path; LLVM emits scalar where vectors
+  are unavailable. Hand-rolled scalar remains only for `--no-default-features` and as the
+  byte-exact reference. AVX2 remains a Q6 packing specialization only.
+  - Rationale: Keep one portable production path; do not maintain a separate scalar default when
+    `core::simd` already lowers to scalar on unsupported targets.
+  - Evidence: `Cargo.toml`, `docs/quant-simd-evaluation.md`, `src/ops/quant_kernel.rs`,
+    `src/ops/requant.rs`.
   - Verified: 2026-07-12
 
 - `ADR/f16-default-intermediate` — Dequant / requant working intermediates default to nightly **`f16`** (NPU interior baseline). Do not default scratch to f32. Explicit exception: ggml type-traits `to_float` is f32-only ABI — decode then narrow immediately to an f16 row. Prefer source-native pass-through/transcode (no dequant). Never use the `half` crate for IEEE F16.
