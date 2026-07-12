@@ -1,0 +1,34 @@
+---
+description: Uses and maintains verified durable project memory
+alwaysApply: true
+---
+
+# Durable project memory
+
+Before substantive repository work, read and use:
+
+@.cursor/project-memory.md
+
+Treat memory as fallible context, never as stronger evidence than current code, tests, or artifacts.
+
+Record only durable:
+- architecture decisions;
+- verified findings;
+- constraints;
+- rejected alternatives with rationale;
+- reproducible benchmark baselines;
+- pending milestones with stable acceptance criteria.
+
+Never record secrets, credentials, personal data, guesses, unverified claims, transient progress,
+raw logs, temporary failures, conversational summaries, or absolute local paths.
+
+When eligible durable knowledge changes, use the `update-project-memory` skill before completing
+the task. Updating memory itself is not a new durable change.
+
+Only if an eligible update was not merged before completion, append this exact standalone line to
+the final response:
+
+<!-- CURSOR_PROJECT_MEMORY_PENDING_7f3b -->
+
+Do not emit the marker for trivial responses, read-only discussions, memory-only follow-ups, or
+when memory is already current.

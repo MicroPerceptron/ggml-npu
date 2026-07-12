@@ -1,0 +1,16 @@
+---
+description: Keep GitHub issues updated during perf and feature work
+alwaysApply: true
+---
+
+# GitHub issue hygiene
+
+For substantive performance, coverage, backend, or feature work:
+
+1. **Before starting**, `gh issue list --state open` (and search) for related issues. Prefer extending an existing issue over opening a duplicate.
+2. **While working**, comment verified progress, measurements, and blockers on the relevant issue(s). Link PRs/commits (`Fixes #N` / `Refs #N`).
+3. **Before finishing**, re-check related open issues:
+   - Update status/comments with evidence (bench paths, test names, metrics).
+   - **Close only when acceptance criteria are met** with reproducible evidence; otherwise leave open and note what remains.
+   - Do not close tracking/meta issues until child acceptance is done or explicitly re-scoped.
+4. Never put secrets, credentials, or absolute local machine paths in issue text; use repo-relative artifact paths.

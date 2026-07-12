@@ -4,16 +4,16 @@ A universal NPU backend for [ggml](https://github.com/ggml-org/ggml) / llama.cpp
 targeting Intel (Level Zero), AMD (XRT/XDNA), and Qualcomm (Hexagon/QNN) client NPUs
 behind one runtime seam, with CPU fallback for everything it does not claim.
 
-**Status: Phase 0 skeleton + Intel bring-up.** The backend registers as a dynamically-loaded
-ggml `ACCEL` device and claims **no** operations (`supports_op == false`), so the scheduler
-runs the whole model on CPU — proving registration + the C ABI + the DL entry point. The
-Intel NPU stack is validated end-to-end (a fixed-shape MatMul runs on the Lunar Lake NPU and
-matches CPU). **The Level Zero submit path works in Rust:** the backend `dlopen`s the loader,
-enumerates the NPU, and runs an OpenVINO-compiled native blob through the graph extension,
-reproducing OpenVINO's output on hardware (see `ggml_npu_ivpu_selftest`). Wiring this into
-`graph_compute` (with a shape-keyed blob cache) is next. See
-[`../llama.cpp/tmp/NPU-gameplan.md`](../llama.cpp/tmp/NPU-gameplan.md) and
-[`../llama.cpp/tmp/NPU.md`](../llama.cpp/tmp/NPU.md).
+**Status: Intel graph-compiler prototype.** The backend registers as a dynamically-loaded ggml
+`NPU` device and currently lowers dense FFN, LFM ShortConv/state writes, RoPE, runtime attention,
+FlashAttention, and sparse routed-expert graphs on Intel Lunar Lake. It
+re-quantizes model weights, compiles OpenVINO models with low-bit weights baked as Constants,
+loads the native artifacts through the Level Zero graph extension, and dispatches scheduler
+splits from Rust. Unsupported operations remain on CPU/GPU.
+
+The next architecture target is Liquid AI's LFM family, especially LFM2.5-8B-A1B. That requires
+stateful short-convolution, sparse routed-expert, and attention graph coverage; see
+[`docs/npu-findings-and-roadmap.md`](docs/npu-findings-and-roadmap.md) for measured constraints.
 
 ## Design conventions
 
@@ -25,6 +25,8 @@ reproducing OpenVINO's output on hardware (see `ggml_npu_ivpu_selftest`). Wiring
 - **Atomics over global locks.** The singleton vtable graph is published with a lock-free
   `AtomicPtr` CAS, not a `OnceLock`.
 - **Partitioned modules**, organized by association; vendors live under `vendor/<driver>/`.
+- **Portable ownership first.** `runtime/` defines device/program/memory/queue/event lifecycles;
+  `os/` supplies owned host primitives. Vendor command protocols stay below both interfaces.
 
 ## Layout
 
@@ -33,12 +35,17 @@ src/lib.rs              no_std crate root: global allocator, panic handler, mod 
 src/backend/mod.rs      singleton vtable graph (AtomicPtr CAS wiring)
 src/backend/shell.rs    registry + device + backend(stream) vtables
 src/backend/buffer.rs   buffer-type + buffer vtables (host allocation)
-src/hal.rs              NpuHal — the universal 5-verb submission seam
+src/engine.rs           scheduler split recognition and graph dispatch
+src/ops/                matmul, graph-pattern IR, and host requantization
+src/hal.rs              legacy five-verb compatibility façade
+src/runtime/            portable fallible runtime lifecycle + artifact envelope
+src/host/               host contracts, mock provider, and rustix Linux implementation
 src/vendor/stub.rs      CPU-echo NpuHal (no hardware)
 src/vendor/ivpu/        Intel NPU (Level Zero + OpenVINO); level_zero/ vendored headers   <- active
+src/vendor/ivpu/direct/ feature-gated Linux intel_vpu discovery/resource UAPI (no submit)
 src/vendor/xdna/        AMD Ryzen AI (XRT + mlir-aie)                                       skeleton
 src/vendor/hexagon/     Qualcomm Hexagon (FastRPC/QNN + hexagon-mlir)                       skeleton
-tests/registration_check.c   self-contained Phase 0 verifier (mimics ggml's DL loader)
+tests/registration_check.c   self-contained registration verifier (mimics ggml's DL loader)
 build.rs                bindgen driver (locates ggml headers + clang resource dir)
 ```
 
@@ -56,7 +63,20 @@ build.rs                bindgen driver (locates ggml headers + clang resource di
 ```sh
 cargo build --release                 # -> target/release/libggml_npu.so
 GGML_DIR=/path/to/llama.cpp cargo build --release   # if not a sibling
+cargo check --features direct-ivpu    # safe direct Linux foundation; no graph execution
 ```
+
+The direct runtime boundary and exact prerequisites for a first direct matmul are documented in
+[`docs/direct-runtime-foundation.md`](docs/direct-runtime-foundation.md). The existing OpenVINO and
+Level Zero runtime remains the default compatibility path. `direct-ivpu` enables a no-std,
+ELF-only Goblin configuration for device artifacts; host shared-library loading continues to use
+the platform `dlopen`/`dlsym` boundary.
+
+Host microbenchmarks use feature-gated Criterion, while llama-bench remains the end-to-end pp/tg
+framework; see [`docs/benchmarking.md`](docs/benchmarking.md). The io_uring transport decision is
+documented in [`docs/io-uring-assessment.md`](docs/io-uring-assessment.md).
+Persistent and in-process key semantics are documented in
+[`docs/identity.md`](docs/identity.md).
 
 `ggml_*` symbols are left undefined and resolve at `dlopen` from the host; set
 `GGML_LIB_DIR=/dir/with/libggml-base.so` to link deterministically instead. The cdylib is
@@ -65,7 +85,7 @@ GGML_DIR=/path/to/llama.cpp cargo build --release   # if not a sibling
 ## Verify
 
 ```sh
-./tests/run_registration_check.sh     # -> PHASE 0 PASS (ACCEL, api_version 2, supports_op false)
+./tests/run_registration_check.sh     # -> REGISTRATION PASS
 ```
 
 End-to-end, against a host built with `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON`:
@@ -75,10 +95,33 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
   /path/to/llama.cpp/build/bin/test-backend-ops support -b NPU
 ```
 
-## What's next
+## Diagnostics
 
-`vendor/ivpu`: `probe` and the raw Level Zero graph-ext submit (`ze.rs` + `graph.rs`) are
-done and verified on hardware. Next: wire it into `graph_compute` — have `supports_op` claim
-a fixed-shape `MUL_MAT`, map ggml tensors to graph args, and compile-on-miss into a
-shape-keyed blob cache — verified vs CPU with `ggml_backend_compare_graph_backend`. Then
-decompose `run_native_blob` into the `NpuHal` load/alloc/bind/submit/sync verbs.
+- `GGML_NPU_TRACE=1` prints each assigned scheduler split with op ids, shapes, strides, data
+  addresses, and NPU-buffer ownership.
+- `GGML_NPU_PROFILE=1` reports stage-in, submit, device/sync, and copy-out time at process exit.
+- `GGML_NPU_DEBUG=1` enables failure-path notes.
+- `GGML_NPU_BITS=4|8|16` overrides the host-side requant width for quality/performance studies.
+- `GGML_NPU_DEVICE_CLASS=npu|igpu|gpu|accel` overrides the scheduler identity. `npu` is the
+  default; `igpu` is an experiment that permits whole-layer model placement.
+- `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV and FlashAttention candidates; the default keeps
+  attention on GPU while allowing constant-weight/QKV projections.
+- `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path.
+- `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
+- `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
+  any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.
+- `GGML_NPU_LFM_SHORTCONV=1` opts into ancestry-based placement of LFM convolution segments while
+  leaving sequence gather/write setup and unrelated attention/MoE glue on CPU/GPU.
+
+Run the mandatory operation/capability gate with `./tests/run_coverage_gate.sh`. Set `MODEL` to
+also run two fresh-process, timeout- and memory-guarded LFM prefill/decode checks with MoE,
+ShortConv, and full attention enabled. The default keeps model placement on CPU (`NGL=0`) and pulls
+eligible NPU splits; `NPU_ONLY=1 NPU_DEVICE_CLASS=igpu` remains an explicit experiment. Whole-layer
+placement previously reached only 1.84 prompt tok/s versus roughly 53 tok/s for Vulkan+NPU
+enumeration, and cold compilation of large routed-expert graphs can exceed the default timeout.
+
+## Roadmap
+
+The backend is moving from bespoke op matching to an independent graph-oriented compiler:
+correctness and cache-lifetime gates first, then LFM ShortConv state, sparse MoE feasibility,
+heterogeneous attention, broad llama.cpp graph coverage, and asynchronous cost-based placement.

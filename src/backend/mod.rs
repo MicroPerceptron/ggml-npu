@@ -7,6 +7,7 @@
 //! `ggml_backend_init` once, so the race is a formality we nonetheless handle correctly.
 
 mod buffer;
+mod external;
 mod shell;
 
 use core::ffi::{c_char, c_int};
@@ -59,9 +60,9 @@ fn get_or_init() -> *mut Handles {
 /// Device description: the probed NPU name if present, else a generic fallback. The
 /// literals contain no interior NUL, so `CString::new` cannot fail on them.
 fn make_description() -> CString {
-    match crate::vendor::primary_npu_name() {
-        Some(name) => CString::new(alloc::format!("NPU: {name} (Level Zero)"))
-            .unwrap_or_else(|_| CString::new("NPU (Level Zero)").unwrap()),
+    match crate::vendor::devices().into_iter().next() {
+        Some(dev) => CString::new(alloc::format!("NPU: {}", dev.name))
+            .unwrap_or_else(|_| CString::new("NPU").unwrap()),
         None => CString::new("Universal NPU (no device; CPU fallback)").unwrap(),
     }
 }
@@ -112,6 +113,36 @@ fn device() -> *mut ggml_backend_device {
 
 fn buffer_type() -> *mut ggml_backend_buffer_type {
     unsafe { &mut (*get_or_init()).buft }
+}
+
+/// Whether `tensor` lives in **our** buffer type — i.e. its `data` is NPU-mapped memory
+/// (allocated via the vendor's `alloc_host`) that can be bound as a graph argument with **no
+/// copy**. False for foreign buffers (a CPU-produced activation, a weight the model kept on
+/// CPU), which the vendor must stage through a bounce buffer. O(1): a pointer compare against
+/// our singleton buffer-type. Since our buffer type only ever hands out NPU memory (it fails
+/// the allocation otherwise), "our buft" ⟺ "NPU-mapped", so this is exact.
+pub(crate) unsafe fn owns_tensor(tensor: *const ggml_tensor) -> bool {
+    if tensor.is_null() {
+        return false;
+    }
+    let buf = (*tensor).buffer;
+    !buf.is_null() && (*buf).buft == buffer_type()
+}
+
+pub(crate) unsafe fn shared_view(
+    tensor: *const ggml_tensor,
+) -> Option<crate::interop::SharedAllocationView> {
+    buffer::shared_view(tensor)
+}
+
+/// Identity epoch for model-resident NPU buffers. Graph caches include this value because their
+/// programs bake weights and therefore must not survive an unload/reload address reuse.
+pub(crate) fn buffer_generation() -> u64 {
+    buffer::generation()
+}
+
+pub(crate) fn allocated_bytes() -> usize {
+    buffer::allocated_bytes()
 }
 
 fn backend_instance() -> *mut ggml_backend {

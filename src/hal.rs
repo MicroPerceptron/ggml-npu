@@ -1,38 +1,38 @@
-//! The universal NPU submission seam.
+//! Legacy five-verb compatibility façade.
 //!
-//! Half the project's value is that all three target NPUs collapse onto **five verbs**:
+//! Compatibility adapters still reach this API. New runtimes should implement the explicit
+//! ownership and lifecycle contracts in [`crate::runtime::RuntimeHal`]; this trait remains while
+//! the current backend is adapted incrementally.
+//!
+//! The original model collapses target NPUs onto **five verbs**:
 //! `load`, `alloc`, `bind`, `submit`, `sync`. The submission surface unifies even though
-//! the compilers do not. One implementation per vendor under [`crate::vendor`], each
-//! keeping its own native handles via the associated types (no boxing on the hot path).
+//! compiler and execution adapters do not. Implementations keep their native handles in associated
+//! types, without boxing the hot path.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
 
-/// Allocation hints. On integrated NPUs the host↔device boundary copy is the main tax,
-/// so a host-shared (zero-copy) allocation is the default preference.
+/// Compatibility allocation hints.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BufFlags {
-    /// Prefer a host-shared / mappable allocation where the device supports it
-    /// (XRT `HOST_ONLY` BO, L0 host memory, Qualcomm rpcmem/ION).
+    /// Prefer an allocation visible to both host and accelerator where supported.
     pub host_shared: bool,
 }
 
-/// The unified submission surface. Handles are associated types so each vendor keeps its
-/// own native objects. Device buffers are allocator-parameterizable (`allocator_api`) so a
-/// vendor can back them with a device allocator instead of the global one.
+/// The compatibility submission surface. Associated types retain provider-native ownership.
 pub trait NpuHal {
     type Device;
     type Queue;
-    /// A loaded compiled artifact (xclbin+insts | L0 graph | QNN context).
+    /// A loaded compiled artifact.
     type Binary;
-    /// A device-visible buffer (xrt::bo | zeMemAlloc | rpcmem).
+    /// An accelerator-visible buffer.
     type Buffer;
 
     /// Enumerate NPUs of this vendor.
     fn probe() -> Vec<Self::Device>;
     fn queue_create(&self, dev: &Self::Device) -> Self::Queue;
 
-    /// LOAD (once, off the hot path): register xclbin / create L0 graph / QNN context.
+    /// Load one compiled artifact off the hot path.
     fn load(&self, dev: &Self::Device, artifact: &[u8]) -> Self::Binary;
 
     /// ALLOC: prefer host-shared for zero-copy (see [`BufFlags::host_shared`]).
@@ -42,13 +42,12 @@ pub trait NpuHal {
     fn sync_to_device(&self, buf: &Self::Buffer);
     fn sync_from_device(&self, buf: &Self::Buffer);
 
-    /// BIND argument `index`: positional kernel arg (XRT) | graph-arg index (L0) | named
-    /// tensor (QNN). The lowering must emit the arg order/names the binder expects.
+    /// Bind a buffer to the artifact's positional argument contract.
     fn bind(&self, bin: &mut Self::Binary, index: u32, buf: &Self::Buffer);
 
-    /// SUBMIT: run.start(opcode=3) | AppendGraphExecute+Execute | qnnGraphExecute.
+    /// Submit one execution.
     fn submit(&self, q: &Self::Queue, bin: &Self::Binary);
 
-    /// SYNC: run.wait() | zeCommandQueueSynchronize | FastRPC return.
+    /// Wait for prior submissions.
     fn sync(&self, q: &Self::Queue);
 }

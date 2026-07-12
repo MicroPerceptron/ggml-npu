@@ -1,0 +1,11 @@
+timestamp_utc=20260711T230251Z
+mode=npu
+model=../llama.cpp/models/LFM2.5-8B-A1B-Q4_K_M.gguf
+bench=../llama.cpp/build-dl/bin/llama-bench
+attention_placement=qkv
+npu_bits=auto
+npu_async=0
+Linux CassMantle 7.1.3-200.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Sat Jul  4 19:20:12 UTC 2026 x86_64 GNU/Linux
+               total        used        free      shared  buff/cache   available
+Mem:     16272031744 10091950080   556761088   321986560  6078017536  6180081664
+Swap:     8589930496  5498052608  3091877888

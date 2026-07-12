@@ -1,5 +1,10 @@
-/target
 **/*.rs.bk
 *.o
 *.so
+
+/target
+/shim/build/
 /tests/registration_check
+/benchmarks/results/
+
+__pycache__/

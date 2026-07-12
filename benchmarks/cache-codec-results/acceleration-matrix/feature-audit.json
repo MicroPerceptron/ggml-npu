@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "date": "2026-07-12",
+  "selection": {
+    "codec": "Zstandard",
+    "level": 1,
+    "provider": "system-libzstd-so-1",
+    "portable_default": true,
+    "fallback": "Disable artifact tiers and compile normally when the ABI, symbols, or supported version are unavailable."
+  },
+  "zstd": {
+    "versions": {
+      "zstd": "0.13.3",
+      "zstd-safe": "7.2.4",
+      "zstd-sys": "2.0.16+zstd.1.5.7",
+      "bundled_libzstd": "1.5.7",
+      "system_libzstd": "1.5.7-5.fc44"
+    },
+    "benchmark_features": [
+      "zstd/default-features=false"
+    ],
+    "disabled_defaults": [
+      "legacy",
+      "arrays",
+      "zdict_builder",
+      "bindgen"
+    ],
+    "portable_c_flags": [
+      "-O3",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-fPIC",
+      "-m64",
+      "-fvisibility=hidden",
+      "-fmerge-all-constants"
+    ],
+    "runtime_dispatch": "BMI2 on generic GCC/Clang x86 builds",
+    "compile_time_acceleration": "x86-64 SSE2 baseline; AArch64 NEON; general AVX2 only when enabled in CFLAGS",
+    "assembly": "x86-64 Huffman decompression assembly enabled; no_asm is disabled",
+    "no_asm_result": "Exclusive pair: 860.6 versus 798.9 MiB/s aggregate decompression with identical output and compression throughput.",
+    "lto": "fat-lto failed with GCC/rust-lld; fat-lto/thin-lto require coordinated Clang/LLVM plugin LTO and are not portable defaults.",
+    "thin": "Size-minification mode; disables dynamic BMI2 and forces smaller decoders.",
+    "pkg_config": "Requests static linkage; no libzstd.a is installed by the Fedora development package on this host.",
+    "architecture_coverage": [
+      "x86",
+      "x86_64",
+      "aarch64",
+      "other C-supported targets"
+    ]
+  },
+  "structured_zstd": {
+    "version": "0.0.48",
+    "benchmark_features": [
+      "default-features=false",
+      "std",
+      "hash",
+      "kernel_sse2",
+      "kernel_bmi2",
+      "kernel_avx2",
+      "kernel_neon",
+      "kernel_sve",
+      "kernel_simd128"
+    ],
+    "deliberately_disabled": [
+      "kernel_vbmi2"
+    ],
+    "implementation": "Stable std::arch target_feature kernels; no nightly portable_simd.",
+    "dispatch": "std runtime decode dispatch; no_std compile-time target_feature selection.",
+    "active_kernel": "avx2",
+    "encoder_acceleration": "Independent runtime BMI2 Huffman writer on x86 and SVE2-tagged histogram path on AArch64; kernel feature removal is decode-scalar, not wholly scalar.",
+    "architecture_coverage": [
+      "x86",
+      "x86_64",
+      "aarch64",
+      "wasm32-simd128",
+      "scalar fallback"
+    ]
+  },
+  "zrip": {
+    "versions": {
+      "zrip": "0.8.3",
+      "fearless_simd": "0.5.0"
+    },
+    "benchmark_features": [
+      "default-features=false",
+      "std",
+      "frame",
+      "ldm",
+      "simd"
+    ],
+    "implementation": "Stable fearless_simd target-feature dispatch in decode sequence execution only; encoder has no explicit SIMD.",
+    "active_kernel": "avx2",
+    "nightly": "Not enabled; it controls optimization attributes, not SIMD availability.",
+    "architecture_coverage": [
+      "x86-sse4.2",
+      "x86_64-avx2",
+      "aarch64-neon",
+      "wasm32-simd128",
+      "scalar fallback"
+    ]
+  },
+  "lz4_flex": {
+    "version": "0.13.1",
+    "portable_features": [
+      "default-features=false",
+      "safe-encode",
+      "safe-decode",
+      "checked-decode"
+    ],
+    "implementation": "No runtime SIMD dispatcher; compile-time AVX can affect a small copy primitive.",
+    "unsafe_reference": "Disabling safe/checking paths measured 715.5/1625.0 versus 604.7/1407.7 MiB/s aggregate, but is not suitable for persistent records.",
+    "selection": "Reference only; 1.052x aggregate ratio."
+  },
+  "host": {
+    "cpu": "Intel(R) Core(TM) Ultra 5 226V",
+    "affinity": "2-3",
+    "core_group": "4.5 GHz performance cores",
+    "governor": "powersave",
+    "frequency_range_khz": [
+      400000,
+      4500000
+    ],
+    "runtime_features": [
+      "sse2",
+      "sse4.2",
+      "avx",
+      "avx2",
+      "bmi1",
+      "bmi2",
+      "f16c",
+      "fma",
+      "lzcnt",
+      "movbe",
+      "popcnt",
+      "xsave"
+    ],
+    "rustc": "1.99.0-nightly f10db292a, LLVM 22.1.8",
+    "cargo": "1.99.0-nightly 2f0e7011e",
+    "cc": "GCC 16.1.1"
+  }
+}

@@ -1,8 +1,8 @@
-/* registration_check.c — Phase 0 verification for the ggml-npu backend.
+/* registration_check.c — dynamic registration smoke test for the ggml-npu backend.
  *
  * Mimics ggml's dynamic-backend loader (dlopen + ggml_backend_init + api_version
  * check) WITHOUT building all of llama.cpp, then walks the four vtables to confirm
- * the backend registers as an ACCEL device and claims no ops (supports_op == false).
+ * the backend registers as the requested device class and safely rejects a null operation probe.
  *
  * Build (needs the llama.cpp headers; -rdynamic so our stub ggml symbol is visible
  * to the dlopened .so under RTLD_NOW, exactly as a real host exports ggml's symbols):
@@ -14,19 +14,31 @@
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
-/* The only ggml symbol our cdylib references. Real hosts provide it from libggml;
- * here a stub is enough (never called: supports_op==false => no allocation). */
+/* ggml symbols our cdylib references. Real hosts provide these from libggml; here stubs
+ * are enough to satisfy RTLD_NOW — none are called during this registration check (we only
+ * probe with a null op, which supports_op rejects before touching them). */
 ggml_backend_buffer_t ggml_backend_buffer_init(
         ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i iface,
         void * context,
         size_t size) {
     (void) buft; (void) iface; (void) context; (void) size;
+    return NULL;
+}
+int ggml_graph_n_nodes(struct ggml_cgraph * g) { (void) g; return 0; }
+struct ggml_tensor * ggml_graph_node(struct ggml_cgraph * g, int i) { (void) g; (void) i; return NULL; }
+bool ggml_is_contiguous(const struct ggml_tensor * t) { (void) t; return true; }
+bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t b) { (void) b; return false; }
+/* Only needed to satisfy RTLD_NOW. The null-op smoke test never dereferences this result. */
+const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
+    (void) type;
     return NULL;
 }
 
@@ -65,7 +77,7 @@ int main(int argc, char ** argv) {
         passed = passed && c_;                                      \
     } while (0)
 
-    printf("ggml-npu Phase 0 registration check: %s\n\n", path);
+    printf("ggml-npu registration smoke test: %s\n\n", path);
 
     printf("api_version   = %d\n", reg->api_version);
     printf("registry name = %s\n", reg->iface.get_name(reg));
@@ -77,6 +89,8 @@ int main(int argc, char ** argv) {
     printf("device desc   = %s\n", dev->iface.get_description(dev));
     int dtype = (int) dev->iface.get_type(dev);
     printf("device type   = %d\n", dtype);
+    struct ggml_backend_dev_props props;
+    dev->iface.get_props(dev, &props);
     int sop = dev->iface.supports_op(dev, NULL) ? 1 : 0;
     printf("supports_op   = %d\n", sop);
 
@@ -90,13 +104,19 @@ int main(int argc, char ** argv) {
     printf("\nassertions:\n");
     CHECK(reg->api_version == GGML_BACKEND_API_VERSION, "api_version == GGML_BACKEND_API_VERSION (2)");
     CHECK(ndev == 1, "exactly one device");
-    CHECK(dtype == GGML_BACKEND_DEVICE_TYPE_ACCEL, "device type is ACCEL");
-    CHECK(sop == 0, "supports_op returns false (pure CPU fallback)");
+    const char * device_class = getenv("GGML_NPU_DEVICE_CLASS");
+    int expected_type = GGML_BACKEND_DEVICE_TYPE_NPU;
+    if (device_class && strcmp(device_class, "accel") == 0) expected_type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    if (device_class && strcmp(device_class, "gpu") == 0)   expected_type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    if (device_class && strcmp(device_class, "igpu") == 0)  expected_type = GGML_BACKEND_DEVICE_TYPE_IGPU;
+    CHECK(dtype == expected_type, "device type matches native/override class");
+    CHECK((int) props.type == dtype, "get_props type matches get_type");
+    CHECK(sop == 0, "supports_op(NULL) safely returns false");
     CHECK(buft != NULL, "get_buffer_type is non-null");
     if (buft) {
         CHECK(buft->iface.get_alignment(buft) >= 1, "buffer type reports sane alignment");
     }
 
-    printf("\n%s\n", passed ? "PHASE 0 PASS" : "PHASE 0 FAIL");
+    printf("\n%s\n", passed ? "REGISTRATION PASS" : "REGISTRATION FAIL");
     return passed ? 0 : 1;
 }
