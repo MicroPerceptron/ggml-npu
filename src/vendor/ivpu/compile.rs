@@ -771,7 +771,61 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Graph IR v2: one ABI for complete scheduler splits. The first Intel lowering supports the
 // dense/ShortConv building blocks; capability remains conservative as more WireOps are added.
+//
+// `supports_op` (`graph_node_feasible`) and `graph_support` (`graph_feasible`) share the same
+// wire-op allowlist, MoE/attention env gates, input-arity ceiling, and compiler/runtime readiness
+// checks so the scheduler cannot over-claim work the lowerer will reject (#8).
 // ---------------------------------------------------------------------------
+
+/// Wire ops the Intel graph compiler admits today. Keep in lockstep with shim lowering.
+/// Coverage gates compare this set to `tests/coverage_matrix.csv` so claims cannot outrun proofs (#12).
+/// Env/policy gates are applied separately via `env_policy_admits` (#8).
+pub(crate) fn wire_op_compile_supported(op: crate::graph::WireOp) -> bool {
+    matches!(
+        op,
+        crate::graph::WireOp::MatMul
+            | crate::graph::WireOp::Mul
+            | crate::graph::WireOp::Add
+            | crate::graph::WireOp::RmsNorm
+            | crate::graph::WireOp::Silu
+            | crate::graph::WireOp::Reshape
+            | crate::graph::WireOp::View
+            | crate::graph::WireOp::Cont
+            | crate::graph::WireOp::Transpose
+            | crate::graph::WireOp::Concat
+            | crate::graph::WireOp::Copy
+            | crate::graph::WireOp::SsmConv
+            | crate::graph::WireOp::Rope
+            | crate::graph::WireOp::GetRows
+            | crate::graph::WireOp::SetRows
+            | crate::graph::WireOp::Scale
+            | crate::graph::WireOp::Div
+            | crate::graph::WireOp::Clamp
+            | crate::graph::WireOp::Argsort
+            | crate::graph::WireOp::MatMulId
+            | crate::graph::WireOp::Sigmoid
+            | crate::graph::WireOp::SumRows
+            | crate::graph::WireOp::SoftMax
+            | crate::graph::WireOp::FlashAttention
+            | crate::graph::WireOp::Permute
+            | crate::graph::WireOp::Swiglu
+    )
+}
+
+/// Shared MoE / attention policy gates used by both per-node and whole-graph feasibility.
+fn env_policy_admits(spec: &crate::graph::OpSpec, runtime_matmul: bool) -> bool {
+    if spec.traits.moe && !moe_enabled() {
+        return false;
+    }
+    if (spec.traits.attention || runtime_matmul) && !attention_full() {
+        return false;
+    }
+    true
+}
+
+fn compiler_runtime_ready() -> bool {
+    execution_runtime_available() && shim().and_then(|s| s.compile_graph).is_some()
+}
 
 pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
     if !execution_runtime_available() {
@@ -833,54 +887,24 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
             ));
             return false;
         };
-        if spec.traits.moe && !moe_enabled() {
-            super::profile::note(&alloc::format!(
-                "[npu ir2] node {index} rejected: MoE op {op:?} requires GGML_NPU_MOE=1\n"
-            ));
-            return false;
-        }
         let runtime_matmul = op == crate::graph::WireOp::MatMul
             && node
                 .inputs
                 .first()
                 .and_then(|&id| graph.values.get(id as usize))
                 .is_some_and(|value| value.role != TensorRole::Constant);
-        if (spec.traits.attention || runtime_matmul) && !attention_full() {
+        if !env_policy_admits(&spec, runtime_matmul) {
+            let reason = if spec.traits.moe && !moe_enabled() {
+                "MoE op requires GGML_NPU_MOE=1"
+            } else {
+                "attention/runtime-matmul requires GGML_NPU_ATTENTION=full"
+            };
             super::profile::note(&alloc::format!(
-                "[npu ir2] node {index} rejected: attention op {op:?} requires GGML_NPU_ATTENTION=full\n"
+                "[npu ir2] node {index} rejected: {reason} ({op:?})\n"
             ));
             return false;
         }
-        let supported = matches!(
-            op,
-            crate::graph::WireOp::MatMul
-                | crate::graph::WireOp::Mul
-                | crate::graph::WireOp::Add
-                | crate::graph::WireOp::RmsNorm
-                | crate::graph::WireOp::Silu
-                | crate::graph::WireOp::Reshape
-                | crate::graph::WireOp::View
-                | crate::graph::WireOp::Cont
-                | crate::graph::WireOp::Transpose
-                | crate::graph::WireOp::Concat
-                | crate::graph::WireOp::Copy
-                | crate::graph::WireOp::SsmConv
-                | crate::graph::WireOp::Rope
-                | crate::graph::WireOp::GetRows
-                | crate::graph::WireOp::SetRows
-                | crate::graph::WireOp::Scale
-                | crate::graph::WireOp::Div
-                | crate::graph::WireOp::Clamp
-                | crate::graph::WireOp::Argsort
-                | crate::graph::WireOp::MatMulId
-                | crate::graph::WireOp::Sigmoid
-                | crate::graph::WireOp::SumRows
-                | crate::graph::WireOp::SoftMax
-                | crate::graph::WireOp::FlashAttention
-                | crate::graph::WireOp::Permute
-                | crate::graph::WireOp::Swiglu
-        );
-        if !supported || node.inputs.len() > IR_MAX_INPUTS {
+        if !wire_op_compile_supported(op) || node.inputs.len() > IR_MAX_INPUTS {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected: wire op {op:?}, inputs={}\n",
                 node.inputs.len()
@@ -895,30 +919,18 @@ pub(super) unsafe fn graph_node_feasible(
     node: *const crate::ffi::ggml_tensor,
     spec: &crate::graph::OpSpec,
 ) -> bool {
-    if !tensor_constant_admitted(node) {
+    if node.is_null() || !compiler_runtime_ready() || !tensor_constant_admitted(node) {
         return false;
     }
-    let op = Some(spec.wire);
-    let moe_only = matches!(
-        op,
-        Some(
-            crate::graph::WireOp::MatMulId
-                | crate::graph::WireOp::Argsort
-                | crate::graph::WireOp::Sigmoid
-                | crate::graph::WireOp::SumRows
-        )
-    );
-    let attention_only = matches!(
-        op,
-        Some(crate::graph::WireOp::SoftMax | crate::graph::WireOp::Permute)
-    ) || (op == Some(crate::graph::WireOp::MatMul)
-        && !node.is_null()
+    let input_count = (*node).src.iter().filter(|src| !src.is_null()).count();
+    if input_count > IR_MAX_INPUTS || !wire_op_compile_supported(spec.wire) {
+        return false;
+    }
+    // Match graph_feasible: runtime-weight MatMul needs ATTENTION=full (same as traits.attention).
+    let runtime_matmul = spec.wire == crate::graph::WireOp::MatMul
         && !(*node).src[0].is_null()
-        && (*(*node).src[0]).op != crate::ffi::GGML_OP_NONE);
-    shim().and_then(|s| s.compile_graph).is_some()
-        && op.is_some()
-        && (!moe_only || moe_enabled())
-        && (!attention_only || attention_full())
+        && (*(*node).src[0]).op != crate::ffi::GGML_OP_NONE;
+    env_policy_admits(spec, runtime_matmul)
 }
 
 fn moe_enabled() -> bool {
@@ -1705,6 +1717,7 @@ fn subgraph_cache_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::OperationContract;
 
     fn requant(last: u8) -> Requant {
         Requant {
@@ -1749,11 +1762,58 @@ mod tests {
     }
 
     #[test]
+    fn compiler_wire_allowlist_admits_dense_and_rejects_unknown_gaps() {
+        // Shared allowlist used by both supports_op and graph_feasible (#8).
+        assert!(wire_op_compile_supported(crate::graph::WireOp::MatMul));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Silu));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::FlashAttention));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::SsmConv));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::Swiglu));
+    }
+
+    #[test]
+    fn env_policy_gates_use_op_traits_not_partial_wire_lists() {
+        let mut attention = crate::graph::OpRegistry::decode_node(&crate::graph::Node {
+            op: crate::ffi::GGML_OP_SOFT_MAX,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; crate::graph::OP_PARAM_BYTES],
+        })
+        .unwrap();
+        attention.traits.attention = true;
+        attention.traits.moe = false;
+        // Default test env: ATTENTION!=full and MOE unset ⇒ attention/moe rejected.
+        assert!(!env_policy_admits(&attention, false));
+        assert!(!env_policy_admits(&attention, true));
+
+        let mut flash = attention;
+        flash.wire = crate::graph::WireOp::FlashAttention;
+        // Previously graph_node_feasible omitted FlashAttention from its attention gate while
+        // graph_feasible rejected it via traits.attention — that over-claim gap is closed.
+        assert!(!env_policy_admits(&flash, false));
+
+        let mut moe = attention;
+        moe.traits.attention = false;
+        moe.traits.moe = true;
+        moe.wire = crate::graph::WireOp::MatMulId;
+        assert!(!env_policy_admits(&moe, false));
+
+        let mut dense = attention;
+        dense.traits.attention = false;
+        dense.traits.moe = false;
+        dense.wire = crate::graph::WireOp::Add;
+        assert!(env_policy_admits(&dense, false));
+        // Runtime-weight matmul still requires ATTENTION=full even without traits.attention.
+        assert!(!env_policy_admits(&dense, true));
+    }
+
+    #[test]
     fn set_rows_is_not_gated_as_attention() {
         // SetRows must not inherit the attention gate; otherwise ShortConv state-write regions
         // are rejected unless GGML_NPU_ATTENTION=full (#9). Full graph_feasible still needs the
         // OpenVINO shim at runtime — this asserts the contract that removes the false gate.
-        use crate::graph::{Node, OperationContract, OP_PARAM_BYTES};
+        use crate::graph::{Node, OP_PARAM_BYTES};
         let spec = crate::graph::OpRegistry::decode_node(&Node {
             op: crate::ffi::GGML_OP_SET_ROWS,
             spec: Err(crate::graph::OpReject::UnsupportedOp),

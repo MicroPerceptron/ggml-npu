@@ -349,6 +349,22 @@ def execution_path(mode: str, env: dict[str, str], stderr: str) -> dict[str, Any
     }
 
 
+def baseline_eligible(execution: dict[str, Any], status: str = "success") -> bool:
+    """NPU baselines require submission proof tags; unproven NPU runs are never baseline-eligible."""
+    if status != "success":
+        return False
+    runtime = execution.get("runtime") or ""
+    proof = execution.get("proof") or []
+    if runtime.startswith("cpu") or runtime == "vulkan":
+        return bool(proof)
+    if runtime == "direct-ivpu":
+        return bool(execution.get("proven_direct")) and bool(proof)
+    if runtime == "level-zero":
+        return bool(proof)
+    # npu-unproven and unknown runtimes cannot be cited as NPU baselines.
+    return False
+
+
 def workload(row: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
     prompt = int(row.get("n_prompt", env.get("prompt_tokens", 0)) or 0)
     generated = int(row.get("n_gen", env.get("generated_tokens", 0)) or 0)
@@ -421,6 +437,7 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
 
     mode = env.get("mode", "")
     execution = execution_path(mode, env, stderr)
+    execution["baseline_eligible"] = baseline_eligible(execution, status)
     perf_passes = normalize_pass_metrics(read_perf_events(stderr))
     common_metrics = {
         "wall_seconds": float(process["wall_seconds"]) if process and "wall_seconds" in process else None,
@@ -562,6 +579,7 @@ def human_summary(records: list[dict[str, Any]]) -> str:
         if execution["fallback"]:
             path += f" ({execution['fallback']})"
         proof = "; ".join(execution["proof"]) or "no runtime submission proof"
+        eligible = "yes" if execution.get("baseline_eligible") else "no"
         workload_config = record["workload"]
         lines.extend(
             [
@@ -569,6 +587,7 @@ def human_summary(records: list[dict[str, Any]]) -> str:
                 f"{record['run']} · {record['workload']['label']} · {record['status']}",
                 f"  execution: {path}",
                 f"  proof: {proof}",
+                f"  baseline_eligible: {eligible}",
                 *(
                     [f"  compiler: {execution['compiler']}"]
                     if execution["compiler"]
@@ -621,6 +640,11 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, help="write human-readable summary here")
     parser.add_argument("--json-out", type=Path, help="also write normalized JSON here")
+    parser.add_argument(
+        "--require-baseline-proof",
+        action="store_true",
+        help="fail if any successful measurement is not baseline-eligible (rejects npu-unproven)",
+    )
     args = parser.parse_args()
 
     runs = discover(args.paths)
@@ -635,6 +659,23 @@ def main() -> int:
             "measurements": records,
         }
         args.json_out.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    if args.require_baseline_proof:
+        bad = [
+            record
+            for record in records
+            if record.get("status") == "success"
+            and not record.get("execution", {}).get("baseline_eligible")
+        ]
+        if bad:
+            for record in bad:
+                runtime = record.get("execution", {}).get("runtime")
+                proof = record.get("execution", {}).get("proof") or []
+                print(
+                    f"baseline proof required: {record.get('run')} "
+                    f"runtime={runtime} proof={proof or ['(none)']}",
+                    file=sys.stderr,
+                )
+            return 2
     return 0
 
 

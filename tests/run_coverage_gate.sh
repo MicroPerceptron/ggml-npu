@@ -5,6 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
 
 cd "$ROOT"
+# Hermetic claim ⊆ coverage matrix (issue #12). Cheap; no MODEL / pp512.
+./tests/run_claim_coverage_check.sh
+
 cargo test
 CARGO_TARGET_DIR="$ROOT/target" cargo build --release
 ./shim/build.sh

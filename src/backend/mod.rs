@@ -7,6 +7,7 @@
 //! `ggml_backend_init` once, so the race is a formality we nonetheless handle correctly.
 
 mod buffer;
+#[cfg(ggml_has_external_memory)]
 mod external;
 mod shell;
 
