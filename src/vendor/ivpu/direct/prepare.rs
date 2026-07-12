@@ -2,11 +2,13 @@
 
 #![allow(dead_code)]
 
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::ptr;
 
 use crate::host::MemoryMapping;
 use crate::identity::{SemanticDigest, SemanticHasher};
+use crate::interop::{SharedAllocationOwner, SharedAllocationView};
 use crate::runtime::RuntimeError;
 
 use super::elf::ParsedIntelElf;
@@ -15,7 +17,7 @@ use super::hpi::{HpiRequirements, HOST_PARSED_INFERENCE_ALIGNMENT, HOST_PARSED_I
 use super::link::{
     visit_binding_requirements, BindingRequirement, DeviceMemoryClass, PlacedSection,
 };
-use super::linux::LinuxIvpuSharedAllocation;
+use super::linux::{DirectSharedBuffer, LinuxIvpuSharedAllocation};
 use super::load::{stage_program, LoadError, StagedProgram};
 use super::transport::{acquire_device_writes, release_host_writes};
 use super::uapi::{
@@ -40,6 +42,17 @@ const MAX_PREPARED_HANDLES: usize = 64;
 pub struct PreparationBudget {
     pub max_user_bo_bytes: u64,
     pub max_total_accounted_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreparationTimings {
+    pub stage_program_ns: u64,
+    pub binding_import_ns: u64,
+    pub binding_allocate_ns: u64,
+    pub binding_initialize_ns: u64,
+    pub link_ns: u64,
+    pub hpi_ns: u64,
+    pub command_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +82,11 @@ pub struct BindingBuffer<'device> {
     pub section: usize,
     pub class: DeviceMemoryClass,
     pub logical_bytes: u64,
-    pub bo: BufferObject<'device>,
+    pub bo: Rc<BufferObject<'device>>,
     pub backing: BindingBacking,
+    pub allocation_offset: u64,
+    pub direct: bool,
+    pub host_address: Option<core::ptr::NonNull<u8>>,
 }
 
 pub struct PreparedInference<'device> {
@@ -89,6 +105,7 @@ pub struct PreparedInference<'device> {
     pub command_count: usize,
     pub inference_id: u64,
     pub command_digest: SemanticDigest,
+    pub timings: PreparationTimings,
 }
 
 impl PreparedInference<'_> {
@@ -106,18 +123,31 @@ impl PreparedInference<'_> {
         if target.len() != binding.logical_bytes as usize {
             return Err(PrepareError::BindingMismatch);
         }
-        let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
-        if mapping.len() < target.len() {
-            return Err(PrepareError::InvalidMetadata);
-        }
-        acquire_device_writes();
-        // SAFETY: both regions are live, non-overlapping, and exactly bounded by target.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                mapping.address().as_ptr(),
-                target.as_mut_ptr(),
-                target.len(),
-            );
+        if let Some(address) = binding.host_address {
+            acquire_device_writes();
+            // SAFETY: owner-complete tensor allocation remains live with the prepared program.
+            unsafe {
+                ptr::copy_nonoverlapping(address.as_ptr(), target.as_mut_ptr(), target.len());
+            }
+        } else {
+            let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
+            let offset = usize::try_from(binding.allocation_offset)
+                .map_err(|_| PrepareError::InvalidMetadata)?;
+            if offset
+                .checked_add(target.len())
+                .is_none_or(|end| end > mapping.len())
+            {
+                return Err(PrepareError::InvalidMetadata);
+            }
+            acquire_device_writes();
+            // SAFETY: both regions are live, non-overlapping, and exactly bounded by target.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    mapping.address().as_ptr().add(offset),
+                    target.as_mut_ptr(),
+                    target.len(),
+                );
+            }
         }
         Ok(())
     }
@@ -137,10 +167,18 @@ impl PreparedInference<'_> {
             .filter(|binding| binding.class == DeviceMemoryClass::Input)
             .zip(inputs)
         {
+            if binding.direct {
+                continue;
+            }
             if input.len() != binding.logical_bytes as usize {
                 return Err(PrepareError::BindingMismatch);
             }
-            map_and_initialize(&binding.bo, binding.logical_bytes as usize, Some(input))?;
+            map_and_initialize(
+                &binding.bo,
+                binding.allocation_offset as usize,
+                binding.logical_bytes as usize,
+                Some(input),
+            )?;
         }
         Ok(())
     }
@@ -153,12 +191,35 @@ impl PreparedInference<'_> {
             .and_then(|binding| usize::try_from(binding.logical_bytes).ok())
     }
 
+    pub fn input_is_direct(&self, input_index: usize) -> bool {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Input)
+            .nth(input_index)
+            .is_some_and(|binding| binding.direct)
+    }
+
     pub fn output_bytes(&self, output_index: usize) -> Option<usize> {
         self.bindings
             .iter()
             .filter(|binding| binding.class == DeviceMemoryClass::Output)
             .nth(output_index)
             .and_then(|binding| usize::try_from(binding.logical_bytes).ok())
+    }
+
+    pub fn output_is_direct(&self, output_index: usize) -> bool {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.class == DeviceMemoryClass::Output)
+            .nth(output_index)
+            .is_some_and(|binding| binding.direct)
+    }
+
+    pub fn direct_binding_count(&self) -> usize {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.direct)
+            .count()
     }
 
     pub(super) fn output_shared_allocation(
@@ -186,7 +247,20 @@ impl PreparedInference<'_> {
             .iter()
             .filter(|binding| binding.class == DeviceMemoryClass::Output)
         {
-            map_and_initialize(&binding.bo, binding.logical_bytes as usize, None)?;
+            if let Some(address) = binding.host_address {
+                // SAFETY: direct output view is live and bounded by logical_bytes.
+                unsafe {
+                    ptr::write_bytes(address.as_ptr(), 0, binding.logical_bytes as usize);
+                }
+                release_host_writes();
+            } else {
+                map_and_initialize(
+                    &binding.bo,
+                    binding.allocation_offset as usize,
+                    binding.logical_bytes as usize,
+                    None,
+                )?;
+            }
         }
         Ok(())
     }
@@ -197,19 +271,33 @@ impl PreparedInference<'_> {
             .iter()
             .filter(|binding| binding.class == DeviceMemoryClass::Output)
         {
-            let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
-            if mapping.len() < binding.logical_bytes as usize {
-                return Err(PrepareError::InvalidMetadata);
-            }
-            // SAFETY: bounded read-only view while the mapping is alive.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    mapping.address().as_ptr(),
-                    binding.logical_bytes as usize,
-                )
-            };
-            if bytes.iter().any(|byte| *byte != 0) {
-                return Ok(false);
+            if let Some(address) = binding.host_address {
+                // SAFETY: owner-complete tensor allocation remains live and bounded.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(address.as_ptr(), binding.logical_bytes as usize)
+                };
+                if bytes.iter().any(|byte| *byte != 0) {
+                    return Ok(false);
+                }
+            } else {
+                let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
+                let offset = binding.allocation_offset as usize;
+                if offset
+                    .checked_add(binding.logical_bytes as usize)
+                    .is_none_or(|end| end > mapping.len())
+                {
+                    return Err(PrepareError::InvalidMetadata);
+                }
+                // SAFETY: bounded read-only view while the mapping is alive.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        mapping.address().as_ptr().add(offset),
+                        binding.logical_bytes as usize,
+                    )
+                };
+                if bytes.iter().any(|byte| *byte != 0) {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -235,18 +323,24 @@ fn collect_bindings<'a>(
 
 fn map_and_initialize(
     bo: &BufferObject<'_>,
+    offset: usize,
     logical_bytes: usize,
     initial: Option<&[u8]>,
 ) -> Result<(), PrepareError> {
     let mapping = bo.map(true).map_err(PrepareError::Runtime)?;
-    if logical_bytes > mapping.len() || initial.is_some_and(|data| data.len() > logical_bytes) {
+    if offset
+        .checked_add(logical_bytes)
+        .is_none_or(|end| end > mapping.len())
+        || initial.is_some_and(|data| data.len() > logical_bytes)
+    {
         return Err(PrepareError::InvalidMetadata);
     }
     // SAFETY: unique live mapping, with both zeroing and copy bounded to the logical object.
     unsafe {
-        ptr::write_bytes(mapping.address().as_ptr(), 0, logical_bytes);
+        let target = mapping.address().as_ptr().add(offset);
+        ptr::write_bytes(target, 0, logical_bytes);
         if let Some(data) = initial {
-            ptr::copy_nonoverlapping(data.as_ptr(), mapping.address().as_ptr(), data.len());
+            ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
         }
     }
     release_host_writes();
@@ -318,7 +412,17 @@ fn create_bindings<'device>(
     device: &'device IvpuDevice,
     requirements: &[BindingRequirement],
     input_data: &[&[u8]],
-) -> Result<(Vec<BindingBuffer<'device>>, Vec<PlacedSection>, u64), PrepareError> {
+    input_views: &[Option<SharedAllocationView>],
+    output_views: &[Option<SharedAllocationView>],
+) -> Result<
+    (
+        Vec<BindingBuffer<'device>>,
+        Vec<PlacedSection>,
+        u64,
+        PreparationTimings,
+    ),
+    PrepareError,
+> {
     let expected_inputs = requirements
         .iter()
         .filter(|binding| binding.class == DeviceMemoryClass::Input)
@@ -326,8 +430,21 @@ fn create_bindings<'device>(
     if input_data.len() != expected_inputs {
         return Err(PrepareError::BindingMismatch);
     }
+    let expected_outputs = requirements
+        .iter()
+        .filter(|binding| binding.class == DeviceMemoryClass::Output)
+        .count();
+    if (!input_views.is_empty() && input_views.len() != expected_inputs)
+        || (!output_views.is_empty() && output_views.len() != expected_outputs)
+    {
+        return Err(PrepareError::BindingMismatch);
+    }
     let mut buffers = Vec::new();
     let mut placements = Vec::new();
+    let mut imported: Vec<(
+        crate::interop::AllocationIdentity,
+        Rc<BufferObject<'device>>,
+    )> = Vec::new();
     buffers
         .try_reserve_exact(requirements.len())
         .map_err(|_| PrepareError::Allocation)?;
@@ -335,44 +452,142 @@ fn create_bindings<'device>(
         .try_reserve_exact(requirements.len())
         .map_err(|_| PrepareError::Allocation)?;
     let mut input_index = 0usize;
+    let mut output_index = 0usize;
     let mut total = 0u64;
+    let measure = crate::trace::perf_enabled();
+    let mut timings = PreparationTimings::default();
     for requirement in requirements {
-        let initial = if requirement.class == DeviceMemoryClass::Input {
+        let (initial, shared_view) = if requirement.class == DeviceMemoryClass::Input {
             let data = input_data[input_index];
+            let view = input_views.get(input_index).copied().flatten();
             input_index += 1;
             if data.len() != requirement.bytes as usize {
                 return Err(PrepareError::BindingMismatch);
             }
-            Some(data)
+            (Some(data), view)
         } else {
-            None
+            let view = output_views.get(output_index).copied().flatten();
+            output_index += 1;
+            (None, view)
         };
         let requested_bytes = requirement.allocation_bytes.max(1);
-        let (bo, backing) = match LinuxIvpuSharedAllocation::allocate(
-            requested_bytes,
-            requirement.alignment.min(rustix::param::page_size() as u64),
-        )
-        .and_then(|allocation| device.import_shared(allocation))
-        {
-            Ok(bo) => (bo, BindingBacking::ImportedShared),
-            Err(_) => (
-                device
-                    .create_bo(requested_bytes, DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
-                    .map_err(PrepareError::Runtime)?,
-                BindingBacking::IvpuGem,
-            ),
+        let (bo, backing, allocation_offset, direct, is_new) = if let Some(view) = shared_view {
+            let owner =
+                DirectSharedBuffer::from_token(view.token).ok_or(PrepareError::BindingMismatch)?;
+            if owner.identity() != view.identity
+                || owner.ownership() != crate::interop::AllocationOwnership::Backend
+                || view.bytes < requirement.bytes as usize
+                || view
+                    .offset
+                    .checked_add(requested_bytes as usize)
+                    .is_none_or(|end| end > view.allocation_bytes)
+            {
+                return Err(PrepareError::BindingMismatch);
+            }
+            if let Some((_, existing)) = imported
+                .iter()
+                .find(|(identity, _)| *identity == view.identity)
+            {
+                (
+                    existing.clone(),
+                    BindingBacking::ImportedShared,
+                    view.offset as u64,
+                    true,
+                    false,
+                )
+            } else {
+                let started = if measure {
+                    super::super::profile::now_ns()
+                } else {
+                    0
+                };
+                let imported_bo = Rc::new(
+                    device
+                        .import_shared_unretained(
+                            owner
+                                .duplicate_allocation()
+                                .map_err(PrepareError::Runtime)?,
+                        )
+                        .map_err(|_| PrepareError::BindingMismatch)?,
+                );
+                if measure {
+                    timings.binding_import_ns = timings
+                        .binding_import_ns
+                        .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+                }
+                imported
+                    .try_reserve(1)
+                    .map_err(|_| PrepareError::Allocation)?;
+                imported.push((view.identity, imported_bo.clone()));
+                (
+                    imported_bo,
+                    BindingBacking::ImportedShared,
+                    view.offset as u64,
+                    true,
+                    true,
+                )
+            }
+        } else {
+            let started = if measure {
+                super::super::profile::now_ns()
+            } else {
+                0
+            };
+            let (bo, backing) = match LinuxIvpuSharedAllocation::allocate(
+                requested_bytes,
+                requirement.alignment.min(rustix::param::page_size() as u64),
+            )
+            .and_then(|allocation| device.import_shared(allocation))
+            {
+                Ok(bo) => (bo, BindingBacking::ImportedShared),
+                Err(_) => (
+                    device
+                        .create_bo(requested_bytes, DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
+                        .map_err(PrepareError::Runtime)?,
+                    BindingBacking::IvpuGem,
+                ),
+            };
+            if measure {
+                timings.binding_allocate_ns = timings
+                    .binding_allocate_ns
+                    .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+            }
+            (Rc::new(bo), backing, 0, false, true)
         };
         let info = bo.info().map_err(PrepareError::Runtime)?;
-        if info.vpu_address % requirement.alignment != 0 {
+        let device_address = info
+            .vpu_address
+            .checked_add(allocation_offset)
+            .ok_or(PrepareError::InvalidMetadata)?;
+        if device_address % requirement.alignment != 0 {
             return Err(PrepareError::InvalidMetadata);
         }
-        map_and_initialize(&bo, requirement.allocation_bytes as usize, initial)?;
-        total = total
-            .checked_add(info.bytes)
-            .ok_or(PrepareError::BudgetExceeded)?;
+        if !direct {
+            let started = if measure {
+                super::super::profile::now_ns()
+            } else {
+                0
+            };
+            map_and_initialize(
+                &bo,
+                allocation_offset as usize,
+                requirement.allocation_bytes as usize,
+                initial,
+            )?;
+            if measure {
+                timings.binding_initialize_ns = timings
+                    .binding_initialize_ns
+                    .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+            }
+        }
+        if is_new && !direct {
+            total = total
+                .checked_add(info.bytes)
+                .ok_or(PrepareError::BudgetExceeded)?;
+        }
         placements.push(PlacedSection {
             section: requirement.section,
-            device_address: info.vpu_address,
+            device_address,
             bytes: requirement.allocation_bytes,
         });
         buffers.push(BindingBuffer {
@@ -381,9 +596,12 @@ fn create_bindings<'device>(
             logical_bytes: requirement.bytes,
             bo,
             backing,
+            allocation_offset,
+            direct,
+            host_address: shared_view.map(|view| view.address),
         });
     }
-    Ok((buffers, placements, total))
+    Ok((buffers, placements, total, timings))
 }
 
 fn build_command_bytes(
@@ -438,7 +656,7 @@ fn create_command<'device>(
         hpi_info.vpu_address,
         inference_id,
     );
-    map_and_initialize(&command, COMMAND_LOGICAL_BYTES, Some(&bytes))?;
+    map_and_initialize(&command, 0, COMMAND_LOGICAL_BYTES, Some(&bytes))?;
     let mut hasher = SemanticHasher::new(b"direct-ivpu/inference-command");
     hasher.field(b"command-bytes", &bytes);
     Ok((command, command_info.bytes, hasher.finish()))
@@ -452,20 +670,78 @@ pub fn prepare_inference<'device>(
     input_data: &[&[u8]],
     budget: PreparationBudget,
 ) -> Result<PreparedInference<'device>, PrepareError> {
+    prepare_inference_shared(
+        device,
+        parameters,
+        elf,
+        hpi_requirements,
+        input_data,
+        &[],
+        &[],
+        budget,
+    )
+}
+
+pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
+    device: &'device IvpuDevice,
+    parameters: &DeviceParameters,
+    elf: &ParsedIntelElf<'_>,
+    hpi_requirements: &HpiRequirements,
+    input_data: &[&[u8]],
+    input_views: &[Option<SharedAllocationView>],
+    output_views: &[Option<SharedAllocationView>],
+    budget: PreparationBudget,
+) -> Result<PreparedInference<'device>, PrepareError> {
     validate_device(parameters).map_err(PrepareError::Validation)?;
+    let measure = crate::trace::perf_enabled();
+    let started = if measure {
+        super::super::profile::now_ns()
+    } else {
+        0
+    };
     let mut staged = stage_program(device, elf, hpi_requirements, budget.max_user_bo_bytes)
         .map_err(PrepareError::Load)?;
+    let stage_program_ns = if measure {
+        super::super::profile::now_ns().saturating_sub(started)
+    } else {
+        0
+    };
     let requirements = collect_bindings(elf)?;
-    let (bindings, binding_placements, binding_bo_bytes) =
-        create_bindings(device, &requirements, input_data)?;
+    let (bindings, binding_placements, binding_bo_bytes, mut timings) =
+        create_bindings(device, &requirements, input_data, input_views, output_views)?;
+    timings.stage_program_ns = stage_program_ns;
+    let started = if measure {
+        super::super::profile::now_ns()
+    } else {
+        0
+    };
     staged
         .apply_jit_bindings(elf, &binding_placements)
         .map_err(PrepareError::Load)?;
+    if measure {
+        timings.link_ns = super::super::profile::now_ns().saturating_sub(started);
+    }
+    let started = if measure {
+        super::super::profile::now_ns()
+    } else {
+        0
+    };
     let (hpi, hpi_bo_bytes) = create_hpi(device, elf, hpi_requirements, staged.entry_address)?;
+    if measure {
+        timings.hpi_ns = super::super::profile::now_ns().saturating_sub(started);
+    }
     let inference_id = device
         .get_param(DRM_IVPU_PARAM_UNIQUE_INFERENCE_ID, 0)
         .map_err(PrepareError::Runtime)?;
+    let started = if measure {
+        super::super::profile::now_ns()
+    } else {
+        0
+    };
     let (command, command_bo_bytes, command_digest) = create_command(device, &hpi, inference_id)?;
+    if measure {
+        timings.command_ns = super::super::profile::now_ns().saturating_sub(started);
+    }
     let total_user_bo_bytes = staged
         .total_bo_bytes
         .checked_add(binding_bo_bytes)
@@ -487,7 +763,12 @@ pub fn prepare_inference<'device>(
     handles.push(command.handle());
     handles.extend(staged.sections().iter().map(|section| section.bo.handle()));
     handles.push(hpi.handle());
-    handles.extend(bindings.iter().map(|binding| binding.bo.handle()));
+    for binding in &bindings {
+        let handle = binding.bo.handle();
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
     for (index, &handle) in handles.iter().enumerate() {
         if handle == 0 || handles[..index].contains(&handle) {
             return Err(PrepareError::InvalidMetadata);
@@ -524,17 +805,21 @@ pub fn prepare_inference<'device>(
         vpu_address: hpi_info.vpu_address,
         bytes: HOST_PARSED_INFERENCE_BYTES,
     });
-    ranges.extend(
-        bindings
+    for binding in &bindings {
+        if ranges
             .iter()
-            .zip(&binding_placements)
-            .map(|(binding, placement)| MemoryRange {
-                handle: binding.bo.handle(),
-                role: super::transport::BufferRole::Binding,
-                vpu_address: placement.device_address,
-                bytes: placement.bytes.max(1),
-            }),
-    );
+            .any(|range| range.handle == binding.bo.handle())
+        {
+            continue;
+        }
+        let info = binding.bo.info().map_err(PrepareError::Runtime)?;
+        ranges.push(MemoryRange {
+            handle: binding.bo.handle(),
+            role: super::transport::BufferRole::Binding,
+            vpu_address: info.vpu_address,
+            bytes: info.bytes,
+        });
+    }
 
     let command_mapping = command.map(false).map_err(PrepareError::Runtime)?;
     if command_mapping.len() < COMMAND_LOGICAL_BYTES {
@@ -600,7 +885,10 @@ pub fn prepare_inference<'device>(
         if !expected_backing
             || info.flags & super::uapi::DRM_IVPU_BO_READ_ONLY != 0
             || info.vpu_address != binding.bo.vpu_address()
-            || info.bytes < binding.logical_bytes
+            || binding
+                .allocation_offset
+                .checked_add(binding.logical_bytes)
+                .is_none_or(|end| end > info.bytes)
         {
             return Err(PrepareError::InvalidMetadata);
         }
@@ -623,7 +911,9 @@ pub fn prepare_inference<'device>(
         command_count,
         inference_id,
         command_digest,
+        timings,
     };
+    prepared.zero_outputs()?;
     if !prepared.outputs_are_zero()? {
         return Err(PrepareError::InvalidMetadata);
     }

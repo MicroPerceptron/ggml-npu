@@ -2,3 +2,11 @@
 	path = third_party/intel-npu-compiler
 	url = https://github.com/MicroPerceptron/intel-npu-compiler.git
 	branch = develop
+[submodule "third_party/amd-npu-compiler"]
+	path = third_party/amd-npu-compiler
+	url = https://github.com/MicroPerceptron/amd-npu-compiler.git
+	branch = main
+[submodule "third_party/qualcomm-npu-compiler"]
+	path = third_party/qualcomm-npu-compiler
+	url = https://github.com/MicroPerceptron/qualcomm-npu-compiler.git
+	branch = main

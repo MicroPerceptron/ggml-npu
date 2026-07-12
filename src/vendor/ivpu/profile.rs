@@ -67,6 +67,8 @@ static N_STAGED_OCCURRENCES: AtomicU64 = AtomicU64::new(0);
 static N_STAGED_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
 static STAGED_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
+static N_SHARED_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static SHARED_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
 static BYTES_IN: AtomicU64 = AtomicU64::new(0);
 static BYTES_OUT: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +189,10 @@ impl MetricsSink for ProfileSink {
                 N_STAGED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
                 STAGED_ALLOCATION_BYTES.fetch_add(bytes, Ordering::Relaxed);
             }
+            MetricEvent::SharedAllocation { bytes, .. } => {
+                N_SHARED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                SHARED_ALLOCATION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
             MetricEvent::MemoryState {
                 resident_bytes,
                 resident_high_water,
@@ -247,6 +253,8 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
     let staged_allocations = N_STAGED_ALLOCATIONS.load(Ordering::Relaxed);
     let staged_bytes = STAGED_BYTES.load(Ordering::Relaxed);
     let staged_allocation_bytes = STAGED_ALLOCATION_BYTES.load(Ordering::Relaxed);
+    let shared_allocations = N_SHARED_ALLOCATIONS.load(Ordering::Relaxed);
+    let shared_allocation_bytes = SHARED_ALLOCATION_BYTES.load(Ordering::Relaxed);
     let (bin, bout) = (
         BYTES_IN.load(Ordering::Relaxed),
         BYTES_OUT.load(Ordering::Relaxed),
@@ -262,6 +270,7 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
          \x20 copy-out (bounce->host) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 ---- host copy total    : {:>9.3} ms  ({:.1}%)     device total: {:.3} ms ({:.1}%)\n\
          \x20 bindings: {direct} direct / {shared} shared / {imported} imported / {staged} staged occurrences ({:.1}% no-copy of {bindings})\n\
+         \x20 shared allocations: {shared_allocations} unique, {:.2} MiB imported/direct\n\
          \x20 bounce allocations: {staged_allocations} unique, {:.2} MiB allocated; {:.2} MiB copied across occurrences\n\
          \x20 direct memory: resident {:.2} MiB, resident high {:.2} MiB, accounted high {:.2} MiB, limit {:.2} MiB, evicted {:.2} MiB\n\
          \x20 latest program: executable {:.2} MiB, bindings {:.2} MiB, HPI {:.2} MiB, command {:.2} MiB, preemption {:.2} MiB\n",
@@ -289,6 +298,7 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         ms(td),
         pct(td, total),
         pct(direct + shared + imported, bindings.max(1)),
+        shared_allocation_bytes as f64 / 1.048576e6,
         staged_allocation_bytes as f64 / 1.048576e6,
         staged_bytes as f64 / 1.048576e6,
         RESIDENT_BYTES.load(Ordering::Relaxed) as f64 / 1.048576e6,

@@ -164,6 +164,7 @@ pub struct TensorDesc {
     pub role: TensorRole,
     pub data: usize,
     pub owned: bool,
+    pub shared: Option<crate::interop::SharedAllocationView>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +185,49 @@ pub struct GraphIr {
     pub nodes: Vec<Node>,
     pub inputs: Vec<ValueId>,
     pub outputs: Vec<ValueId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionReason {
+    WholeGraph,
+    DisconnectedRegion,
+    MutableStateBoundary,
+    ExpertBankLimit,
+    FeasibilityLimit,
+}
+
+impl PartitionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WholeGraph => "whole_graph",
+            Self::DisconnectedRegion => "disconnected_region",
+            Self::MutableStateBoundary => "mutable_state_boundary",
+            Self::ExpertBankLimit => "expert_bank_limit",
+            Self::FeasibilityLimit => "feasibility_limit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionPolicy {
+    /// Routed expert banks are intentionally isolated: each can be hundreds of MiB and has
+    /// independent selection semantics. Dense constants have no analogous arbitrary node cap.
+    pub max_expert_banks: usize,
+}
+
+impl Default for PartitionPolicy {
+    fn default() -> Self {
+        Self {
+            max_expert_banks: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionPartition {
+    pub graph: GraphIr,
+    pub reason: PartitionReason,
+    pub start: usize,
 }
 
 fn has_name_prefix(t: &ggml_tensor, prefix: &[u8]) -> bool {
@@ -211,6 +255,7 @@ unsafe fn describe(t: *const ggml_tensor, role: TensorRole) -> TensorDesc {
         role,
         data: x.data as usize,
         owned: crate::backend::owns_tensor(t),
+        shared: crate::backend::shared_view(t),
     }
 }
 
@@ -674,44 +719,83 @@ impl GraphIr {
         (OpRegistry::decode_node(node).ok() == Some(captured)).then_some(captured.wire)
     }
 
-    /// Split a scheduler graph into independently compilable, sequential artifacts. Crossing
-    /// values retain their ggml-allocated data pointers and become an output of one partition plus
-    /// a runtime input of the next. Limiting routed expert banks is more important than raw node
-    /// count: each `MatMulId` carries a very large constant bank and must become cacheable on its
-    /// own rather than waiting for a monolithic multi-bank compile.
-    pub fn execution_partitions(&self, max_nodes: usize, max_matmul_id: usize) -> Vec<GraphIr> {
-        if self.nodes.is_empty() || max_nodes == 0 || max_matmul_id == 0 {
+    /// Plan the largest semantically connected regions before vendor feasibility is considered.
+    /// There is deliberately no raw node-count limit. Boundaries exist only for disconnected work,
+    /// independent mutable-state effects, and multiple routed expert banks. A caller may further
+    /// bisect a region when its concrete compiler/runtime rejects it.
+    pub fn execution_regions(&self, policy: PartitionPolicy) -> Vec<ExecutionPartition> {
+        if self.nodes.is_empty() || policy.max_expert_banks == 0 {
             return Vec::new();
         }
-        let mut ranges = Vec::new();
+        let mut ranges: Vec<(usize, usize, PartitionReason)> = Vec::new();
         let mut start = 0usize;
-        while start < self.nodes.len() {
-            let mut end = start;
-            let mut routed_banks = 0usize;
-            while end < self.nodes.len() {
-                let routed = Self::wire_op(&self.nodes[end]) == Some(WireOp::MatMulId);
-                if end > start
-                    && (end - start >= max_nodes || (routed && routed_banks >= max_matmul_id))
-                {
-                    break;
-                }
-                routed_banks += usize::from(routed);
-                end += 1;
+        let mut touched = vec![false; self.values.len()];
+        let mut routed_banks = 0usize;
+        let mut mutable_effect_seen = false;
+        let mut next_reason = PartitionReason::WholeGraph;
+        for (index, node) in self.nodes.iter().enumerate() {
+            let spec = node.spec.ok();
+            let routed = Self::wire_op(node) == Some(WireOp::MatMulId);
+            let mutable_effect = spec.is_some_and(|spec| {
+                spec.traits.stateful
+                    || node.inputs.iter().any(|&id| {
+                        self.values
+                            .get(id as usize)
+                            .is_some_and(|value| value.role == TensorRole::MutableState)
+                    })
+                    || self
+                        .values
+                        .get(node.output as usize)
+                        .is_some_and(|value| value.role == TensorRole::MutableState)
+            });
+            let connected = index == start
+                || node
+                    .inputs
+                    .iter()
+                    .any(|&id| touched.get(id as usize).copied().unwrap_or(false));
+            let boundary = if index > start && routed && routed_banks >= policy.max_expert_banks {
+                Some(PartitionReason::ExpertBankLimit)
+            } else if index > start && mutable_effect && mutable_effect_seen && !connected {
+                Some(PartitionReason::MutableStateBoundary)
+            } else if index > start && !connected {
+                Some(PartitionReason::DisconnectedRegion)
+            } else {
+                None
+            };
+            if let Some(reason) = boundary {
+                ranges.push((start, index, next_reason));
+                start = index;
+                touched.fill(false);
+                routed_banks = 0;
+                mutable_effect_seen = false;
+                next_reason = reason;
             }
-            ranges.push((start, end));
-            start = end;
+            for &input in &node.inputs {
+                if let Some(value) = touched.get_mut(input as usize) {
+                    *value = true;
+                }
+            }
+            if let Some(value) = touched.get_mut(node.output as usize) {
+                *value = true;
+            }
+            routed_banks += usize::from(routed);
+            mutable_effect_seen |= mutable_effect;
         }
-        if ranges.len() == 1 {
-            return vec![self.clone()];
-        }
-
+        ranges.push((start, self.nodes.len(), next_reason));
         ranges
             .into_iter()
-            .filter_map(|(start, end)| self.partition_range(start, end))
+            .filter_map(|(start, end, reason)| {
+                self.partition_range(start, end)
+                    .map(|graph| ExecutionPartition {
+                        graph,
+                        reason,
+                        start,
+                    })
+            })
             .collect()
     }
 
-    fn partition_range(&self, start: usize, end: usize) -> Option<GraphIr> {
+    pub(crate) fn partition_range(&self, start: usize, end: usize) -> Option<GraphIr> {
         if start >= end || end > self.nodes.len() {
             return None;
         }
@@ -878,7 +962,117 @@ mod tests {
             role,
             data,
             owned: false,
+            shared: None,
         }
+    }
+
+    fn add_node(inputs: Vec<ValueId>, output: ValueId) -> Node {
+        Node {
+            op: GGML_OP_ADD,
+            spec: decode_spec(GGML_OP_ADD, 0, 0.0, 0, 2),
+            inputs,
+            output,
+            op_params: [0; OP_PARAM_BYTES],
+        }
+    }
+
+    #[test]
+    fn partition_policy_fuses_connected_graphs_larger_than_eight_nodes() {
+        let mut values = vec![
+            value(TensorRole::RuntimeInput, 1, Dim::Static(4)),
+            value(TensorRole::RuntimeInput, 2, Dim::Static(4)),
+        ];
+        let mut nodes = Vec::new();
+        let mut previous = 0;
+        for index in 0..12 {
+            let output = values.len() as ValueId;
+            values.push(value(
+                if index == 11 {
+                    TensorRole::Output
+                } else {
+                    TensorRole::Intermediate
+                },
+                10 + index,
+                Dim::Static(4),
+            ));
+            nodes.push(add_node(vec![previous, 1], output));
+            previous = output;
+        }
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes,
+            inputs: vec![0, 1],
+            outputs: vec![previous],
+        };
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].graph.nodes.len(), 12);
+        assert_eq!(regions[0].reason, PartitionReason::WholeGraph);
+    }
+
+    #[test]
+    fn partition_policy_limits_only_routed_expert_banks() {
+        let values = vec![
+            value(TensorRole::Constant, 1, Dim::Static(4)),
+            value(TensorRole::RuntimeInput, 2, Dim::Static(4)),
+            value(TensorRole::RuntimeInput, 3, Dim::Static(1)),
+            value(TensorRole::Intermediate, 4, Dim::Static(4)),
+            value(TensorRole::Constant, 5, Dim::Static(4)),
+            value(TensorRole::Output, 6, Dim::Static(4)),
+        ];
+        let routed = |inputs, output| Node {
+            op: GGML_OP_MUL_MAT_ID,
+            spec: decode_spec(GGML_OP_MUL_MAT_ID, 0, 0.0, 0, 3),
+            inputs,
+            output,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![routed(vec![0, 1, 2], 3), routed(vec![4, 3, 2], 5)],
+            inputs: vec![0, 1, 2, 4],
+            outputs: vec![5],
+        };
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].graph.nodes.len(), 1);
+        assert_eq!(regions[1].graph.nodes.len(), 1);
+        assert_eq!(regions[1].reason, PartitionReason::ExpertBankLimit);
+        assert_eq!(regions[0].graph.outputs.len(), 1);
+        assert_eq!(regions[1].graph.inputs.len(), 2);
+    }
+
+    #[test]
+    fn partition_range_preserves_crossing_state_and_output_order() {
+        let mut state = value(TensorRole::MutableState, 1, Dim::Static(4));
+        state.owned = true;
+        let values = vec![
+            state,
+            value(TensorRole::RuntimeInput, 2, Dim::Static(4)),
+            value(TensorRole::MutableState, 3, Dim::Static(4)),
+            value(TensorRole::Output, 4, Dim::Static(4)),
+        ];
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![add_node(vec![0, 1], 2), add_node(vec![2, 1], 3)],
+            inputs: vec![0, 1],
+            outputs: vec![2, 3],
+        };
+        let first = graph.partition_range(0, 1).unwrap();
+        assert_eq!(first.outputs.len(), 1);
+        assert_eq!(
+            first.values[first.outputs[0] as usize].role,
+            TensorRole::MutableState
+        );
+        let second = graph.partition_range(1, 2).unwrap();
+        assert!(second
+            .inputs
+            .iter()
+            .any(|&input| { second.values[input as usize].role == TensorRole::MutableState }));
+        assert_eq!(second.outputs.len(), 1);
     }
 
     #[test]

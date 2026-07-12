@@ -183,6 +183,29 @@ impl Vendor for IvpuVendor {
             }
         }
     }
+
+    fn alloc_shared_backend(
+        &self,
+        size: usize,
+    ) -> Option<alloc::boxed::Box<dyn crate::interop::SharedAllocationOwner>> {
+        #[cfg(all(feature = "direct-ivpu", not(feature = "level-zero-compat")))]
+        {
+            return direct::linux::DirectSharedBuffer::allocate(size).ok();
+        }
+        #[cfg(any(not(feature = "direct-ivpu"), feature = "level-zero-compat"))]
+        {
+            let _ = size;
+            None
+        }
+    }
+
+    fn note_shared_allocation(&self, identity: crate::interop::AllocationIdentity, bytes: usize) {
+        profile::event(crate::metrics::MetricEvent::SharedAllocation {
+            allocation: identity.external_id(),
+            bytes: bytes as u64,
+            imported: false,
+        });
+    }
 }
 
 /// Bring-up self-test: run a native (OpenVINO-compiled) blob on the first discovered NPU,

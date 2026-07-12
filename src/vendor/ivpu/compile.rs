@@ -22,10 +22,12 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void};
 use core::mem;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::graph::{Dim, GraphIr, TensorRole, OP_PARAM_BYTES};
-use crate::host::{ConfigService, DynamicLibraryService, HostEnvironment, LibraryVisibility};
+use crate::host::{
+    ConfigService, DynamicLibraryService, HostEnvironment, LibraryVisibility, MemoryStatusService,
+};
 use crate::identity::{SemanticDigest, SemanticHasher};
 use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
@@ -33,6 +35,128 @@ use crate::ops::Operand;
 
 /// Persistent artifact namespace. Increment whenever compiler semantics or framing changes.
 const FORMAT_VERSION: u64 = 8;
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_HOST_FLOOR_BYTES: u64 = 4096 * MIB;
+const DEFAULT_EXPANDED_CONSTANT_FRACTION: u64 = 8;
+const DEFAULT_MAX_EXPANDED_CONSTANT_BYTES: u64 = 256 * MIB;
+static EXPANDED_CONSTANT_BUDGET: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn config_mib(name: &core::ffi::CStr) -> Option<u64> {
+    let value = crate::host::builtin().config().value(name)?;
+    let mut parsed = 0u64;
+    for &byte in value.to_bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        parsed = parsed
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+    }
+    parsed.checked_mul(MIB)
+}
+
+fn predicted_compiler_constant_bytes(elements: u64) -> u64 {
+    // Current native ELF evidence is approximately f16 plus compiler alignment/metadata. Keep a
+    // small safety margin so placement rejects before a 500+ MiB payload enters the T0 cycle.
+    elements.saturating_mul(33).saturating_add(15) / 16
+}
+
+fn expanded_constant_budget() -> u64 {
+    let cached = EXPANDED_CONSTANT_BUDGET.load(Ordering::Acquire);
+    if cached != u64::MAX {
+        return cached;
+    }
+    let budget = config_mib(c"GGML_NPU_EXPANDED_CONSTANT_MB").unwrap_or_else(|| {
+        let resident = config_mib(c"GGML_NPU_RESIDENT_MB").unwrap_or_else(|| {
+            crate::host::builtin()
+                .memory()
+                .available_memory_bytes()
+                .unwrap_or(0)
+                .saturating_sub(DEFAULT_HOST_FLOOR_BYTES)
+        });
+        (resident / DEFAULT_EXPANDED_CONSTANT_FRACTION).min(DEFAULT_MAX_EXPANDED_CONSTANT_BYTES)
+    });
+    match EXPANDED_CONSTANT_BUDGET.compare_exchange(
+        u64::MAX,
+        budget,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => budget,
+        Err(existing) => existing,
+    }
+}
+
+fn expanded_constant_admitted(predicted: u64, budget: u64, override_enabled: bool) -> bool {
+    override_enabled || (budget != 0 && predicted <= budget)
+}
+
+fn constant_elements(value: &crate::graph::TensorDesc) -> u64 {
+    value.dims.into_iter().fold(1u64, |product, dim| {
+        let extent = match dim {
+            Dim::Static(value) => value,
+            Dim::Bounded { max, .. } => max,
+        };
+        product.saturating_mul(extent.max(0) as u64)
+    })
+}
+
+fn graph_constant_admitted(graph: &GraphIr, node: &crate::graph::Node) -> bool {
+    if GraphIr::wire_op(node) != Some(crate::graph::WireOp::MatMul) {
+        return true;
+    }
+    let Some(weight) = node
+        .inputs
+        .first()
+        .and_then(|&id| graph.values.get(id as usize))
+        .filter(|value| value.role == TensorRole::Constant)
+    else {
+        return true;
+    };
+    let predicted = predicted_compiler_constant_bytes(constant_elements(weight));
+    let budget = expanded_constant_budget();
+    let override_enabled = crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_ALLOW_GIANT_CONSTANTS");
+    let admitted = expanded_constant_admitted(predicted, budget, override_enabled);
+    if !admitted {
+        crate::trace::perf(
+            "placement_rejection",
+            &alloc::format!(
+                ",\"reason\":\"expanded_constant_budget\",\"predicted_bytes\":{predicted},\"budget_bytes\":{budget},\"override\":\"GGML_NPU_ALLOW_GIANT_CONSTANTS\""
+            ),
+        );
+    }
+    admitted
+}
+
+unsafe fn tensor_constant_admitted(node: *const crate::ffi::ggml_tensor) -> bool {
+    if node.is_null() || (*node).op != crate::ffi::GGML_OP_MUL_MAT {
+        return true;
+    }
+    let weight = (*node).src[0];
+    if weight.is_null() || (*weight).op != crate::ffi::GGML_OP_NONE {
+        return true;
+    }
+    let elements = (*weight).ne.iter().fold(1u64, |product, &extent| {
+        product.saturating_mul(extent.max(0) as u64)
+    });
+    let predicted = predicted_compiler_constant_bytes(elements);
+    let budget = expanded_constant_budget();
+    let override_enabled = crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_ALLOW_GIANT_CONSTANTS");
+    let admitted = expanded_constant_admitted(predicted, budget, override_enabled);
+    if !admitted {
+        crate::trace::perf(
+            "placement_rejection",
+            &alloc::format!(
+                ",\"reason\":\"expanded_constant_budget\",\"predicted_bytes\":{predicted},\"budget_bytes\":{budget},\"override\":\"GGML_NPU_ALLOW_GIANT_CONSTANTS\""
+            ),
+        );
+    }
+    admitted
+}
 
 fn execution_runtime_available() -> bool {
     #[cfg(feature = "level-zero-compat")]
@@ -462,6 +586,12 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
         }
     }
     for (index, node) in graph.nodes.iter().enumerate() {
+        if !graph_constant_admitted(graph, node) {
+            super::profile::note(&alloc::format!(
+                "[npu ir2] node {index} rejected: expanded_constant_budget\n"
+            ));
+            return false;
+        }
         let Ok(spec) = node.spec else {
             super::profile::note(&alloc::format!(
                 "[npu ir2] node {index} rejected by operation contract: {:?}\n",
@@ -538,6 +668,9 @@ pub(super) unsafe fn graph_node_feasible(
     node: *const crate::ffi::ggml_tensor,
     spec: &crate::graph::OpSpec,
 ) -> bool {
+    if !tensor_constant_admitted(node) {
+        return false;
+    }
     let op = Some(spec.wire);
     let moe_only = matches!(
         op,
@@ -604,6 +737,7 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
             elems,
             dtype: t.dtype,
             owned: t.owned,
+            shared: t.shared,
         };
         // Tiny convolution kernels are not group-quantizable; preserve them as f16.
         let bits = if k % 32 == 0 {
@@ -611,7 +745,43 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
         } else {
             16
         };
+        let requant_started = if crate::trace::perf_enabled() {
+            super::profile::now_ns()
+        } else {
+            0
+        };
         let rq = requant::requant(&operand, k, n, bits, asymmetric())?;
+        if crate::trace::perf_enabled() {
+            let traits = unsafe { crate::ffi::ggml_get_type_traits(t.dtype) };
+            let source_bytes = if traits.is_null() {
+                0
+            } else {
+                let traits = unsafe { &*traits };
+                usize::try_from(traits.blck_size)
+                    .ok()
+                    .filter(|&block| block != 0 && elems % block == 0)
+                    .and_then(|block| {
+                        elems
+                            .checked_div(block)
+                            .and_then(|count| count.checked_mul(traits.type_size))
+                    })
+                    .unwrap_or(0)
+            };
+            crate::trace::perf(
+                "constant_canonicalization",
+                &alloc::format!(
+                    ",\"graph_key\":\"{}\",\"value\":{id},\"source_dtype\":{},\"source_bytes\":{source_bytes},\"canonical_bits\":{},\"canonical_bytes\":{},\"requant_ns\":{}",
+                    graph.semantic_key().digest().hex(),
+                    t.dtype,
+                    rq.bits,
+                    rq.weight
+                        .len()
+                        .saturating_add(rq.scales.len())
+                        .saturating_add(rq.zeros.len()),
+                    super::profile::now_ns().saturating_sub(requant_started),
+                ),
+            );
+        }
         req_index[id] = Some(requants.len());
         requants.push(rq);
     }
@@ -681,6 +851,11 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
         .filter(|&id| graph.values[id as usize].role != TensorRole::Constant)
         .collect();
 
+    let key_started = if crate::trace::perf_enabled() {
+        super::profile::now_ns()
+    } else {
+        0
+    };
     let mut key_hasher = persistent_hasher(b"persistent/graph-ir-v2");
     key_hasher
         .u64(b"tensor-count", tensors.len() as u64)
@@ -764,8 +939,23 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
         key_hasher.u32(b"output-id", id);
     }
     let key = persistent_key("ir2", key_hasher, &alloc::format!("n{}", nodes.len()));
+    let key_text = key.as_c_str().to_str().unwrap_or("invalid-cache-key");
+    if crate::trace::perf_enabled() {
+        crate::trace::perf(
+            "program_phase",
+            &alloc::format!(
+                ",\"persistent_key\":\"{key_text}\",\"phase\":\"persistent_key\",\"elapsed_ns\":{}",
+                super::profile::now_ns().saturating_sub(key_started),
+            ),
+        );
+    }
     let mut blob = ptr::null_mut();
     let mut len = 0usize;
+    let compiler_started = if crate::trace::perf_enabled() {
+        super::profile::now_ns()
+    } else {
+        0
+    };
     let rc = unsafe {
         compile(
             tensors.len() as i32,
@@ -783,6 +973,16 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
     };
     if rc != 0 || blob.is_null() || len == 0 {
         return None;
+    }
+    if crate::trace::perf_enabled() {
+        crate::trace::perf(
+            "compiler_artifact",
+            &alloc::format!(
+                ",\"persistent_key\":\"{key_text}\",\"nodes\":{},\"elapsed_ns\":{},\"elf_bytes\":{len}",
+                nodes.len(),
+                super::profile::now_ns().saturating_sub(compiler_started),
+            ),
+        );
     }
     let out = unsafe { core::slice::from_raw_parts(blob, len) }.to_vec();
     unsafe { (s.free)(blob) };
@@ -1100,5 +1300,22 @@ mod tests {
             cache_key(&requant(7), 0x1000, 0, 1, 32, 1),
             cache_key(&requant(7), 0x1000, 1, 1, 32, 1)
         );
+    }
+
+    #[test]
+    fn expanded_constant_admission_is_budget_based_and_overridable() {
+        let output_head = predicted_compiler_constant_bytes(128_000 * 2_048);
+        assert!(output_head > 500 * MIB);
+        assert!(!expanded_constant_admitted(output_head, 384 * MIB, false));
+        assert!(expanded_constant_admitted(output_head, 600 * MIB, false));
+        assert!(expanded_constant_admitted(output_head, 1, true));
+    }
+
+    #[test]
+    fn expanded_constant_prediction_tracks_f16_sized_native_payload() {
+        let elements = 512 * 2_048;
+        let predicted = predicted_compiler_constant_bytes(elements);
+        assert!(predicted >= elements * 2);
+        assert!(predicted <= elements * 3);
     }
 }

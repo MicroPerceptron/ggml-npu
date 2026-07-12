@@ -127,6 +127,138 @@ class SummaryTests(unittest.TestCase):
             self.assertIsNone(records[0]["metrics"]["latency_mean_seconds"])
             self.assertIsNone(records[0]["metrics"]["peak_rss_bytes"])
 
+    def test_normalizes_dispatches_and_churn_per_explicit_pass(self) -> None:
+        events = [
+            {
+                "schema": 1,
+                "source": "llama-bench",
+                "event": "pass_begin",
+                "phase": "warmup",
+                "index": 0,
+                "prompt_tokens": 512,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-scheduler",
+                "event": "scheduler_split_begin",
+                "split": 0,
+                "backend": "NPU",
+                "nodes": 12,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-scheduler",
+                "event": "scheduler_split_end",
+                "split": 0,
+                "elapsed_ns": 30,
+                "handoff_begin_ns": 2,
+                "handoff_end_ns": 3,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "program_cache",
+                "outcome": "cold_miss",
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "dispatch",
+                "stage_in_ns": 1,
+                "submit_ns": 2,
+                "wait_ns": 3,
+                "copy_out_ns": 4,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "program_phase",
+                "phase": "elf_parse",
+                "elapsed_ns": 5,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "constant_canonicalization",
+                "source_bytes": 40,
+                "canonical_bytes": 80,
+                "requant_ns": 6,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "compiler_artifact",
+                "elf_bytes": 120,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "graph_partition",
+                "nodes": 12,
+            },
+            {
+                "schema": 1,
+                "source": "llama-bench",
+                "event": "pass_end",
+                "phase": "warmup",
+                "elapsed_ns": 100,
+            },
+            {
+                "schema": 1,
+                "source": "llama-bench",
+                "event": "pass_begin",
+                "phase": "sample",
+                "index": 0,
+                "prompt_tokens": 512,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "program_cache",
+                "outcome": "rehydration",
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "program_eviction",
+                "bytes": 512,
+            },
+            {
+                "schema": 1,
+                "source": "ggml-npu",
+                "event": "dispatch",
+                "stage_in_ns": 10,
+                "submit_ns": 20,
+                "wait_ns": 30,
+                "copy_out_ns": 40,
+            },
+            {
+                "schema": 1,
+                "source": "llama-bench",
+                "event": "pass_end",
+                "phase": "sample",
+                "elapsed_ns": 1_000,
+            },
+        ]
+        passes = summarize.normalize_pass_metrics(events)
+        self.assertEqual(len(passes), 2)
+        self.assertEqual(passes[0]["dispatches"], 1)
+        self.assertEqual(passes[0]["scheduler_splits"], 1)
+        self.assertEqual(passes[0]["scheduler_backends"], {"NPU": 1})
+        self.assertEqual(passes[0]["scheduler_backend_nodes"], {"NPU": 12})
+        self.assertEqual(passes[0]["scheduler_backend_ns"], {"NPU": 30})
+        self.assertEqual(passes[0]["scheduler_handoff_ns"], 5)
+        self.assertEqual(passes[0]["cold_misses"], 1)
+        self.assertEqual(passes[0]["program_phase_ns"], {"elf_parse": 5})
+        self.assertEqual(passes[0]["constant_source_bytes"], 40)
+        self.assertEqual(passes[0]["constant_canonical_bytes"], 80)
+        self.assertEqual(passes[0]["max_artifact_bytes"], 120)
+        self.assertEqual(passes[0]["program_node_histogram"], {"12": 1})
+        self.assertEqual(passes[1]["rehydrations"], 1)
+        self.assertEqual(passes[1]["evicted_bytes"], 512)
+        self.assertEqual(passes[1]["direct_ns"], 100)
+        self.assertEqual(passes[1]["unattributed_ns"], 900)
+
 
 if __name__ == "__main__":
     unittest.main()

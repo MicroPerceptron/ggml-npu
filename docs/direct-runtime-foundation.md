@@ -140,6 +140,30 @@ returned to 28 open FDs, RSS changed from 160,020 KiB to 160,212 KiB, swap staye
 driver's reported memory utilization returned to its 68,714,496-byte baseline. Kernel logs gained
 no IVPU reset, fault, MMU, firmware, OOM, or hang entry; the device returned to D3hot.
 
+## Direct queue overlap boundary
+
+The default direct path remains synchronous by design. Graph-region planning now makes data,
+mutable-state, and output dependencies explicit, but a prepared inference still owns one reusable
+command BO and scheduler handoff ownership is returned at the end of each split. Submitting the
+next dependent partition before command-BO completion would permit command reuse, output reads, or
+external-memory ownership transfer while the device still owns the prior job.
+
+Safe overlap requires a per-submission completion object, command-buffer slots that are not reused
+until that completion, pinning resident programs and shared allocations through completion, and a
+dependency DAG that can prove two regions share neither values nor mutable state. The current
+driver targets do not expose an `uring_cmd` path, and host thread pools do not establish those
+invariants. Until queue/event ownership supports them, direct submission intentionally performs
+`submit -> finite command-BO wait -> output/ownership release`.
+
+## Resident budget stability
+
+The direct context snapshots its configured/host-derived resident byte budget before the first
+program load. It does not recompute the limit from live `MemAvailable` while canonicalization,
+artifact reads, page cache, and BO preparation are increasing process pressure. Recomputing had
+allowed a claimed graph to become inadmissible during the same pass and caused cyclic eviction.
+The tiered cache may consume this stable capacity input, but changing tiers must not make placement
+or admission depend on transient pressure after a graph has been claimed.
+
 ## Current parity
 
 - Discovery and identity: **direct proven**, Level Zero proven.

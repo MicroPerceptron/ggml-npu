@@ -5,8 +5,6 @@
 //! pointers plus host-sized lengths; converting them to integers would discard provenance and
 //! lifetime information.
 
-#![allow(dead_code)]
-
 use core::fmt;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;

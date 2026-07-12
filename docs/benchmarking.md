@@ -35,6 +35,18 @@ Criterion output is generated under `target/criterion/`, already excluded by `/t
 - optional energy;
 - timeout, process-group cleanup, and an NPU MemAvailable guard.
 
+All timed full-model and cache/quant microbenchmarks on a shared host use the same exclusive lock:
+
+```sh
+flock -x /tmp/ggml-npu-bench-global.lock \
+  taskset -c 0-7 env GGML_NPU_BENCH_LOCK=/tmp/ggml-npu-bench-global.lock \
+  THREADS=8 ./benchmarks/run_lfm_baseline.sh
+```
+
+The harness records the lock path, inherited CPU affinity, start/end load average, memory pressure,
+RSS, swap, and device memory. A run that overlaps another benchmark is invalid for comparison even
+if it completes; builds and correctness tests do not require the benchmark lock.
+
 llama-bench remains authoritative for pp/tg model measurements. Criterion numbers are host
 microbenchmarks and cannot be compared directly with token throughput, latency, energy, or model
 quality.

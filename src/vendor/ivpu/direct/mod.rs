@@ -216,6 +216,21 @@ impl IvpuDevice {
         &self,
         allocation: LinuxIvpuSharedAllocation,
     ) -> Result<BufferObject<'_>, RuntimeError> {
+        self.import_shared_impl(allocation, true)
+    }
+
+    pub(super) fn import_shared_unretained(
+        &self,
+        allocation: LinuxIvpuSharedAllocation,
+    ) -> Result<BufferObject<'_>, RuntimeError> {
+        self.import_shared_impl(allocation, false)
+    }
+
+    fn import_shared_impl(
+        &self,
+        allocation: LinuxIvpuSharedAllocation,
+        retain_allocation: bool,
+    ) -> Result<BufferObject<'_>, RuntimeError> {
         if !self.prime_capabilities()?.import {
             return Err(RuntimeError::Unsupported);
         }
@@ -239,7 +254,7 @@ impl IvpuDevice {
             requested_bytes: descriptor.bytes,
             vpu_address: info.vpu_addr,
             backing: BufferBacking::ImportedShared,
-            shared: Some(allocation),
+            shared: retain_allocation.then_some(allocation),
         })
     }
 }
@@ -457,7 +472,14 @@ impl BufferObject<'_> {
     pub fn destroy(mut self) -> Result<(), RuntimeError> {
         let handle = self.handle;
         self.handle = 0;
-        self.device.file.close_bo(handle)
+        if self.backing == BufferBacking::ImportedShared {
+            // PRIME_FD_TO_HANDLE may return an existing per-file handle without adding a userspace
+            // close reference. Keep imported handles until the device file closes to avoid
+            // invalidating another prepared program that shares the same allocation.
+            Ok(())
+        } else {
+            self.device.file.close_bo(handle)
+        }
     }
 
     /// Wait for this BO to become idle. This is meaningful for a command BO only after a future
@@ -484,7 +506,9 @@ impl BufferObject<'_> {
 impl Drop for BufferObject<'_> {
     fn drop(&mut self) {
         if self.handle != 0 {
-            let _ = self.device.file.close_bo(self.handle);
+            if self.backing != BufferBacking::ImportedShared {
+                let _ = self.device.file.close_bo(self.handle);
+            }
             self.handle = 0;
         }
     }
@@ -1020,6 +1044,7 @@ mod tests {
                 role,
                 data: 0,
                 owned: false,
+                shared: None,
             }
         }
 

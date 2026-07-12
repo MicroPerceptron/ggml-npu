@@ -29,6 +29,7 @@ pub fn run(graph: &GraphIr) -> bool {
                 })?,
                 dtype: t.dtype,
                 owned: t.owned,
+                shared: t.shared,
             })
         })
         .collect();
@@ -48,6 +49,7 @@ pub fn run(graph: &GraphIr) -> bool {
                 })?,
                 dtype: t.dtype,
                 owned: t.owned,
+                shared: t.shared,
             })
         })
         .collect();

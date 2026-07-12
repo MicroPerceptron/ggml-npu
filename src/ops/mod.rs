@@ -30,6 +30,7 @@ pub struct Operand {
     pub dtype: crate::ffi::ggml_type,
     #[allow(dead_code)]
     pub owned: bool,
+    pub shared: Option<crate::interop::SharedAllocationView>,
 }
 
 impl Operand {
@@ -42,6 +43,7 @@ impl Operand {
             elems: (d.ne[0] * d.ne[1] * d.ne[2] * d.ne[3]) as usize,
             dtype: d.type_,
             owned: crate::backend::owns_tensor(t),
+            shared: crate::backend::shared_view(t),
         }
     }
 }

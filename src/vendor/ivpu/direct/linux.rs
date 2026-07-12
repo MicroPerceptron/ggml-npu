@@ -4,9 +4,10 @@
 //! ioctl mechanics, DRM PRIME/GEM, DMA-BUF ownership, and mapping composition come from
 //! `host::linux`.
 
-use core::ffi::CStr;
+use alloc::boxed::Box;
+use core::ffi::{c_void, CStr};
+use core::sync::atomic::{AtomicU8, Ordering};
 
-#[cfg(feature = "bench-hardware")]
 use rustix::fd::AsRawFd;
 
 use crate::host::linux::dmabuf::{LinuxDmaBuf, LinuxDmaBufError, LinuxDmaBufInfo};
@@ -18,7 +19,10 @@ use crate::host::{
     builtin, FileError, FileService, HostEnvironment, MapOptions, MemoryMapping, OpenAccess,
     OpenOptions, OwnedFile,
 };
-use crate::interop::AllocationIdentity;
+use crate::interop::{
+    AllocationIdentity, AllocationOwnership, AllocationToken, OpaqueExternalHandle, OwnershipError,
+    SharedAllocationOwner,
+};
 use crate::runtime::{AccessMode, RuntimeError};
 
 use super::uapi::*;
@@ -215,9 +219,143 @@ impl LinuxIvpuSharedAllocation {
             .map_err(dmabuf_error)
     }
 
-    #[cfg(feature = "bench-hardware")]
-    pub(super) fn linux_fd_for_external_api_test(&self) -> i32 {
+    pub(super) fn raw_fd(&self) -> i32 {
         self.0.as_fd().as_raw_fd()
+    }
+
+    #[cfg(all(test, feature = "bench-hardware"))]
+    pub(super) fn linux_fd_for_external_api_test(&self) -> i32 {
+        self.raw_fd()
+    }
+}
+
+const DIRECT_SHARED_PROVIDER: u64 = u64::from_be_bytes(*b"IVPUSHAR");
+const OWNER_BACKEND: u8 = 0;
+const OWNER_EXTERNAL: u8 = 1;
+const OWNER_UNCERTAIN: u8 = 2;
+const OWNER_RELEASED: u8 = 3;
+static NEXT_SHARED_GENERATION: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+pub(in crate::vendor::ivpu) struct DirectSharedBuffer {
+    allocation: LinuxIvpuSharedAllocation,
+    mapping: LinuxIvpuMapping,
+    identity: AllocationIdentity,
+    external_fd: i32,
+    ownership: AtomicU8,
+}
+
+impl DirectSharedBuffer {
+    pub(in crate::vendor::ivpu) fn allocate(
+        bytes: usize,
+    ) -> Result<Box<dyn SharedAllocationOwner>, RuntimeError> {
+        let allocation = LinuxIvpuSharedAllocation::allocate(bytes.max(1) as u64, 4096)?;
+        let mapping = allocation.map(AccessMode::ReadWrite)?;
+        let external_fd = allocation.raw_fd();
+        let mut identity = allocation.identity();
+        identity.generation = NEXT_SHARED_GENERATION.fetch_add(1, Ordering::AcqRel);
+        Ok(Box::new(Self {
+            allocation,
+            mapping,
+            identity,
+            external_fd,
+            ownership: AtomicU8::new(OWNER_BACKEND),
+        }))
+    }
+
+    pub(super) fn duplicate_allocation(&self) -> Result<LinuxIvpuSharedAllocation, RuntimeError> {
+        self.allocation.duplicate()
+    }
+
+    pub(super) fn from_token(token: AllocationToken) -> Option<&'static Self> {
+        if token.provider != DIRECT_SHARED_PROVIDER {
+            return None;
+        }
+        // SAFETY: tokens are issued only from a live boxed DirectSharedBuffer and callers retain
+        // the owning ggml buffer through direct submission completion.
+        Some(unsafe { &*token.owner.as_ptr().cast::<Self>() })
+    }
+}
+
+impl SharedAllocationOwner for DirectSharedBuffer {
+    fn address(&self) -> core::ptr::NonNull<u8> {
+        self.mapping.address()
+    }
+
+    fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    fn alignment(&self) -> usize {
+        4096
+    }
+
+    fn identity(&self) -> AllocationIdentity {
+        self.identity
+    }
+
+    fn token(&self) -> AllocationToken {
+        AllocationToken {
+            provider: DIRECT_SHARED_PROVIDER,
+            // SAFETY: self is boxed before this method is exposed through the backend buffer.
+            owner: unsafe {
+                core::ptr::NonNull::new_unchecked((self as *const Self).cast_mut().cast::<c_void>())
+            },
+        }
+    }
+
+    fn external_handle(&self) -> OpaqueExternalHandle<'_> {
+        OpaqueExternalHandle {
+            type_name: c"ggml.platform.linux.shared-memory-fd.v1",
+            data: (&self.external_fd as *const i32).cast::<c_void>(),
+            size: core::mem::size_of::<i32>(),
+            _owner: core::marker::PhantomData,
+        }
+    }
+
+    fn ownership(&self) -> AllocationOwnership {
+        match self.ownership.load(Ordering::Acquire) {
+            OWNER_BACKEND => AllocationOwnership::Backend,
+            OWNER_EXTERNAL => AllocationOwnership::External,
+            OWNER_UNCERTAIN => AllocationOwnership::Uncertain,
+            _ => AllocationOwnership::Released,
+        }
+    }
+
+    fn acquire_backend(&self) -> Result<(), OwnershipError> {
+        self.ownership
+            .compare_exchange(
+                OWNER_EXTERNAL,
+                OWNER_BACKEND,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|state| match state {
+                OWNER_UNCERTAIN => OwnershipError::Uncertain,
+                OWNER_RELEASED => OwnershipError::Released,
+                _ => OwnershipError::WrongOwner,
+            })
+    }
+
+    fn release_external(&self) -> Result<(), OwnershipError> {
+        self.ownership
+            .compare_exchange(
+                OWNER_BACKEND,
+                OWNER_EXTERNAL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|state| match state {
+                OWNER_UNCERTAIN => OwnershipError::Uncertain,
+                OWNER_RELEASED => OwnershipError::Released,
+                _ => OwnershipError::WrongOwner,
+            })
+    }
+
+    fn mark_uncertain(&self) {
+        self.ownership.store(OWNER_UNCERTAIN, Ordering::Release);
     }
 }
 

@@ -7,6 +7,7 @@
 //! `ggml_backend_init` once, so the race is a formality we nonetheless handle correctly.
 
 mod buffer;
+mod external;
 mod shell;
 
 use core::ffi::{c_char, c_int};
@@ -126,6 +127,12 @@ pub(crate) unsafe fn owns_tensor(tensor: *const ggml_tensor) -> bool {
     }
     let buf = (*tensor).buffer;
     !buf.is_null() && (*buf).buft == buffer_type()
+}
+
+pub(crate) unsafe fn shared_view(
+    tensor: *const ggml_tensor,
+) -> Option<crate::interop::SharedAllocationView> {
+    buffer::shared_view(tensor)
 }
 
 /// Identity epoch for model-resident NPU buffers. Graph caches include this value because their

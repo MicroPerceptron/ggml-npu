@@ -40,6 +40,11 @@ pub enum MetricEvent {
         allocation: u64,
         bytes: u64,
     },
+    SharedAllocation {
+        allocation: u64,
+        bytes: u64,
+        imported: bool,
+    },
     MemoryState {
         resident_bytes: u64,
         resident_high_water: u64,

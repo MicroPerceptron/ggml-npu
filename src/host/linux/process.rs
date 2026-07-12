@@ -27,6 +27,7 @@ unsafe extern "C" {
         argument: *mut c_void,
         dso_handle: *mut c_void,
     ) -> c_int;
+    static mut __dso_handle: *mut c_void;
     fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
@@ -142,8 +143,14 @@ impl DiagnosticService for LinuxDiagnostics {
     }
 
     fn register_process_exit(&self, callback: ExitCallback, argument: *mut c_void) -> bool {
-        // SAFETY: callback has the C runtime's required signature and process lifetime.
-        unsafe { __cxa_atexit(callback, argument, ptr::null_mut()) == 0 }
+        // SAFETY: tie the callback to this shared object so dlclose runs it before unmapping code.
+        unsafe {
+            __cxa_atexit(
+                callback,
+                argument,
+                core::ptr::addr_of_mut!(__dso_handle).cast(),
+            ) == 0
+        }
     }
 }
 

@@ -16,11 +16,18 @@ pub(super) static REG_IFACE: ggml_backend_reg_i = ggml_backend_reg_i {
     get_name: Some(reg_get_name),
     get_device_count: Some(reg_get_device_count),
     get_device: Some(reg_get_device),
-    get_proc_address: None,
+    get_proc_address: Some(reg_get_proc_address),
 };
 
 unsafe extern "C" fn reg_get_name(_reg: ggml_backend_reg_t) -> *const c_char {
     c"NPU".as_ptr()
+}
+
+unsafe extern "C" fn reg_get_proc_address(
+    _reg: ggml_backend_reg_t,
+    name: *const c_char,
+) -> *mut core::ffi::c_void {
+    super::external::proc_address(name)
 }
 
 unsafe extern "C" fn reg_get_device_count(_reg: ggml_backend_reg_t) -> usize {

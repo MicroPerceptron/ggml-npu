@@ -17,6 +17,7 @@ DIRECT_RESIDENT = re.compile(r"direct memory: resident\s+([0-9]+(?:\.[0-9]+)?)\s
 RATE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(?:±\s*([0-9]+(?:\.[0-9]+)?))?")
 WORKLOAD = re.compile(r"^(pp|tg)(\d+)$")
 ABSOLUTE_FILE_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/)(?:[^/\\\s]+[/\\])+[^/\\\s]+")
+PERF_PREFIX = "[ggml-perf] "
 
 
 def portable_run_path(run: Path) -> str:
@@ -88,6 +89,141 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             rows.append(value)
     return rows
+
+
+def read_perf_events(stderr: str) -> list[dict[str, Any]]:
+    events = []
+    for line in stderr.splitlines():
+        if PERF_PREFIX not in line:
+            continue
+        payload = line.split(PERF_PREFIX, 1)[1]
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("schema") == 1:
+            events.append(value)
+    return events
+
+
+def normalize_pass_metrics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attribute ordered scheduler/NPU events to explicit llama-bench pass boundaries."""
+    passes: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for event in events:
+        kind = event.get("event")
+        if event.get("source") == "llama-bench" and kind == "pass_begin":
+            current = {
+                "phase": event.get("phase"),
+                "index": event.get("index"),
+                "prompt_tokens": event.get("prompt_tokens"),
+                "dispatches": 0,
+                "scheduler_splits": 0,
+                "scheduler_nodes": 0,
+                "resident_hits": 0,
+                "cold_misses": 0,
+                "rehydrations": 0,
+                "evicted_bytes": 0,
+                "direct_ns": 0,
+                "scheduler_backends": {},
+                "scheduler_backend_nodes": {},
+                "scheduler_backend_ns": {},
+                "scheduler_handoff_ns": 0,
+                "program_phase_ns": {},
+                "artifact_loads": {},
+                "max_artifact_bytes": 0,
+                "constant_source_bytes": 0,
+                "constant_canonical_bytes": 0,
+                "constant_canonicalization_ns": 0,
+                "program_node_histogram": {},
+                "placement_rejections": {},
+                "_split_backends": {},
+            }
+            continue
+        if current is None:
+            continue
+        if event.get("source") == "ggml-npu" and kind == "dispatch":
+            current["dispatches"] += 1
+            current["direct_ns"] += sum(
+                int(event.get(field, 0) or 0)
+                for field in ("stage_in_ns", "submit_ns", "wait_ns", "copy_out_ns")
+            )
+        elif event.get("source") == "ggml-scheduler" and kind == "scheduler_split_begin":
+            current["scheduler_splits"] += 1
+            current["scheduler_nodes"] += int(event.get("nodes", 0) or 0)
+            backend = str(event.get("backend") or event.get("backend_id") or "unknown")
+            split = str(event.get("split", current["scheduler_splits"] - 1))
+            current["_split_backends"][split] = backend
+            current["scheduler_backends"][backend] = (
+                current["scheduler_backends"].get(backend, 0) + 1
+            )
+            current["scheduler_backend_nodes"][backend] = (
+                current["scheduler_backend_nodes"].get(backend, 0)
+                + int(event.get("nodes", 0) or 0)
+            )
+        elif event.get("source") == "ggml-scheduler" and kind == "scheduler_split_end":
+            split = str(event.get("split", ""))
+            backend = current["_split_backends"].get(
+                split, str(event.get("backend_id") or "unknown")
+            )
+            current["scheduler_backend_ns"][backend] = (
+                current["scheduler_backend_ns"].get(backend, 0)
+                + int(event.get("elapsed_ns", 0) or 0)
+            )
+            current["scheduler_handoff_ns"] += int(
+                event.get("handoff_begin_ns", 0) or 0
+            ) + int(event.get("handoff_end_ns", 0) or 0)
+        elif event.get("source") == "ggml-npu" and kind == "program_cache":
+            outcome = event.get("outcome")
+            if outcome == "resident_hit":
+                current["resident_hits"] += 1
+            elif outcome == "cold_miss":
+                current["cold_misses"] += 1
+            elif outcome == "rehydration":
+                current["rehydrations"] += 1
+        elif event.get("source") == "ggml-npu" and kind == "program_eviction":
+            current["evicted_bytes"] += int(event.get("bytes", 0) or 0)
+        elif event.get("source") == "ggml-npu" and kind == "program_phase":
+            phase = str(event.get("phase") or "unknown")
+            current["program_phase_ns"][phase] = (
+                current["program_phase_ns"].get(phase, 0)
+                + int(event.get("elapsed_ns", 0) or 0)
+            )
+        elif event.get("source") == "ggml-npu" and kind == "constant_canonicalization":
+            current["constant_source_bytes"] += int(event.get("source_bytes", 0) or 0)
+            current["constant_canonical_bytes"] += int(
+                event.get("canonical_bytes", 0) or 0
+            )
+            current["constant_canonicalization_ns"] += int(
+                event.get("requant_ns", 0) or 0
+            )
+        elif event.get("source") == "ggml-npu" and kind == "compiler_artifact":
+            current["max_artifact_bytes"] = max(
+                current["max_artifact_bytes"], int(event.get("elf_bytes", 0) or 0)
+            )
+        elif event.get("source") == "ggml-npu-compiler" and kind == "artifact_load":
+            outcome = str(event.get("outcome") or "unknown")
+            current["artifact_loads"][outcome] = (
+                current["artifact_loads"].get(outcome, 0) + 1
+            )
+        elif event.get("source") == "ggml-npu" and kind == "graph_partition":
+            nodes = str(event.get("nodes", 0))
+            current["program_node_histogram"][nodes] = (
+                current["program_node_histogram"].get(nodes, 0) + 1
+            )
+        elif event.get("source") == "ggml-npu" and kind == "placement_rejection":
+            reason = str(event.get("reason") or "unknown")
+            current["placement_rejections"][reason] = (
+                current["placement_rejections"].get(reason, 0) + 1
+            )
+        elif event.get("source") == "llama-bench" and kind == "pass_end":
+            current["elapsed_ns"] = int(event.get("elapsed_ns", 0) or 0)
+            elapsed = current["elapsed_ns"]
+            current["unattributed_ns"] = max(0, elapsed - current["direct_ns"])
+            current.pop("_split_backends", None)
+            passes.append(current)
+            current = None
+    return passes
 
 
 def table_cells(line: str) -> list[str]:
@@ -285,6 +421,7 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
 
     mode = env.get("mode", "")
     execution = execution_path(mode, env, stderr)
+    perf_passes = normalize_pass_metrics(read_perf_events(stderr))
     common_metrics = {
         "wall_seconds": float(process["wall_seconds"]) if process and "wall_seconds" in process else None,
         "user_seconds": float(process["user_seconds"]) if process and "user_seconds" in process else None,
@@ -311,6 +448,7 @@ def normalize_run(run: Path) -> list[dict[str, Any]]:
             if resources and "peak_npu_memory_bytes" in resources
             else None
         ),
+        "passes": perf_passes,
         "memory_psi_some_delta_us": (
             int(resources["memory_psi_some_delta_us"])
             if resources and "memory_psi_some_delta_us" in resources

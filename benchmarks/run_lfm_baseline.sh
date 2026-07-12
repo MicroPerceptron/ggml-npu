@@ -86,6 +86,9 @@ npu_cache_label=default
 if [[ -n "${GGML_NPU_CACHE:-}" ]]; then
     npu_cache_label="$(path_label "$GGML_NPU_CACHE")"
 fi
+cpu_affinity="$(taskset -pc $$ 2>/dev/null || echo unavailable)"
+load_average_start="$(< /proc/loadavg)"
+memory_pressure_start="$(tr '\n' ';' < /proc/pressure/memory 2>/dev/null || echo unavailable)"
 mkdir -p "$OUT"
 {
     echo "timestamp_utc=$STAMP"
@@ -108,6 +111,10 @@ mkdir -p "$OUT"
     echo "generated_tokens=${GEN_TOKENS:-128}"
     echo "repetitions=${REPETITIONS:-5}"
     echo "threads=$THREADS"
+    echo "benchmark_lock=${GGML_NPU_BENCH_LOCK:-none}"
+    echo "cpu_affinity=$cpu_affinity"
+    echo "load_average_start=$load_average_start"
+    echo "memory_pressure_start=$memory_pressure_start"
     echo "backend_git_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
     uname -a
     free -b
@@ -240,6 +247,10 @@ bench_pid=""
 [[ -n "$monitor_pid" ]] && wait "$monitor_pid" 2>/dev/null || true
 guard_pid=""
 monitor_pid=""
+{
+    echo "load_average_end=$(< /proc/loadavg)"
+    echo "memory_pressure_end=$(tr '\n' ';' < /proc/pressure/memory 2>/dev/null || echo unavailable)"
+} >> "$OUT/environment.txt"
 awk -F '\t' '
     NR > 1 {
         if ($2 > rss) rss = $2

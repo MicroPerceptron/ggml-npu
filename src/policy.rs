@@ -6,7 +6,7 @@
 use core::ffi::CStr;
 
 use crate::ffi::*;
-use crate::graph::{OpRegistry, OperationContract, PlacementClass};
+use crate::graph::{OpRegistry, OpSpec, OperationContract, PlacementClass};
 use crate::host::{ConfigService, HostEnvironment};
 
 fn env_u64(name: &'static CStr, default: u64) -> u64 {
@@ -88,6 +88,64 @@ unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
         })
 }
 
+unsafe fn has_disabled_moe_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            let routed = OpRegistry::decode_tensor(src).is_ok_and(|spec| spec.traits.moe);
+            routed || has_disabled_moe_ancestor(src, depth - 1)
+        })
+}
+
+fn output_elements(node: &ggml_tensor) -> u64 {
+    node.ne.iter().fold(1u64, |product, &extent| {
+        product.saturating_mul(extent.max(0) as u64)
+    })
+}
+
+fn region_supported(
+    spec: OpSpec,
+    elements: u64,
+    moe_enabled: bool,
+    disabled_moe_ancestor: bool,
+    anchor_ancestor: bool,
+    min_region_elements: u64,
+) -> bool {
+    if spec.traits.moe && !moe_enabled {
+        return false;
+    }
+    match spec.placement {
+        PlacementClass::Anchor | PlacementClass::Stateful => true,
+        PlacementClass::StandaloneIfProfitable => elements >= min_region_elements,
+        PlacementClass::FusibleOnly | PlacementClass::Metadata => {
+            (moe_enabled || !disabled_moe_ancestor) && anchor_ancestor
+        }
+    }
+}
+
+/// Capability placement for scheduler expansion. Cheap metadata/elementwise work may extend an
+/// eligible accelerator region, but cannot cross a routed-MoE CPU boundary or anchor a split by
+/// itself. This is shape/graph based and deliberately contains no model or tensor-name checks.
+pub(crate) unsafe fn supports_region(node: *const ggml_tensor, spec: OpSpec) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let moe_enabled = crate::host::builtin().config().is_set(c"GGML_NPU_MOE");
+    region_supported(
+        spec,
+        output_elements(&*node),
+        moe_enabled,
+        !moe_enabled && has_disabled_moe_ancestor(node, 12),
+        has_anchor_ancestor(node, 12),
+        env_u64(c"GGML_NPU_MIN_REGION_ELEMENTS", 32_768),
+    )
+}
+
 pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     if node.is_null() {
         return false;
@@ -137,4 +195,42 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         _ => return false,
     };
     work >= min_work
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(placement: PlacementClass, moe: bool) -> OpSpec {
+        let mut spec = crate::graph::OpRegistry::decode_node(&crate::graph::Node {
+            op: GGML_OP_ADD,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; crate::graph::OP_PARAM_BYTES],
+        })
+        .unwrap();
+        spec.placement = placement;
+        spec.traits.moe = moe;
+        spec
+    }
+
+    #[test]
+    fn moe_disabled_region_does_not_pull_adjacent_glue() {
+        let glue = spec(PlacementClass::FusibleOnly, false);
+        assert!(!region_supported(glue, 4096, false, true, true, 32_768));
+        assert!(region_supported(glue, 4096, false, false, true, 32_768));
+        assert!(!region_supported(glue, 4096, false, false, false, 32_768));
+    }
+
+    #[test]
+    fn standalone_region_obeys_deterministic_cost_floor() {
+        let standalone = spec(PlacementClass::StandaloneIfProfitable, false);
+        assert!(!region_supported(
+            standalone, 32_767, false, false, false, 32_768
+        ));
+        assert!(region_supported(
+            standalone, 32_768, false, false, false, 32_768
+        ));
+    }
 }

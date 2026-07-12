@@ -11,11 +11,11 @@ use super::direct::budget::RuntimeBudget;
 use super::direct::elf::parse_intel_elf_with_resident_limit;
 use super::direct::hpi::inspect_hpi_requirements;
 use super::direct::link::{visit_binding_requirements, DeviceMemoryClass};
-use super::direct::prepare::{prepare_inference, PreparedInference};
+use super::direct::prepare::{prepare_inference, prepare_inference_shared, PreparedInference};
 use super::direct::transport::release_host_writes;
 use super::direct::{CommandQueue, IvpuDevice};
 use super::profile;
-use crate::host::{ClockService, HostEnvironment};
+use crate::host::{ClockService, ConfigService, HostEnvironment};
 use crate::identity::{ExactKeyBuilder, ExactSemanticKey};
 use crate::metrics::MetricEvent;
 use crate::ops::Operand;
@@ -24,6 +24,7 @@ use crate::runtime::{Deadline, RuntimeError};
 struct DirectContext {
     device: &'static IvpuDevice,
     queue: CommandQueue<'static>,
+    budget: RuntimeBudget,
 }
 
 static CONTEXT: AtomicPtr<DirectContext> = AtomicPtr::new(ptr::null_mut());
@@ -35,8 +36,13 @@ fn context() -> Result<&'static DirectContext, RuntimeError> {
         return Ok(unsafe { &*current });
     }
     let device = Box::leak(Box::new(IvpuDevice::open_first()?));
+    let budget = RuntimeBudget::query(&device.parameters()?)?;
     let queue = device.create_queue(0, 0)?;
-    let candidate = Box::into_raw(Box::new(DirectContext { device, queue }));
+    let candidate = Box::into_raw(Box::new(DirectContext {
+        device,
+        queue,
+        budget,
+    }));
     match CONTEXT.compare_exchange(
         ptr::null_mut(),
         candidate,
@@ -68,6 +74,7 @@ struct ResidentProgram {
 
 struct CacheState {
     entries: Vec<ResidentProgram>,
+    seen: Vec<ExactSemanticKey>,
     resident_bytes: u64,
     resident_high_water: u64,
     accounted_high_water: u64,
@@ -79,6 +86,7 @@ impl CacheState {
     const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            seen: Vec::new(),
             resident_bytes: 0,
             resident_high_water: 0,
             accounted_high_water: 0,
@@ -99,6 +107,7 @@ impl CacheState {
             return false;
         };
         let entry = self.entries.swap_remove(index);
+        let key = entry.key.digest().hex();
         self.resident_bytes = self.resident_bytes.saturating_sub(entry.resident_bytes);
         profile::note(&alloc::format!(
             "[npu direct] evict resident={} accounted={} remaining={}\n",
@@ -110,6 +119,14 @@ impl CacheState {
             cache: "direct-programs",
             bytes: entry.resident_bytes,
         });
+        crate::trace::perf(
+            "program_eviction",
+            &alloc::format!(
+                ",\"key\":\"{key}\",\"bytes\":{},\"resident_after\":{}",
+                entry.resident_bytes,
+                self.resident_bytes,
+            ),
+        );
         drop(entry);
         true
     }
@@ -237,6 +254,9 @@ fn copy_output(program: &PreparedInference<'_>, index: usize, output: &Operand) 
         ));
         return false;
     }
+    if program.output_is_direct(index) {
+        return true;
+    }
     // SAFETY: output storage is live and at least `bytes` long.
     let target = unsafe { core::slice::from_raw_parts_mut(output.ptr.cast::<u8>(), bytes) };
     match program.copy_output(index, target) {
@@ -297,7 +317,7 @@ fn dispatch(
         return false;
     }
 
-    let prof = profile::enabled();
+    let prof = profile::enabled() || crate::trace::perf_enabled();
     let t0 = if prof { profile::now_ns() } else { 0 };
     if let Err(error) = program.write_inputs(&input_bytes) {
         profile::note(&alloc::format!(
@@ -349,12 +369,21 @@ fn dispatch(
     let t3 = if prof { profile::now_ns() } else { 0 };
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     if prof {
-        let bytes_in: u64 = input_bytes.iter().map(|bytes| bytes.len() as u64).sum();
+        let bytes_in: u64 = input_bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !program.input_is_direct(*index))
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
         let bytes_out: u64 = outputs
             .iter()
-            .filter_map(|output| operand_storage_bytes(output))
+            .enumerate()
+            .filter(|(index, _)| !program.output_is_direct(*index))
+            .filter_map(|(_, output)| operand_storage_bytes(output))
             .map(|bytes| bytes as u64)
             .sum();
+        let imported = program.direct_binding_count() as u64;
+        let staged = (inputs.len() + outputs.len()) as u64 - imported;
         profile::record(
             t0,
             t1,
@@ -363,14 +392,53 @@ fn dispatch(
             t3,
             0,
             0,
-            0,
-            (inputs.len() + outputs.len()) as u64,
+            imported,
+            staged,
             bytes_in.saturating_add(bytes_out),
             bytes_in,
             bytes_out,
         );
+        crate::trace::perf(
+            "dispatch",
+            &alloc::format!(
+                ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":{},\"copy_out_ns\":{},\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":{bytes_out}",
+                t1.saturating_sub(t0),
+                tmid.saturating_sub(t1),
+                t2.saturating_sub(tmid),
+                t3.saturating_sub(t2),
+                imported,
+                staged,
+            ),
+        );
     }
     true
+}
+
+fn binding_key(
+    key: ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+) -> ExactSemanticKey {
+    let mut builder = ExactKeyBuilder::new(b"direct-runtime/shared-bindings-v1");
+    builder.field(b"program", &key.digest().0);
+    for (direction, operands) in [(0u8, inputs), (1u8, outputs)] {
+        for (index, operand) in operands.iter().enumerate() {
+            builder
+                .u8(b"direction", direction)
+                .u64(b"index", index as u64);
+            if let Some(view) = operand.shared {
+                builder
+                    .u64(b"provider", view.identity.provider)
+                    .u64(b"object", view.identity.object)
+                    .u64(b"generation", view.identity.generation)
+                    .u64(b"offset", view.offset as u64)
+                    .u64(b"bytes", view.bytes as u64);
+            } else {
+                builder.u8(b"staged", 1);
+            }
+        }
+    }
+    builder.finish()
 }
 
 fn run_program(
@@ -380,6 +448,22 @@ fn run_program(
     outputs: &[&Operand],
     compile: impl FnOnce() -> Option<Vec<u8>>,
 ) -> bool {
+    let perf = crate::trace::perf_enabled();
+    let key_started = if perf { profile::now_ns() } else { 0 };
+    let program_digest = key.digest().hex();
+    let key = binding_key(key, inputs, outputs);
+    let run_digest = key.digest().hex();
+    if perf {
+        crate::trace::perf(
+            "program_identity",
+            &alloc::format!(
+                ",\"program_key\":\"{program_digest}\",\"run_key\":\"{run_digest}\",\"generation\":{generation},\"inputs\":{},\"outputs\":{},\"key_ns\":{}",
+                inputs.len(),
+                outputs.len(),
+                profile::now_ns().saturating_sub(key_started),
+            ),
+        );
+    }
     profile::note(&alloc::format!(
         "[npu direct] run generation={generation} inputs={} outputs={} key={}\n",
         inputs.len(),
@@ -406,20 +490,15 @@ fn run_program(
             return false;
         }
     };
-    let budget = match RuntimeBudget::query(&parameters) {
-        Ok(budget) => budget,
-        Err(error) => {
-            profile::note(&alloc::format!(
-                "[npu direct] budget rejected load: {error:?}\n"
-            ));
-            return false;
-        }
-    };
+    // Residency must not collapse as compilation and page-cache pressure change MemAvailable.
+    // The context snapshots the queried/configured byte budget before its first program load.
+    let budget = context.budget;
     let mut guard = PROGRAMS.lock();
     let state = guard.state();
     if state.generation != generation {
         let evicted = state.resident_bytes;
         state.entries.clear();
+        state.seen.clear();
         state.resident_bytes = 0;
         state.generation = generation;
         if evicted != 0 {
@@ -437,16 +516,55 @@ fn run_program(
         .position(|entry| entry.generation == generation && entry.key == key);
     let index = if let Some(index) = index {
         profile::note("[npu direct] resident program hit\n");
+        crate::trace::perf(
+            "program_cache",
+            &alloc::format!(
+                ",\"program_key\":\"{program_digest}\",\"run_key\":\"{run_digest}\",\"outcome\":\"resident_hit\",\"resident_bytes\":{},\"resident_limit\":{}",
+                state.resident_bytes,
+                budget.resident_program_bytes,
+            ),
+        );
         index
     } else {
+        let rehydration = state.seen.iter().any(|seen| seen == &key);
+        if !rehydration {
+            state.seen.push(key.clone());
+        }
+        crate::trace::perf(
+            "program_cache",
+            &alloc::format!(
+                ",\"program_key\":\"{program_digest}\",\"run_key\":\"{run_digest}\",\"outcome\":\"{}\",\"resident_bytes\":{},\"resident_limit\":{}",
+                if rehydration { "rehydration" } else { "cold_miss" },
+                state.resident_bytes,
+                budget.resident_program_bytes,
+            ),
+        );
+        let compile_started = if perf { profile::now_ns() } else { 0 };
         let Some(blob) = compile() else {
             profile::note("[npu direct] compiler returned no artifact\n");
+            crate::trace::perf(
+                "program_rejection",
+                &alloc::format!(
+                    ",\"program_key\":\"{program_digest}\",\"run_key\":\"{run_digest}\",\"reason\":\"compile_failed\""
+                ),
+            );
             return false;
         };
+        if perf {
+            crate::trace::perf(
+                "program_phase",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"phase\":\"compile_or_disk_load\",\"elapsed_ns\":{},\"artifact_bytes\":{}",
+                    profile::now_ns().saturating_sub(compile_started),
+                    blob.len(),
+                ),
+            );
+        }
         profile::note(&alloc::format!(
             "[npu direct] artifact bytes={} compiled/cache-loaded\n",
             blob.len()
         ));
+        let elf_started = if perf { profile::now_ns() } else { 0 };
         let elf = match parse_intel_elf_with_resident_limit(&blob, budget.resident_program_bytes) {
             Ok(elf) => elf,
             Err(error) => {
@@ -456,12 +574,33 @@ fn run_program(
                 return false;
             }
         };
+        if perf {
+            crate::trace::perf(
+                "program_phase",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"phase\":\"elf_parse\",\"elapsed_ns\":{},\"artifact_bytes\":{},\"predicted_resident_bytes\":{}",
+                    profile::now_ns().saturating_sub(elf_started),
+                    blob.len(),
+                    elf.inspection().resident_bytes,
+                ),
+            );
+        }
         if !state.make_room(
             elf.inspection().resident_bytes,
             budget.resident_program_bytes,
         ) {
+            crate::trace::perf(
+                "program_admission",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"outcome\":\"rejected\",\"reason\":\"elf_resident_limit\",\"requested_bytes\":{},\"resident_bytes\":{},\"resident_limit\":{}",
+                    elf.inspection().resident_bytes,
+                    state.resident_bytes,
+                    budget.resident_program_bytes,
+                ),
+            );
             return false;
         }
+        let hpi_started = if perf { profile::now_ns() } else { 0 };
         let hpi = match inspect_hpi_requirements(&elf, &parameters) {
             Ok(hpi) => hpi,
             Err(error) => {
@@ -471,6 +610,15 @@ fn run_program(
                 return false;
             }
         };
+        if perf {
+            crate::trace::perf(
+                "program_phase",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"phase\":\"hpi_inspect\",\"elapsed_ns\":{}",
+                    profile::now_ns().saturating_sub(hpi_started),
+                ),
+            );
+        }
         let mut initial_inputs = Vec::new();
         if initial_inputs.try_reserve_exact(inputs.len()).is_err() {
             return false;
@@ -504,12 +652,26 @@ fn run_program(
             };
             initial_inputs.push(data);
         }
-        let prepared = match prepare_inference(
+        let shared_bindings = !crate::host::builtin()
+            .config()
+            .is_set(c"GGML_NPU_DISABLE_SHARED_BINDINGS");
+        let input_views: Vec<_> = inputs
+            .iter()
+            .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+            .collect();
+        let output_views: Vec<_> = outputs
+            .iter()
+            .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+            .collect();
+        let prepare_started = if perf { profile::now_ns() } else { 0 };
+        let prepared = match prepare_inference_shared(
             context.device,
             &parameters,
             &elf,
             &hpi,
             &initial_inputs,
+            &input_views,
+            &output_views,
             budget.preparation(),
         ) {
             Ok(prepared) => prepared,
@@ -520,19 +682,50 @@ fn run_program(
                 return false;
             }
         };
+        if perf {
+            crate::trace::perf(
+                "program_phase",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"phase\":\"bo_prepare\",\"elapsed_ns\":{},\"stage_program_ns\":{},\"binding_import_ns\":{},\"binding_allocate_ns\":{},\"binding_initialize_ns\":{},\"link_ns\":{},\"hpi_ns\":{},\"command_ns\":{},\"executable_bytes\":{},\"binding_bytes\":{},\"hpi_bytes\":{},\"command_bytes\":{}",
+                    profile::now_ns().saturating_sub(prepare_started),
+                    prepared.timings.stage_program_ns,
+                    prepared.timings.binding_import_ns,
+                    prepared.timings.binding_allocate_ns,
+                    prepared.timings.binding_initialize_ns,
+                    prepared.timings.link_ns,
+                    prepared.timings.hpi_ns,
+                    prepared.timings.command_ns,
+                    prepared.executable_bo_bytes,
+                    prepared.binding_bo_bytes,
+                    prepared.hpi_bo_bytes,
+                    prepared.command_bo_bytes,
+                ),
+            );
+        }
         let resident_bytes = prepared.total_user_bo_bytes;
         if !state.make_room(resident_bytes, budget.resident_program_bytes) {
+            crate::trace::perf(
+                "program_admission",
+                &alloc::format!(
+                    ",\"run_key\":\"{run_digest}\",\"outcome\":\"rejected\",\"reason\":\"prepared_resident_limit\",\"requested_bytes\":{resident_bytes},\"resident_bytes\":{},\"resident_limit\":{}",
+                    state.resident_bytes,
+                    budget.resident_program_bytes,
+                ),
+            );
             return false;
         }
         let accounted_bytes = prepared.total_accounted_bytes;
         for binding in &prepared.bindings {
-            profile::event(MetricEvent::StagingAllocation {
-                allocation: binding
-                    .bo
-                    .shared_identity()
-                    .map_or(binding.bo.vpu_address(), |identity| identity.object),
-                bytes: binding.logical_bytes,
-            });
+            let allocation = binding
+                .bo
+                .shared_identity()
+                .map_or(binding.bo.vpu_address(), |identity| identity.object);
+            if !binding.direct {
+                profile::event(MetricEvent::StagingAllocation {
+                    allocation,
+                    bytes: binding.logical_bytes,
+                });
+            }
         }
         profile::record_direct_memory_breakdown(
             prepared.executable_bo_bytes,
@@ -572,6 +765,16 @@ fn run_program(
             accounted_bytes,
             state.resident_bytes
         ));
+        crate::trace::perf(
+            "program_admission",
+            &alloc::format!(
+                ",\"program_key\":\"{program_digest}\",\"run_key\":\"{run_digest}\",\"outcome\":\"admitted\",\"rehydration\":{},\"resident_bytes\":{resident_bytes},\"cache_resident_bytes\":{},\"resident_limit\":{},\"artifact_bytes\":{}",
+                rehydration,
+                state.resident_bytes,
+                budget.resident_program_bytes,
+                blob.len(),
+            ),
+        );
         state.entries.len() - 1
     };
     let entry = &mut state.entries[index];

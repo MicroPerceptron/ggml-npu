@@ -620,7 +620,16 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
         std::string dir = cache_dir();
         if (!dir.empty()) {
             path = dir + "/" + cache_key + ".blob";
+            const auto read_started = std::chrono::steady_clock::now();
             if (read_blob(path, blob, len)) {
+                if (std::getenv("GGML_PERF_METRICS")) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - read_started);
+                    std::fprintf(
+                        stderr,
+                        "[ggml-perf] {\"schema\":1,\"source\":\"ggml-npu-compiler\",\"event\":\"artifact_load\",\"persistent_key\":\"%s\",\"outcome\":\"disk_hit\",\"elapsed_ns\":%lld,\"elf_bytes\":%zu}\n",
+                        cache_key, static_cast<long long>(elapsed.count()), *len);
+                }
                 if (std::getenv("GGML_NPU_DEBUG")) {
                     std::fprintf(stderr, "[ir2 cache] hit key=%s nodes=%d bytes=%zu\n",
                                  cache_key, n_nodes, *len);
@@ -1142,6 +1151,14 @@ int ggml_npu_ov_compile_graph(int32_t n_tensors, const struct npu_ir_tensor* ten
             std::fprintf(stderr, "[ir2 compile] done key=%s nodes=%d ms=%lld bytes=%zu\n",
                          cache_key ? cache_key : "(none)", n_nodes,
                          static_cast<long long>(elapsed.count()), native.size());
+        }
+        if (std::getenv("GGML_PERF_METRICS")) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - compile_started);
+            std::fprintf(
+                stderr,
+                "[ggml-perf] {\"schema\":1,\"source\":\"ggml-npu-compiler\",\"event\":\"artifact_load\",\"persistent_key\":\"%s\",\"outcome\":\"compiled\",\"elapsed_ns\":%lld,\"elf_bytes\":%zu}\n",
+                cache_key ? cache_key : "", static_cast<long long>(elapsed.count()), native.size());
         }
         return 0;
     } catch (const std::exception& e) {

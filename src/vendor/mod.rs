@@ -16,6 +16,7 @@ pub mod ivpu;
 pub mod stub;
 pub mod xdna;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -90,6 +91,18 @@ pub trait Vendor: Sync {
     unsafe fn alloc_host(&self, size: usize) -> *mut c_void;
     /// Free memory returned by [`alloc_host`](Vendor::alloc_host).
     unsafe fn free_host(&self, ptr: *mut c_void, size: usize);
+
+    /// Optional owner-complete allocation for cross-backend sharing. The returned owner keeps the
+    /// mapping and transferable resource alive for the full ggml buffer lifetime.
+    fn alloc_shared_backend(
+        &self,
+        _size: usize,
+    ) -> Option<Box<dyn crate::interop::SharedAllocationOwner>> {
+        None
+    }
+
+    fn note_shared_allocation(&self, _identity: crate::interop::AllocationIdentity, _bytes: usize) {
+    }
 }
 
 static IVPU: ivpu::IvpuVendor = ivpu::IvpuVendor;
