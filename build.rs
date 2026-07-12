@@ -70,10 +70,27 @@ fn main() {
         .unwrap_or_else(|_| manifest.join("../llama.cpp"));
     let inc = ggml_root.join("ggml/include");
     let src = ggml_root.join("ggml/src");
+    let backend_h = inc.join("ggml-backend.h");
     assert!(
-        inc.join("ggml-backend.h").exists(),
+        backend_h.exists(),
         "ggml headers not found under {} — set GGML_DIR to your llama.cpp checkout",
         ggml_root.display()
+    );
+    // Upstream ggml-org/llama.cpp lacks NPU device typing and the external-memory registry
+    // ABI. The supported pin is MicroPerceptron/llama.cpp (see .github/workflows/ci.yml / #13).
+    let backend_hdr = std::fs::read_to_string(&backend_h).unwrap_or_default();
+    assert!(
+        backend_hdr.contains("GGML_BACKEND_DEVICE_TYPE_NPU"),
+        "GGML_BACKEND_DEVICE_TYPE_NPU missing from {} — use the MicroPerceptron/llama.cpp pin \
+         documented in .github/workflows/ci.yml (issue #13); inventing the enum value against \
+         upstream would mis-report device type to the host scheduler",
+        backend_h.display()
+    );
+    assert!(
+        backend_hdr.contains("ggml_backend_external_memory_i"),
+        "ggml_backend_external_memory_i missing from {} — use the MicroPerceptron/llama.cpp pin \
+         documented in .github/workflows/ci.yml (issue #13)",
+        backend_h.display()
     );
     let level_zero_compat = env::var_os("CARGO_FEATURE_LEVEL_ZERO_COMPAT").is_some();
     // ze_graph_ext.h pulls in ze_api.h + ze_graph_profiling_ext.h (same dir), so one optional

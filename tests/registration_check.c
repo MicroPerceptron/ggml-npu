@@ -21,6 +21,9 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
+/* Requires GGML_BACKEND_DEVICE_TYPE_NPU from the MicroPerceptron/llama.cpp pin
+ * (.github/workflows/ci.yml / issue #13). Upstream ggml-org headers fail the compile here. */
+
 /* ggml symbols our cdylib references. Real hosts provide these from libggml; here stubs
  * are enough to satisfy RTLD_NOW — none are called during this registration check (we only
  * probe with a null op, which supports_op rejects before touching them). */

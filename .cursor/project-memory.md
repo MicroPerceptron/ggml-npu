@@ -92,8 +92,8 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `.cursor/rules/benchmark-invocation.mdc`, `docs/benchmarking.md`, `benchmarks/README.md`, `benchmarks/lib/lfm_process_guard.sh`.
   - Verified: 2026-07-12
 
-- `CONSTRAINT/upstream-ggml-npu-device-type` — CI builds that bind against upstream llama.cpp headers fail when `GGML_BACKEND_DEVICE_TYPE_NPU` is absent; `src/backend/shell.rs` currently requires that constant.
-  - Evidence: `src/backend/shell.rs`, GitHub Actions build logs for `develop`.
+- `CONSTRAINT/upstream-ggml-npu-device-type` — Stock `ggml-org/llama.cpp` lacks `GGML_BACKEND_DEVICE_TYPE_NPU` and the external-memory registry ABI. Supported header pin is `MicroPerceptron/llama.cpp` at the SHA in `.github/workflows/ci.yml`; `build.rs` asserts both symbols so inventing the enum against upstream cannot mis-report device type. Issue #13.
+  - Evidence: `.github/workflows/ci.yml`, `build.rs`, `src/backend/shell.rs`, `src/backend/external.rs`, `README.md`.
   - Verified: 2026-07-12
 
 - `CONSTRAINT/shared-memory-promotion` — Generic interop currently proves only allocation identity, access intent, and an owner-controlled host mapping. External handles, visibility, ownership transfer, synchronization, cache maintenance, and queue-family rules stay adapter-owned until at least two implementations share their invariants and failure semantics without convention-based translation.
@@ -105,6 +105,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Rejected alternatives
+
+- `REJECTED/invent-npu-device-type-vs-upstream` — Do not define a local `GGML_BACKEND_DEVICE_TYPE_NPU` (or fake external-memory ABI) against stock `ggml-org/llama.cpp` headers to green CI.
+  - Rationale: A backend-local enum value the host scheduler does not understand would mis-report device class; keep the MicroPerceptron/llama.cpp pin as the ABI source of truth (issue #13).
+  - Evidence: `.github/workflows/ci.yml`, `build.rs`.
+  - Verified: 2026-07-12
 
 - `REJECTED/half-crate-for-f16` — Do not switch IEEE F16 constants or intermediates to the `half` crate (or any crate `f16` type). Keep nightly `f16`.
   - Rationale: Nightly `f16` is the objective baseline; `half::f16` collides in naming/API surface and would pull F16 off the NPU interior type.
