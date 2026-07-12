@@ -16,7 +16,7 @@ default = ["direct-ivpu", "portable-simd"]
 # Linux intel_vpu discovery, checked UAPI wrappers, and release-pinned firmware command validation.
 direct-ivpu = ["dep:goblin"]
 level-zero-compat = []
-bench = ["dep:criterion", "direct-ivpu"]
+bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
 # Production quant-transcode implementation. The crate's pinned nightly enables `portable_simd`;
 # unsupported architectures retain the scalar implementation.
@@ -28,7 +28,8 @@ cpufeatures = { version = "0.3.0", default-features = false, optional = true }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
 goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
 # Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
-rustix = { version = "1.1.4", features = ["event", "fs", "mm", "param", "time"], default-features = false }
+rustix = { version = "1.1.4", features = ["alloc", "event", "fs", "mm", "param", "process", "thread", "time"], default-features = false }
+zstd = { version = "0.13.3", default-features = false, optional = true }
 
 [build-dependencies]
 bindgen = "0.72.1"
@@ -52,6 +53,11 @@ required-features = ["bench"]
 
 [[bench]]
 name = "runtime"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "artifact_cache"
 harness = false
 required-features = ["bench"]
 

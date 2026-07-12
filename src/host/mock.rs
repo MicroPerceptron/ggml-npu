@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use std::alloc::{GlobalAlloc, System};
 
@@ -13,6 +13,10 @@ use super::{
     DynamicLibraryService, ExitCallback, FileError, FileService, HostEnvironment, HostError,
     LibraryVisibility, MapOptions, MappingOwner, MathService, MemoryMapping, MemoryStatusService,
     OpenOptions, OwnedFile, Ready, WaitInterest,
+};
+use crate::artifact_cache::{
+    ArtifactKey, ArtifactStore, CacheError, CodecDescriptor, CompressionProvider, StoreReport,
+    WaitProvider,
 };
 use crate::runtime::Deadline;
 
@@ -80,6 +84,12 @@ pub(crate) struct MockClock(pub u64);
 impl ClockService for MockClock {
     fn monotonic_now_ns(&self) -> Result<u64, HostError> {
         Ok(self.0)
+    }
+}
+
+impl crate::artifact_cache::CacheClock for MockClock {
+    fn now_ns(&self) -> u64 {
+        self.0
     }
 }
 
@@ -186,6 +196,63 @@ impl DynamicLibraryService for MockLibraries {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MockCompression;
+
+impl CompressionProvider for MockCompression {
+    fn descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor {
+            id: 1,
+            version: 1,
+            options: 0,
+        }
+    }
+
+    fn compress(&self, source: &[u8]) -> Result<Vec<u8>, CacheError> {
+        Ok(source.to_vec())
+    }
+
+    fn decompress(&self, source: &[u8], _uncompressed_bytes: usize) -> Result<Vec<u8>, CacheError> {
+        Ok(source.to_vec())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MockArtifactCache;
+
+impl ArtifactStore for MockArtifactCache {
+    fn load(&self, _key: ArtifactKey, _max_bytes: usize) -> Result<Option<Vec<u8>>, CacheError> {
+        Ok(None)
+    }
+
+    fn store(
+        &self,
+        _key: ArtifactKey,
+        _record: &[u8],
+        _budget_bytes: u64,
+        _low_water_bytes: u64,
+    ) -> Result<StoreReport, CacheError> {
+        Ok(StoreReport::default())
+    }
+
+    fn quarantine(&self, _key: ArtifactKey) -> Result<(), CacheError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MockWait;
+
+impl WaitProvider for MockWait {
+    fn wait_while(&self, state: &AtomicU32, expected: u32) {
+        while state.load(Ordering::Acquire) == expected {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn wake_all(&self, _state: &AtomicU32) {}
+}
+
 pub(crate) struct MockHost {
     pub files: MockFiles,
     pub clock: MockClock,
@@ -196,6 +263,9 @@ pub(crate) struct MockHost {
     pub diagnostics: MockDiagnostics,
     pub allocator: MockAllocator,
     pub libraries: MockLibraries,
+    pub compression: MockCompression,
+    pub artifact_cache: MockArtifactCache,
+    pub wait: MockWait,
 }
 
 impl HostEnvironment for MockHost {
@@ -208,6 +278,9 @@ impl HostEnvironment for MockHost {
     type Diagnostics = MockDiagnostics;
     type Allocator = MockAllocator;
     type Libraries = MockLibraries;
+    type Compression = MockCompression;
+    type ArtifactCache = MockArtifactCache;
+    type Wait = MockWait;
 
     fn files(&self) -> &Self::Files {
         &self.files
@@ -244,6 +317,18 @@ impl HostEnvironment for MockHost {
     fn libraries(&self) -> &Self::Libraries {
         &self.libraries
     }
+
+    fn compression(&self) -> &Self::Compression {
+        &self.compression
+    }
+
+    fn artifact_cache(&self) -> &Self::ArtifactCache {
+        &self.artifact_cache
+    }
+
+    fn wait_provider(&self) -> &Self::Wait {
+        &self.wait
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +361,9 @@ mod tests {
             diagnostics: MockDiagnostics::default(),
             allocator: MockAllocator,
             libraries: MockLibraries,
+            compression: MockCompression,
+            artifact_cache: MockArtifactCache,
+            wait: MockWait,
         };
 
         assert_eq!(host.clock().monotonic_now_ns(), Ok(42));

@@ -1,0 +1,649 @@
+{
+  "build": {
+    "binary_bytes": 3530272,
+    "cargo_features": {
+      "bundled_zstd": true,
+      "lz4_safe": true,
+      "structured_simd": true,
+      "zrip_simd": true,
+      "zstd_fat_lto": false,
+      "zstd_no_asm": true,
+      "zstd_pkg_config": false,
+      "zstd_thin_lto": false,
+      "zstd_thin_minified": false
+    },
+    "compiler": {
+      "cargo": "cargo 1.99.0-nightly (2f0e7011e 2026-07-05)",
+      "cc": "gcc 16.1.1",
+      "cflags": "",
+      "profile": "release opt-level=3 lto=thin codegen-units=1",
+      "rustc": "rustc 1.99.0-nightly (f10db292a 2026-07-07)",
+      "rustflags": ""
+    },
+    "execution": {
+      "global_lock": "/tmp/ggml-npu-bench-global.lock",
+      "lock_mode": "shared",
+      "mode": "parallel-shared"
+    },
+    "providers": {
+      "bundled_zstd": {
+        "assembly": false,
+        "crate": "zstd 0.13.3 / zstd-safe 7.2.4 / zstd-sys 2.0.16+zstd.1.5.7",
+        "portable_runtime_dispatch": "BMI2 on GCC/Clang x86; x86_64 HUF assembly unless zstd-no-asm; SSE2/NEON selected by C target macros",
+        "runtime_version": 10507
+      },
+      "lz4_flex": {
+        "checked_decode": true,
+        "compile_time_avx_small_copy": false,
+        "crate": "lz4_flex 0.13.1",
+        "runtime_dispatch": false,
+        "safe_paths": true
+      },
+      "structured_zstd": {
+        "active_decode_kernel": "avx2",
+        "crate": "structured-zstd 0.0.48",
+        "decode_runtime_dispatch": true,
+        "encoder_acceleration": "BMI2 Huffman bitstream dispatch on x86 and SVE2-tagged histogram path on aarch64 are independent of kernel_* features",
+        "vbmi2_enabled": false
+      },
+      "system_zstd": {
+        "crate_features": "none; libloading stable C ABI",
+        "mapped_library": "/usr/lib64/libzstd.so.1.5.7",
+        "runtime_version": 10507
+      },
+      "zrip": {
+        "active_decode_kernel": "fearless_simd-avx2",
+        "crate": "zrip 0.8.3 / fearless_simd 0.5.0",
+        "encoder_explicit_simd": false,
+        "runtime_dispatch": true
+      }
+    },
+    "target": {
+      "arch": "x86_64",
+      "benchmark_cpu_state": [
+        {
+          "cpu": 2,
+          "current_khz": 2600026,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2500000,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "compile_time_features": {
+        "avx": false,
+        "avx2": false,
+        "bmi2": false,
+        "neon": false,
+        "sse2": true,
+        "sse4_2": false
+      },
+      "cpu_affinity": "2-3",
+      "cpu_model": "Intel(R) Core(TM) Ultra 5 226V",
+      "os": "linux",
+      "requested_cpu_affinity": "2-3",
+      "runtime_features": {
+        "avx": true,
+        "avx2": true,
+        "bmi1": true,
+        "bmi2": true,
+        "f16c": true,
+        "fma": true,
+        "lzcnt": true,
+        "movbe": true,
+        "popcnt": true,
+        "sse2": true,
+        "sse4_2": true,
+        "xsave": true
+      },
+      "triple": "x86_64-unknown-linux-gnu"
+    },
+    "variant": "zstd-no-asm"
+  },
+  "candidates": [
+    "zstd-bundled--3",
+    "zstd-bundled-1"
+  ],
+  "method": "fresh process per codec/artifact; first-operation compression/decompression timings include provider initialization; cold-main timing includes argument parse and input read; median warm iterations; VmHWM peak delta after input load",
+  "samples": [
+    {
+      "artifact": "ir2-2fc11a4f22b54cfc-n3.blob",
+      "codec": "zstd-bundled--3",
+      "cold_main_to_first_roundtrip_ns": 1345369,
+      "compressed_bytes": 4037,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 399080,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1377677,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 1355218,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1485567,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 4667295,
+      "input_bytes": 69782,
+      "iterations": 15,
+      "peak_rss_kib": 3340,
+      "peak_scratch_delta_kib": 800,
+      "ratio_uncompressed_over_compressed": 17.285608124845183,
+      "rss_after_input_kib": 2540,
+      "startup_compress_ns": 236843,
+      "startup_decompress_ns": 183759,
+      "steady_compress_median_ns": 58297,
+      "steady_compress_mib_s": 1141.5561889541646,
+      "steady_decompress_median_ns": 38229,
+      "steady_decompress_mib_s": 1740.8067474289396
+    },
+    {
+      "artifact": "ir2-2fc11a4f22b54cfc-n3.blob",
+      "codec": "zstd-bundled-1",
+      "cold_main_to_first_roundtrip_ns": 645433,
+      "compressed_bytes": 2744,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 400000,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1500000,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 1374212,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1488310,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 3909348,
+      "input_bytes": 69782,
+      "iterations": 15,
+      "peak_rss_kib": 3500,
+      "peak_scratch_delta_kib": 832,
+      "ratio_uncompressed_over_compressed": 25.43075801749271,
+      "rss_after_input_kib": 2668,
+      "startup_compress_ns": 259845,
+      "startup_decompress_ns": 174741,
+      "steady_compress_median_ns": 65775,
+      "steady_compress_mib_s": 1011.7719672742064,
+      "steady_decompress_median_ns": 33745,
+      "steady_decompress_mib_s": 1972.123311526476
+    },
+    {
+      "artifact": "ir2-25db148dace09539-n8.blob",
+      "codec": "zstd-bundled--3",
+      "cold_main_to_first_roundtrip_ns": 11643236,
+      "compressed_bytes": 1237213,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 1580356,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1771906,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 1251765,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1394019,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 67590275,
+      "input_bytes": 1634468,
+      "iterations": 15,
+      "peak_rss_kib": 10392,
+      "peak_scratch_delta_kib": 6184,
+      "ratio_uncompressed_over_compressed": 1.321088608024649,
+      "rss_after_input_kib": 4208,
+      "startup_compress_ns": 4469661,
+      "startup_decompress_ns": 2522180,
+      "steady_compress_median_ns": 2212814,
+      "steady_compress_mib_s": 704.4198710727113,
+      "steady_decompress_median_ns": 917942,
+      "steady_decompress_mib_s": 1698.092202544268
+    },
+    {
+      "artifact": "ir2-25db148dace09539-n8.blob",
+      "codec": "zstd-bundled-1",
+      "cold_main_to_first_roundtrip_ns": 9471863,
+      "compressed_bytes": 1086219,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2272114,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2663132,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 1965396,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1875084,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 76469023,
+      "input_bytes": 1634468,
+      "iterations": 15,
+      "peak_rss_kib": 10228,
+      "peak_scratch_delta_kib": 5892,
+      "ratio_uncompressed_over_compressed": 1.5047315504516123,
+      "rss_after_input_kib": 4336,
+      "startup_compress_ns": 4124657,
+      "startup_decompress_ns": 3772584,
+      "steady_compress_median_ns": 2502674,
+      "steady_compress_mib_s": 622.8338779193338,
+      "steady_decompress_median_ns": 1565165,
+      "steady_decompress_mib_s": 995.9014880781838
+    },
+    {
+      "artifact": "ir2-082d22694112e163-n8.blob",
+      "codec": "zstd-bundled--3",
+      "cold_main_to_first_roundtrip_ns": 31457084,
+      "compressed_bytes": 7179390,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2493497,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2469490,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2474557,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2699967,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 132939225,
+      "input_bytes": 8425629,
+      "iterations": 7,
+      "peak_rss_kib": 41896,
+      "peak_scratch_delta_kib": 31056,
+      "ratio_uncompressed_over_compressed": 1.1735856388913264,
+      "rss_after_input_kib": 10840,
+      "startup_compress_ns": 12037282,
+      "startup_decompress_ns": 8814040,
+      "steady_compress_median_ns": 8723026,
+      "steady_compress_mib_s": 921.1603836636136,
+      "steady_decompress_median_ns": 3186147,
+      "steady_decompress_mib_s": 2521.9508004080403
+    },
+    {
+      "artifact": "ir2-082d22694112e163-n8.blob",
+      "codec": "zstd-bundled-1",
+      "cold_main_to_first_roundtrip_ns": 33939695,
+      "compressed_bytes": 6200339,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2680811,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1151425,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2497224,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2196902,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 212193995,
+      "input_bytes": 8425629,
+      "iterations": 7,
+      "peak_rss_kib": 39928,
+      "peak_scratch_delta_kib": 29144,
+      "ratio_uncompressed_over_compressed": 1.3588981183125632,
+      "rss_after_input_kib": 10784,
+      "startup_compress_ns": 16430871,
+      "startup_decompress_ns": 12234875,
+      "steady_compress_median_ns": 13891976,
+      "steady_compress_mib_s": 578.413465216732,
+      "steady_decompress_median_ns": 9014024,
+      "steady_decompress_mib_s": 891.4227404839032
+    },
+    {
+      "artifact": "ir2-27d892a231afd50b-n8.blob",
+      "codec": "zstd-bundled--3",
+      "cold_main_to_first_roundtrip_ns": 141727108,
+      "compressed_bytes": 48615073,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2138587,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 400135,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2430541,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2071842,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 867321907,
+      "input_bytes": 51998870,
+      "iterations": 7,
+      "peak_rss_kib": 203060,
+      "peak_scratch_delta_kib": 149720,
+      "ratio_uncompressed_over_compressed": 1.069603865451359,
+      "rss_after_input_kib": 53340,
+      "startup_compress_ns": 55969717,
+      "startup_decompress_ns": 39644402,
+      "steady_compress_median_ns": 56682557,
+      "steady_compress_mib_s": 874.8720845664648,
+      "steady_decompress_median_ns": 39164583,
+      "steady_decompress_mib_s": 1266.1946841396846
+    },
+    {
+      "artifact": "ir2-27d892a231afd50b-n8.blob",
+      "codec": "zstd-bundled-1",
+      "cold_main_to_first_roundtrip_ns": 198604074,
+      "compressed_bytes": 40968336,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2286378,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2008218,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2567328,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2329881,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 1437265164,
+      "input_bytes": 51998870,
+      "iterations": 7,
+      "peak_rss_kib": 195872,
+      "peak_scratch_delta_kib": 142352,
+      "ratio_uncompressed_over_compressed": 1.2692453508485186,
+      "rss_after_input_kib": 53520,
+      "startup_compress_ns": 86852225,
+      "startup_decompress_ns": 81237164,
+      "steady_compress_median_ns": 87761183,
+      "steady_compress_mib_s": 565.0560430702883,
+      "steady_decompress_median_ns": 80849821,
+      "steady_decompress_mib_s": 613.359265212813
+    },
+    {
+      "artifact": "ir2-00ca97ae85b4313b-n3.blob",
+      "codec": "zstd-bundled--3",
+      "cold_main_to_first_roundtrip_ns": 331318303,
+      "compressed_bytes": 119878478,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2519058,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2077265,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2600000,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 2256953,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 1593427214,
+      "input_bytes": 122200221,
+      "iterations": 5,
+      "peak_rss_kib": 478672,
+      "peak_scratch_delta_kib": 356596,
+      "ratio_uncompressed_over_compressed": 1.0193674714488783,
+      "rss_after_input_kib": 122076,
+      "startup_compress_ns": 148030605,
+      "startup_decompress_ns": 82674797,
+      "steady_compress_median_ns": 152662756,
+      "steady_compress_mib_s": 763.3768397766097,
+      "steady_decompress_median_ns": 81883487,
+      "steady_decompress_mib_s": 1423.2321618993542
+    },
+    {
+      "artifact": "ir2-00ca97ae85b4313b-n3.blob",
+      "codec": "zstd-bundled-1",
+      "cold_main_to_first_roundtrip_ns": 352215636,
+      "compressed_bytes": 55534531,
+      "cpu_state_end": [
+        {
+          "cpu": 2,
+          "current_khz": 2500000,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1644858,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "cpu_state_start": [
+        {
+          "cpu": 2,
+          "current_khz": 2699972,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        },
+        {
+          "cpu": 3,
+          "current_khz": 1950683,
+          "governor": "powersave",
+          "max_khz": 4500000,
+          "min_khz": 400000
+        }
+      ],
+      "fresh_process_wall_ns": 1887300313,
+      "input_bytes": 122200221,
+      "iterations": 5,
+      "peak_rss_kib": 415644,
+      "peak_scratch_delta_kib": 293712,
+      "ratio_uncompressed_over_compressed": 2.200436715671552,
+      "rss_after_input_kib": 121932,
+      "startup_compress_ns": 161061980,
+      "startup_decompress_ns": 123648091,
+      "steady_compress_median_ns": 162333002,
+      "steady_compress_mib_s": 717.9021566228885,
+      "steady_decompress_median_ns": 125814312,
+      "steady_decompress_mib_s": 926.2794540168662
+    }
+  ],
+  "schema": 2,
+  "summary": [
+    {
+      "aggregate_compress_mib_s": 797.8135756380357,
+      "aggregate_decompress_mib_s": 1404.1797239147318,
+      "aggregate_ratio": 1.0419117254420818,
+      "artifact_count": 5,
+      "codec": "zstd-bundled--3",
+      "compressed_bytes": 176914191,
+      "input_bytes": 184328970,
+      "max_peak_scratch_delta_kib": 356596
+    },
+    {
+      "aggregate_compress_mib_s": 659.4888921959299,
+      "aggregate_decompress_mib_s": 809.0582539878366,
+      "aggregate_ratio": 1.775942942284981,
+      "artifact_count": 5,
+      "codec": "zstd-bundled-1",
+      "compressed_bytes": 103792169,
+      "input_bytes": 184328970,
+      "max_peak_scratch_delta_kib": 293712
+    }
+  ]
+}

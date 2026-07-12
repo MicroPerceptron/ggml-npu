@@ -40,6 +40,7 @@ pub(crate) mod ffi {
 }
 
 pub(crate) mod address;
+pub mod artifact_cache;
 mod backend;
 mod engine;
 mod graph;
