@@ -270,7 +270,8 @@ mod tests {
             elems: values.len(),
             dtype: GGML_TYPE_F32,
             owned: false,
-        }
+            shared: None,
+}
     }
 
     fn read_f16(bytes: &[u8]) -> f32 {

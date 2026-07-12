@@ -983,7 +983,8 @@ fn graph_artifact_key(graph: &GraphIr) -> Option<ArtifactKey> {
                 elems: elements,
                 dtype: value.dtype,
                 owned: value.owned,
-            };
+                shared: None,
+};
             let k = match value.dims[0] {
                 Dim::Static(value) => value,
                 Dim::Bounded { max, .. } => max,
@@ -1064,7 +1065,8 @@ fn compile_graph_uncached(graph: &GraphIr) -> Option<Vec<u8>> {
             elems,
             dtype: t.dtype,
             owned: t.owned,
-        };
+            shared: None,
+};
         // Tiny convolution kernels are not group-quantizable; preserve them as f16.
         let bits = if k.is_multiple_of(32) {
             choose_bits(&operand, forced_bits())

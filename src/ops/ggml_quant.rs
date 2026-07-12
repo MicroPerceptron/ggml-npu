@@ -666,7 +666,8 @@ mod tests {
             elems: values.len(),
             dtype: GGML_TYPE_F32,
             owned: false,
-        };
+            shared: None,
+};
         requant::requant(&operand, SUPER_BLOCK, 1, bits, true).unwrap()
     }
 
