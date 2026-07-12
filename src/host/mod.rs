@@ -10,7 +10,10 @@ use core::alloc::Layout;
 use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
 
+use crate::artifact_cache::{ArtifactStore, CompressionProvider, WaitProvider};
 use crate::runtime::Deadline;
+
+pub(crate) mod artifact_cache;
 
 pub(crate) const ERROR_DOMAIN: u32 = u32::from_be_bytes(*b"HOST");
 
@@ -119,6 +122,10 @@ pub(crate) trait ClockService {
 
 pub(crate) trait MemoryStatusService {
     fn available_memory_bytes(&self) -> Result<u64, HostError>;
+
+    fn constrained_available_memory_bytes(&self) -> Result<u64, HostError> {
+        self.available_memory_bytes()
+    }
 }
 
 pub(crate) trait MathService {
@@ -197,6 +204,9 @@ pub(crate) trait HostEnvironment {
     type Diagnostics: DiagnosticService;
     type Allocator: AllocationService;
     type Libraries: DynamicLibraryService;
+    type Compression: CompressionProvider;
+    type ArtifactCache: ArtifactStore;
+    type Wait: WaitProvider;
 
     fn files(&self) -> &Self::Files;
     fn clock(&self) -> &Self::Clock;
@@ -207,6 +217,9 @@ pub(crate) trait HostEnvironment {
     fn diagnostics(&self) -> &Self::Diagnostics;
     fn allocator(&self) -> &Self::Allocator;
     fn libraries(&self) -> &Self::Libraries;
+    fn compression(&self) -> &Self::Compression;
+    fn artifact_cache(&self) -> &Self::ArtifactCache;
+    fn wait_provider(&self) -> &Self::Wait;
 }
 
 #[cfg(target_os = "linux")]

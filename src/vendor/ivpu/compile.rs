@@ -2,15 +2,11 @@
 //!
 //! The OpenVINO compile shim (`libggml_npu_ovc.so`) is `dlopen`'d on demand and, given a weight
 //! re-quantized to low-bit form ([`crate::ops::requant`]), bakes it as a compile-time `Constant` and
-//! compiles a native NPU blob (the fused decompress-matmul). Each blob is a **transient** artifact:
-//! the caller ([`super::session`]) parses it into a driver-owned graph once and then drops it,
-//! caching *that graph* — so a program's weights are not also kept resident as blob bytes (the
-//! double-keep this avoids). Cold-compile cost is amortized two ways:
-//! - **on disk** by a content hash — managed inside the shim (C++) so this core stays `no_std` and
-//!   file-I/O-free; a warm process reloads a ~few-ms blob instead of recompiling (~100 ms).
-//! - **in memory** by the built graph (in [`super::session`], keyed by `(weight pointer, M)` for a
-//!   single matmul or the exact [`sg_semantic_key`] for a subgraph) — so a program compiles at
-//!   most once per process and steady-state decode is a pure graph-cache hit.
+//! compiles a native NPU blob (the fused decompress-matmul). Canonical keys are computed from raw
+//! constant identity before requantization, then the neutral host cache checks compressed memory
+//! and durable content-addressed tiers. The returned uncompressed blob is transient: the selected
+//! runtime parses/prepares it and drops it, while T0 retains only its prepared program and T1/T2
+//! retain only the compressed artifact record.
 //!
 //! `no_std`: the selected host provider supplies configuration and dynamic loading. A compile
 //! failure is cached (as `None`) and not retried.
@@ -24,17 +20,17 @@ use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+use crate::artifact_cache::{ArtifactKey, CacheCompatibility};
 use crate::graph::{Dim, GraphIr, TensorRole, OP_PARAM_BYTES};
-use crate::host::{
-    ConfigService, DynamicLibraryService, HostEnvironment, LibraryVisibility, MemoryStatusService,
-};
+use crate::host::{ConfigService, DynamicLibraryService, HostEnvironment, LibraryVisibility, MemoryStatusService};
 use crate::identity::{SemanticDigest, SemanticHasher};
 use crate::ops::requant::{self, Requant};
 use crate::ops::subgraph::{Ref, SgOp, Subgraph};
 use crate::ops::Operand;
 
 /// Persistent artifact namespace. Increment whenever compiler semantics or framing changes.
-const FORMAT_VERSION: u64 = 8;
+const FORMAT_VERSION: u64 = 9;
+
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_HOST_FLOOR_BYTES: u64 = 4096 * MIB;
 const DEFAULT_EXPANDED_CONSTANT_FRACTION: u64 = 8;
@@ -158,6 +154,7 @@ unsafe fn tensor_constant_admitted(node: *const crate::ffi::ggml_tensor) -> bool
     admitted
 }
 
+
 fn execution_runtime_available() -> bool {
     #[cfg(feature = "level-zero-compat")]
     {
@@ -177,6 +174,24 @@ fn persistent_hasher(domain: &[u8]) -> SemanticHasher {
         .field(b"compiler-adapter", b"openvino-native-graph")
         .u64(b"asymmetric-requant", u64::from(asymmetric()));
     hasher
+}
+
+fn identity(domain: &[u8], value: &[u8]) -> SemanticDigest {
+    let mut hasher = SemanticHasher::new(domain);
+    hasher.field(b"identity", value);
+    hasher.finish()
+}
+
+fn cache_compatibility() -> CacheCompatibility {
+    CacheCompatibility {
+        artifact_schema: FORMAT_VERSION as u32,
+        compiler: identity(b"artifact/compiler", b"native-graph-compiler"),
+        pipeline: identity(b"artifact/pipeline", b"graph-ir-v2-requant-v9"),
+        toolchain: identity(b"artifact/toolchain", b"compiler-provider-abi-v1"),
+        target: identity(b"artifact/target", b"native-npu-elf"),
+        firmware: identity(b"artifact/firmware", b"firmware-command-api-v1"),
+        runtime: identity(b"artifact/runtime", b"native-graph-loader-v1"),
+    }
 }
 
 fn persistent_key(prefix: &str, hasher: SemanticHasher, suffix: &str) -> CString {
@@ -202,6 +217,65 @@ struct ConstantDigestKey {
 
 static CONSTANT_DIGESTS: super::cache::Cache<ConstantDigestKey, SemanticDigest> =
     super::cache::Cache::new(2048);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawConstantDigestKey {
+    generation: u64,
+    source_address: usize,
+    source_dtype: u32,
+    source_elements: usize,
+}
+
+static RAW_CONSTANT_DIGESTS: super::cache::Cache<RawConstantDigestKey, SemanticDigest> =
+    super::cache::Cache::new(4096);
+
+fn operand_storage_bytes(operand: &Operand) -> Option<usize> {
+    let traits = unsafe { crate::ffi::ggml_get_type_traits(operand.dtype) };
+    if traits.is_null() {
+        return None;
+    }
+    let traits = unsafe { &*traits };
+    let block = usize::try_from(traits.blck_size).ok()?;
+    if block == 0 || !operand.elems.is_multiple_of(block) {
+        return None;
+    }
+    operand
+        .elems
+        .checked_div(block)?
+        .checked_mul(traits.type_size)
+}
+
+fn compute_raw_constant_digest(operand: &Operand) -> Option<SemanticDigest> {
+    let bytes = operand_storage_bytes(operand)?;
+    if operand.ptr.is_null() {
+        return None;
+    }
+    let source = unsafe { core::slice::from_raw_parts(operand.ptr.cast::<u8>(), bytes) };
+    let mut hasher = SemanticHasher::new(b"raw-constant/content");
+    hasher
+        .u32(b"dtype", operand.dtype)
+        .u64(b"elements", operand.elems as u64)
+        .field(b"bytes", source);
+    Some(hasher.finish())
+}
+
+fn raw_constant_digest(generation: u64, operand: &Operand) -> Option<SemanticDigest> {
+    let key = RawConstantDigestKey {
+        generation,
+        source_address: operand.ptr as usize,
+        source_dtype: operand.dtype,
+        source_elements: operand.elems,
+    };
+    if let Some(digest) = RAW_CONSTANT_DIGESTS.get(&key) {
+        return Some(digest);
+    }
+    let digest = compute_raw_constant_digest(operand)?;
+    Some(
+        RAW_CONSTANT_DIGESTS
+            .try_get_or_insert_with(key, || digest)
+            .unwrap_or(digest),
+    )
+}
 
 fn compute_requant_digest(rq: &Requant) -> SemanticDigest {
     let mut hasher = SemanticHasher::new(b"requantized-constant/content");
@@ -332,7 +406,7 @@ struct Shim {
 
 /// `null` = untried, `FAILED` = tried & unavailable, else a leaked `*mut Shim`.
 static SHIM: AtomicPtr<Shim> = AtomicPtr::new(ptr::null_mut());
-const SHIM_FAILED: *mut Shim = 1usize as *mut Shim;
+const SHIM_FAILED: *mut Shim = ptr::dangling_mut();
 
 unsafe fn load_shim() -> Option<Shim> {
     let host = crate::host::builtin();
@@ -437,6 +511,26 @@ pub(super) fn const_feasible(weight: &Operand, m: i64, k: i64, n: i64) -> bool {
         && requant::can_requant(weight, k as usize)
 }
 
+fn const_artifact_key(weight: &Operand, m: i64, k: i64, n: i64) -> Option<ArtifactKey> {
+    let source_elements = usize::try_from(k.checked_mul(n)?).ok()?;
+    if weight.elems < source_elements {
+        return None;
+    }
+    let bits = choose_bits(weight, forced_bits());
+    let digest = raw_constant_digest(crate::backend::buffer_generation(), weight)?;
+    let mut hasher = persistent_hasher(b"artifact/matmul-constant");
+    hasher
+        .i64(b"m", m)
+        .i64(b"k", k)
+        .i64(b"n", n)
+        .u32(b"source-dtype", weight.dtype)
+        .u64(b"source-elements", source_elements as u64)
+        .u64(b"requant-bits", bits as u64)
+        .u64(b"asymmetric", u64::from(asymmetric()))
+        .field(b"raw-constant-digest", &digest.0);
+    Some(ArtifactKey(hasher.finish()))
+}
+
 /// Compile the Constant blob for `weight` at shape `(M, K, N)` — re-quantize + compile (or
 /// disk-load) — as a **transient** `Vec<u8>` the caller parses into a graph and then drops. `None`
 /// if the shim/NPU is absent or the weight can't take this path. Called once per `(weight, M)` on a
@@ -452,7 +546,13 @@ pub(super) fn compile_const_blob(weight: &Operand, m: i64, k: i64, n: i64) -> Op
     {
         return None;
     }
-    compile_const(weight, m, k, n)
+    let key = const_artifact_key(weight, m, k, n)?;
+    crate::host::artifact_cache::get_or_compile(
+        key,
+        cache_compatibility(),
+        &super::profile::ARTIFACT_CACHE_OBSERVER,
+        || compile_const(weight, m, k, n),
+    )
 }
 
 /// Optional weight-width override from `GGML_NPU_BITS` (`"4"`, `"8"`, or `"16"`); unset/other →
@@ -512,8 +612,6 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
         choose_bits(weight, forced_bits()),
         asymmetric(),
     )?;
-    let key = cache_key(&rq, weight.ptr as usize, weight.dtype as u32, m, k, n);
-
     let mut blob: *mut u8 = ptr::null_mut();
     let mut len: usize = 0;
     let rc = unsafe {
@@ -529,7 +627,7 @@ fn compile_const(weight: &Operand, m: i64, k: i64, n: i64) -> Option<Vec<u8>> {
             rq.scales.len(),
             rq.zeros.as_ptr(),
             rq.zeros.len(),
-            key.as_ptr(),
+            c"".as_ptr(),
             &mut blob,
             &mut len,
         )
@@ -705,7 +803,104 @@ fn attention_full() -> bool {
         .is_some_and(|value| value.to_bytes() == b"full")
 }
 
+fn graph_artifact_key(graph: &GraphIr) -> Option<ArtifactKey> {
+    let mut hasher = persistent_hasher(b"artifact/graph-ir-v2");
+    hasher
+        .u64(b"value-count", graph.values.len() as u64)
+        .u64(b"node-count", graph.nodes.len() as u64)
+        .u64(b"input-count", graph.inputs.len() as u64)
+        .u64(b"output-count", graph.outputs.len() as u64)
+        .u64(b"attention-policy-full", u64::from(attention_full()))
+        .u64(b"moe-policy-enabled", u64::from(moe_enabled()));
+    for (index, node) in graph.nodes.iter().enumerate() {
+        hasher
+            .u64(b"node-index", index as u64)
+            .u32(b"node-op", GraphIr::wire_op(node)? as u32)
+            .u64(b"node-input-count", node.inputs.len() as u64)
+            .u32(b"node-output", node.output)
+            .field(b"node-op-params", &node.op_params);
+        for &input in &node.inputs {
+            hasher.u32(b"node-input", input);
+        }
+    }
+    for (index, value) in graph.values.iter().enumerate() {
+        let role = match value.role {
+            TensorRole::RuntimeInput => 0,
+            TensorRole::Constant => 1,
+            TensorRole::MutableState => 2,
+            TensorRole::Intermediate => 3,
+            TensorRole::Output => 4,
+        };
+        hasher
+            .u64(b"value-index", index as u64)
+            .u32(b"value-role", role)
+            .u32(b"value-source-dtype", value.dtype);
+        let mut elements = 1usize;
+        for dimension in value.dims {
+            match dimension {
+                Dim::Static(dimension) => {
+                    hasher
+                        .u8(b"value-dimension-kind", 0)
+                        .i64(b"value-dimension", dimension);
+                    elements = elements.checked_mul(usize::try_from(dimension).ok()?)?;
+                }
+                Dim::Bounded { min, max } => {
+                    hasher
+                        .u8(b"value-dimension-kind", 1)
+                        .i64(b"value-dimension-min", min)
+                        .i64(b"value-dimension-max", max);
+                    elements = elements.checked_mul(usize::try_from(max).ok()?)?;
+                }
+            }
+        }
+        for stride in value.strides {
+            hasher.u64(b"value-stride", stride as u64);
+        }
+        if value.role == TensorRole::Constant {
+            let operand = Operand {
+                ptr: value.data as *mut c_void,
+                elems: elements,
+                dtype: value.dtype,
+                owned: value.owned,
+            };
+            let k = match value.dims[0] {
+                Dim::Static(value) => value,
+                Dim::Bounded { max, .. } => max,
+            };
+            let bits = if k % 32 == 0 {
+                choose_bits(&operand, forced_bits())
+            } else {
+                16
+            };
+            let digest = raw_constant_digest(graph.generation, &operand)?;
+            hasher
+                .u64(b"constant-requant-bits", bits as u64)
+                .field(b"constant-raw-digest", &digest.0);
+        }
+    }
+    for &input in &graph.inputs {
+        hasher.u32(b"graph-input", input);
+    }
+    for &output in &graph.outputs {
+        hasher.u32(b"graph-output", output);
+    }
+    Some(ArtifactKey(hasher.finish()))
+}
+
 pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
+    if !graph_feasible(graph) {
+        return None;
+    }
+    let key = graph_artifact_key(graph)?;
+    crate::host::artifact_cache::get_or_compile(
+        key,
+        cache_compatibility(),
+        &super::profile::ARTIFACT_CACHE_OBSERVER,
+        || compile_graph_uncached(graph),
+    )
+}
+
+fn compile_graph_uncached(graph: &GraphIr) -> Option<Vec<u8>> {
     if !graph_feasible(graph) {
         return None;
     }
@@ -737,51 +932,14 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
             elems,
             dtype: t.dtype,
             owned: t.owned,
-            shared: t.shared,
         };
         // Tiny convolution kernels are not group-quantizable; preserve them as f16.
-        let bits = if k % 32 == 0 {
+        let bits = if k.is_multiple_of(32) {
             choose_bits(&operand, forced_bits())
         } else {
             16
         };
-        let requant_started = if crate::trace::perf_enabled() {
-            super::profile::now_ns()
-        } else {
-            0
-        };
         let rq = requant::requant(&operand, k, n, bits, asymmetric())?;
-        if crate::trace::perf_enabled() {
-            let traits = unsafe { crate::ffi::ggml_get_type_traits(t.dtype) };
-            let source_bytes = if traits.is_null() {
-                0
-            } else {
-                let traits = unsafe { &*traits };
-                usize::try_from(traits.blck_size)
-                    .ok()
-                    .filter(|&block| block != 0 && elems % block == 0)
-                    .and_then(|block| {
-                        elems
-                            .checked_div(block)
-                            .and_then(|count| count.checked_mul(traits.type_size))
-                    })
-                    .unwrap_or(0)
-            };
-            crate::trace::perf(
-                "constant_canonicalization",
-                &alloc::format!(
-                    ",\"graph_key\":\"{}\",\"value\":{id},\"source_dtype\":{},\"source_bytes\":{source_bytes},\"canonical_bits\":{},\"canonical_bytes\":{},\"requant_ns\":{}",
-                    graph.semantic_key().digest().hex(),
-                    t.dtype,
-                    rq.bits,
-                    rq.weight
-                        .len()
-                        .saturating_add(rq.scales.len())
-                        .saturating_add(rq.zeros.len()),
-                    super::profile::now_ns().saturating_sub(requant_started),
-                ),
-            );
-        }
         req_index[id] = Some(requants.len());
         requants.push(rq);
     }
@@ -851,111 +1009,8 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
         .filter(|&id| graph.values[id as usize].role != TensorRole::Constant)
         .collect();
 
-    let key_started = if crate::trace::perf_enabled() {
-        super::profile::now_ns()
-    } else {
-        0
-    };
-    let mut key_hasher = persistent_hasher(b"persistent/graph-ir-v2");
-    key_hasher
-        .u64(b"tensor-count", tensors.len() as u64)
-        .u64(b"node-count", nodes.len() as u64)
-        .u64(b"runtime-input-count", runtime_inputs.len() as u64)
-        .u64(b"output-count", graph.outputs.len() as u64)
-        .u64(b"attention-policy-full", u64::from(attention_full()))
-        .u64(b"moe-policy-enabled", u64::from(moe_enabled()));
-    for (index, node) in nodes.iter().enumerate() {
-        key_hasher
-            .u64(b"node-index", index as u64)
-            .i32(b"node-op", node.op)
-            .i32(b"node-input-count", node.n_inputs)
-            .i32(b"node-output", node.output)
-            .field(b"node-op-params", &node.params);
-        for &input in node.inputs.iter().take(node.n_inputs as usize) {
-            key_hasher.i32(b"node-input", input);
-        }
-    }
-    for (index, (tensor, value)) in tensors.iter().zip(&graph.values).enumerate() {
-        key_hasher
-            .u64(b"tensor-index", index as u64)
-            .i32(b"tensor-role", tensor.role)
-            .i32(b"tensor-dtype", tensor.dtype)
-            .i32(b"tensor-bits", tensor.bits)
-            .i32(b"tensor-group", tensor.group);
-        for dim in tensor.ne {
-            key_hasher.i64(b"tensor-dimension", dim);
-        }
-        for dim in value.dims {
-            match dim {
-                Dim::Static(value) => {
-                    key_hasher
-                        .u8(b"tensor-dim-kind", 0)
-                        .i64(b"tensor-dim", value);
-                }
-                Dim::Bounded { min, max } => {
-                    key_hasher
-                        .u8(b"tensor-dim-kind", 1)
-                        .i64(b"tensor-dim-min", min)
-                        .i64(b"tensor-dim-max", max);
-                }
-            }
-        }
-        for stride in value.strides {
-            key_hasher.u64(b"tensor-stride", stride as u64);
-        }
-        if let Some(rq) = req_index[index].map(|rq_index| &requants[rq_index]) {
-            let source_elements = value
-                .dims
-                .iter()
-                .try_fold(1usize, |elements, dim| {
-                    let value = match dim {
-                        Dim::Static(value) => *value,
-                        Dim::Bounded { max, .. } => *max,
-                    };
-                    elements.checked_mul(value as usize)
-                })
-                .unwrap_or(0);
-            let digest = requant_digest(
-                ConstantDigestKey {
-                    generation: graph.generation,
-                    source_address: value.data,
-                    source_dtype: value.dtype as u32,
-                    source_elements,
-                    k: tensor.ne[0],
-                    n: tensor.ne[1] * tensor.ne[2] * tensor.ne[3],
-                    bits: rq.bits,
-                    group: rq.group,
-                    asymmetric: asymmetric(),
-                },
-                rq,
-            );
-            key_hasher.field(b"constant-content-digest", &digest.0);
-        }
-    }
-    for &id in &runtime_inputs {
-        key_hasher.u32(b"runtime-input-id", id);
-    }
-    for &id in &graph.outputs {
-        key_hasher.u32(b"output-id", id);
-    }
-    let key = persistent_key("ir2", key_hasher, &alloc::format!("n{}", nodes.len()));
-    let key_text = key.as_c_str().to_str().unwrap_or("invalid-cache-key");
-    if crate::trace::perf_enabled() {
-        crate::trace::perf(
-            "program_phase",
-            &alloc::format!(
-                ",\"persistent_key\":\"{key_text}\",\"phase\":\"persistent_key\",\"elapsed_ns\":{}",
-                super::profile::now_ns().saturating_sub(key_started),
-            ),
-        );
-    }
     let mut blob = ptr::null_mut();
     let mut len = 0usize;
-    let compiler_started = if crate::trace::perf_enabled() {
-        super::profile::now_ns()
-    } else {
-        0
-    };
     let rc = unsafe {
         compile(
             tensors.len() as i32,
@@ -966,23 +1021,13 @@ pub(super) fn compile_graph_blob(graph: &GraphIr) -> Option<Vec<u8>> {
             runtime_inputs.as_ptr(),
             graph.outputs.len() as i32,
             graph.outputs.as_ptr(),
-            key.as_ptr(),
+            c"".as_ptr(),
             &mut blob,
             &mut len,
         )
     };
     if rc != 0 || blob.is_null() || len == 0 {
         return None;
-    }
-    if crate::trace::perf_enabled() {
-        crate::trace::perf(
-            "compiler_artifact",
-            &alloc::format!(
-                ",\"persistent_key\":\"{key_text}\",\"nodes\":{},\"elapsed_ns\":{},\"elf_bytes\":{len}",
-                nodes.len(),
-                super::profile::now_ns().saturating_sub(compiler_started),
-            ),
-        );
     }
     let out = unsafe { core::slice::from_raw_parts(blob, len) }.to_vec();
     unsafe { (s.free)(blob) };
@@ -1043,6 +1088,61 @@ fn cache_key(
 /// which the caller parses into a graph and then drops. `None` for a malformed subgraph or a
 /// shim/requant failure. Called once per distinct [`sg_semantic_key`] on a
 /// [`session::run_subgraph`](super::session::run_subgraph) graph-cache miss.
+fn subgraph_artifact_key(sg: &Subgraph) -> Option<ArtifactKey> {
+    let mut hasher = persistent_hasher(b"artifact/fused-subgraph");
+    hasher
+        .i64(b"m", sg.m)
+        .u64(b"input-count", sg.inputs.len() as u64)
+        .u64(b"node-count", sg.nodes.len() as u64)
+        .u64(b"constant-count", sg.consts.len() as u64)
+        .u64(b"output-count", sg.outputs.len() as u64);
+    for input in &sg.inputs {
+        hasher
+            .u64(b"input-elements", input.elems as u64)
+            .u32(b"input-dtype", input.dtype);
+    }
+    let encode = |reference: Ref| match reference {
+        Ref::Input(index) => index,
+        Ref::Node(index) => 0x8000_0000 | index,
+    };
+    for node in &sg.nodes {
+        let opcode = match node.op {
+            SgOp::MatMul { n } => {
+                hasher.i64(b"matmul-n", n);
+                1
+            }
+            SgOp::Mul => 2,
+            SgOp::Silu => 3,
+            SgOp::Add => 4,
+            SgOp::RmsNorm { eps } => {
+                hasher.u32(b"rms-eps", eps.to_bits());
+                5
+            }
+        };
+        hasher
+            .u8(b"node-op", opcode)
+            .u32(b"node-a", encode(node.a))
+            .u32(b"node-b", node.b.map(encode).unwrap_or(u32::MAX))
+            .u32(b"node-constant", node.weight.unwrap_or(u32::MAX));
+    }
+    let force = forced_bits();
+    for constant in &sg.consts {
+        let bits = choose_bits(&constant.weight, force);
+        let digest = raw_constant_digest(crate::backend::buffer_generation(), &constant.weight)?;
+        hasher
+            .i64(b"constant-k", constant.k)
+            .i64(b"constant-n", constant.n)
+            .u32(b"constant-source-dtype", constant.weight.dtype)
+            .u64(b"constant-elements", constant.weight.elems as u64)
+            .u64(b"constant-requant-bits", bits as u64)
+            .field(b"constant-raw-digest", &digest.0);
+    }
+    for &output in &sg.outputs {
+        hasher.u32(b"output-node", output);
+    }
+    Some(ArtifactKey(hasher.finish()))
+}
+
 pub(super) fn compile_subgraph_blob(sg: &Subgraph) -> Option<Vec<u8>> {
     if sg.m <= 0
         || sg.inputs.is_empty()
@@ -1055,7 +1155,13 @@ pub(super) fn compile_subgraph_blob(sg: &Subgraph) -> Option<Vec<u8>> {
     if sg.outputs.iter().any(|&o| o as usize >= sg.nodes.len()) {
         return None;
     }
-    compile_subgraph(sg)
+    let key = subgraph_artifact_key(sg)?;
+    crate::host::artifact_cache::get_or_compile(
+        key,
+        cache_compatibility(),
+        &super::profile::ARTIFACT_CACHE_OBSERVER,
+        || compile_subgraph(sg),
+    )
 }
 
 /// Exact owned in-process key for a subgraph's compiled program: M, input metadata, node DAG,
@@ -1096,10 +1202,7 @@ pub(super) fn sg_semantic_key(sg: &Subgraph) -> crate::identity::ExactSemanticKe
         key.u8(b"node-op", op)
             .u32(b"node-a", enc(nd.a))
             .u32(b"node-b", nd.b.map(enc).unwrap_or(u32::MAX))
-            .u32(
-                b"node-weight",
-                nd.weight.map(|weight| weight as u32).unwrap_or(u32::MAX),
-            );
+            .u32(b"node-weight", nd.weight.unwrap_or(u32::MAX));
     }
     for c in &sg.consts {
         key.u64(b"constant-address", c.weight.ptr as usize as u64)
@@ -1181,8 +1284,6 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
         .iter()
         .map(|op| (op.elems / sg.m as usize) as i32)
         .collect();
-    let key = subgraph_cache_key(sg, &requants, &nodes, &input_k, &out_nodes);
-
     let mut blob: *mut u8 = ptr::null_mut();
     let mut len: usize = 0;
     let rc = unsafe {
@@ -1196,7 +1297,7 @@ fn compile_subgraph(sg: &Subgraph) -> Option<Vec<u8>> {
             consts.as_ptr(),
             out_nodes.as_ptr(),
             out_nodes.len() as i32,
-            key.as_ptr(),
+            c"".as_ptr(),
             &mut blob,
             &mut len,
         )
@@ -1246,7 +1347,7 @@ fn subgraph_cache_key(
                 ConstantDigestKey {
                     generation: crate::backend::buffer_generation(),
                     source_address: constant.weight.ptr as usize,
-                    source_dtype: constant.weight.dtype as u32,
+                    source_dtype: constant.weight.dtype,
                     source_elements: constant.weight.elems,
                     k: constant.k,
                     n: constant.n,
@@ -1293,7 +1394,7 @@ mod tests {
         let second = cache_key(&requant(8), 0x2000, 0, 1, 32, 1);
         let first = first.to_str().unwrap();
         let second = second.to_str().unwrap();
-        assert!(first.starts_with("matmul-b3v8-"));
+        assert!(first.starts_with("matmul-b3v9-"));
         assert_eq!(first.split('-').nth(2).unwrap().len(), 64);
         assert_ne!(first, second);
         assert_ne!(
