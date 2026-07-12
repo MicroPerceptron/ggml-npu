@@ -114,7 +114,7 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `FINDING/moe-expert-id-assert-after-layout-glue` — After PR #37 cleared layout-only region rejects, develop `5ccffe4` pp16 r=1 sharing-on smoke aborted warmup (exit 134) with `GGML_ASSERT(id >= 0 && id < n_expert)` in llama.cpp `ggml-backend.cpp` after NPU claimed MoE routing (Argsort/GetRows/SumRows/Sigmoid) despite `npu_moe=0`. Root cause: `moe_enabled()` used `ConfigService::is_set`, and `_run_targeted_smoke.sh` always exports `GGML_NPU_MOE=0`, so presence alone falsely enabled MoE; bad expert ids then reached `MUL_MAT_ID` on another backend. Fix: MoE (and shared `is_opt_in_one`) requires exact value `1`; `=0`/unset unclaims MoE-tagged ops.
   - Scope: Env-gate honesty for MoE claim policy under harness `GGML_NPU_MOE=0`; not a claim that `GGML_NPU_MOE=1` routing is correct on NPU.
-  - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `src/policy.rs`, `benchmarks/results/_run_targeted_smoke.sh`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/`, issues #5/#11.
+  - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `src/policy.rs`, `benchmarks/results/_run_targeted_smoke.sh`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/` (pre-fix abort), `benchmarks/results/develop-0a804c7-targeted-pp16-sharing-on/` (post-fix exit 0; zero Argsort/Sigmoid/SumRows claims), issues #5/#11, PR #38.
   - Verified: 2026-07-12
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
