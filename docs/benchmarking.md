@@ -40,7 +40,8 @@ full benches. Policy details: `.cursor/rules/benchmark-invocation.mdc`.
 - environment and source provenance;
 - structured process wall/RSS data;
 - optional energy;
-- timeout, process-group cleanup, and an NPU MemAvailable guard.
+- timeout, process-group/session cleanup, and an NPU MemAvailable guard (see
+  `benchmarks/lib/lfm_process_guard.sh`).
 
 All timed full-model and cache/quant microbenchmarks on a shared host use the same exclusive lock:
 
@@ -53,6 +54,13 @@ flock -x /tmp/ggml-npu-bench-global.lock \
 The harness records the lock path, inherited CPU affinity, start/end load average, memory pressure,
 RSS, swap, and device memory. A run that overlaps another benchmark is invalid for comparison even
 if it completes; builds and correctness tests do not require the benchmark lock.
+
+Host memory safety: NPU runs preflight swap/MemAvailable, then poll MemAvailable on a short interval
+and kill the bench **session** on breach (not only the wrapper PID). Under heavy zram/swap thrash,
+SIGTERM can sit pending in D-state long enough for the OOM killer to hit `llama-bench` and co-located
+IDE processes — reclaim swap before locked fullperf, and avoid running it inside Cursor when
+MemAvailable/swap are already stressed. Helper contract and smoke test:
+`benchmarks/lib/lfm_process_guard.sh`, `benchmarks/test_lfm_process_guard.sh`.
 
 llama-bench remains authoritative for pp/tg model measurements. Criterion numbers are host
 microbenchmarks and cannot be compared directly with token throughput, latency, energy, or model
