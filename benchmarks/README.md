@@ -1,5 +1,9 @@
 # Benchmark artifacts
 
+Full LFM pp512 / multi-sample locked llama-bench is expensive — do not run it by default. Prefer
+tests, Criterion microbenches, and short profiles; see
+[`docs/benchmarking.md`](../docs/benchmarking.md) and `.cursor/rules/benchmark-invocation.mdc`.
+
 `run_lfm_baseline.sh` captures repeatable native CPU, BLAS, Vulkan, and opt-in NPU baselines for an LFM GGUF.
 Each run creates a timestamped directory containing:
 
