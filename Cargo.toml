@@ -20,7 +20,7 @@ bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
 bench-hardware = ["bench", "level-zero-compat"]
 test-support = []
 # Production quant-transcode implementation. The crate's pinned nightly enables `portable_simd`;
-# unsupported architectures retain the scalar implementation.
+# LLVM emits scalar code on unsupported targets — there is no separate hand-rolled scalar default.
 portable-simd = ["dep:cpufeatures"]
 # F8 constant foundations via `float8`. Kept off by default: `float8` transitively depends on
 # `half`, which must never become the F16 path (nightly `f16` remains the baseline).

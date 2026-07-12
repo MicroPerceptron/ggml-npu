@@ -21,16 +21,17 @@ governor or EPP setting was changed. Q4_K and Q6_K have 256 elements per source 
 
 ## Decision
 
-- `portable-simd` is now in the default production feature set. Q4_K uses the baseline portable
-  implementation. On x86-64, Q6_K uses a per-function AVX2 implementation only when the
+- `portable-simd` is now in the default production feature set. Q4_K / Q6_K packing and fallback
+  requant float hot loops use `core::simd` as the written production path; LLVM emits scalar where
+  the target has no vectors. On x86-64, Q6_K uses a per-function AVX2 implementation only when the
   no-std-compatible `cpufeatures` detector verifies CPU and OS support.
-- Builds with `--no-default-features --features direct-ivpu` use `ScalarKernel`. Default builds on
-  x86/x86-64 and ARM/AArch64 use portable SIMD; other architectures fall back to scalar. No global
+- Builds with `--no-default-features --features direct-ivpu` use `ScalarKernel` / scalar requant
+  helpers. Default builds always select portable SIMD (plus optional AVX2 Q6). No global
   `target-cpu` or `target-feature` flag is required.
 - Selection is observable as `scalar`, `portable-simd`, or `portable-simd+avx2-q6` in benchmark
   metadata and once under `GGML_NPU_TRACE`.
-- `ScalarKernel` remains the byte-exact reference and fallback. All production and specialized
-  routes are tested against it.
+- `ScalarKernel` remains the byte-exact reference and the `--no-default-features` path. All
+  production and specialized routes are tested against it.
 - `pulp` 0.22.3 was evaluated and then removed. Its route was byte-exact, but was no faster than
   scalar on the authoritative sequential realistic workload and would add nine transitive
   packages. No production or benchmark dependency remains.

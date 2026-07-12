@@ -52,20 +52,17 @@ impl QuantKernel for ScalarKernel {
 
 /// Kernel selected by the normal production build.
 ///
-/// Selection never relies on global target features. The portable route is baseline-safe, while
-/// the x86-64 AVX2 specialization is reached only after cached OS-aware runtime detection.
+/// With the default `portable-simd` feature, production always uses `core::simd`
+/// ([`PortableSimdKernel`]); LLVM emits scalar code on targets without vector support. There is no
+/// separate hand-rolled scalar production default. The x86-64 AVX2 Q6 specialization is reached
+/// only after cached OS-aware runtime detection. [`ScalarKernel`] remains the byte-exact reference
+/// and the `--no-default-features` path.
 #[derive(Clone, Copy, Debug)]
 pub enum ProductionKernel {
+    /// Byte-exact reference and `--no-default-features` production path.
+    #[allow(dead_code)] // constructed only when `portable-simd` is disabled
     Scalar(ScalarKernel),
-    #[cfg(all(
-        feature = "portable-simd",
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "arm",
-            target_arch = "aarch64"
-        )
-    ))]
+    #[cfg(feature = "portable-simd")]
     Portable(PortableSimdKernel),
     #[cfg(all(feature = "portable-simd", target_arch = "x86_64"))]
     Avx2Q6(Avx2Kernel),
@@ -78,35 +75,21 @@ impl ProductionKernel {
             return Self::Avx2Q6(kernel);
         }
 
-        #[cfg(all(
-            feature = "portable-simd",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64"
-            )
-        ))]
+        #[cfg(feature = "portable-simd")]
         {
             return Self::Portable(PortableSimdKernel);
         }
 
-        #[allow(unreachable_code)]
-        Self::Scalar(ScalarKernel)
+        #[cfg(not(feature = "portable-simd"))]
+        {
+            Self::Scalar(ScalarKernel)
+        }
     }
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Scalar(_) => "scalar",
-            #[cfg(all(
-                feature = "portable-simd",
-                any(
-                    target_arch = "x86",
-                    target_arch = "x86_64",
-                    target_arch = "arm",
-                    target_arch = "aarch64"
-                )
-            ))]
+            #[cfg(feature = "portable-simd")]
             Self::Portable(_) => "portable-simd",
             #[cfg(all(feature = "portable-simd", target_arch = "x86_64"))]
             Self::Avx2Q6(_) => "portable-simd+avx2-q6",
@@ -124,15 +107,7 @@ impl QuantKernel for ProductionKernel {
     fn pack_u4_split_nibbles(&self, source: &[u8; 128], output: &mut [u8; 128]) {
         match self {
             Self::Scalar(kernel) => kernel.pack_u4_split_nibbles(source, output),
-            #[cfg(all(
-                feature = "portable-simd",
-                any(
-                    target_arch = "x86",
-                    target_arch = "x86_64",
-                    target_arch = "arm",
-                    target_arch = "aarch64"
-                )
-            ))]
+            #[cfg(feature = "portable-simd")]
             Self::Portable(kernel) => kernel.pack_u4_split_nibbles(source, output),
             #[cfg(all(feature = "portable-simd", target_arch = "x86_64"))]
             Self::Avx2Q6(_) => PortableSimdKernel.pack_u4_split_nibbles(source, output),
@@ -142,15 +117,7 @@ impl QuantKernel for ProductionKernel {
     fn pack_i6_quartets(&self, low: &[u8; 128], high: &[u8; 64], output: &mut [u8; 192]) {
         match self {
             Self::Scalar(kernel) => kernel.pack_i6_quartets(low, high, output),
-            #[cfg(all(
-                feature = "portable-simd",
-                any(
-                    target_arch = "x86",
-                    target_arch = "x86_64",
-                    target_arch = "arm",
-                    target_arch = "aarch64"
-                )
-            ))]
+            #[cfg(feature = "portable-simd")]
             Self::Portable(kernel) => kernel.pack_i6_quartets(low, high, output),
             #[cfg(all(feature = "portable-simd", target_arch = "x86_64"))]
             Self::Avx2Q6(kernel) => kernel.pack_i6_quartets(low, high, output),

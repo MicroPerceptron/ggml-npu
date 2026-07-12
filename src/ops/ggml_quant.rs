@@ -418,15 +418,7 @@ pub fn transcode_q4_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData,
             &mut offset_base,
             &mut offset_factor,
         ),
-        #[cfg(all(
-            feature = "portable-simd",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64"
-            )
-        ))]
+        #[cfg(feature = "portable-simd")]
         ProductionKernel::Portable(kernel) => transcode_q4_blocks(
             kernel,
             source_blocks,
@@ -487,15 +479,7 @@ pub fn transcode_q6_k(source: &[u8], k: usize, n: usize) -> Result<ConstantData,
             &mut scale_base,
             &mut scale_factor,
         ),
-        #[cfg(all(
-            feature = "portable-simd",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64"
-            )
-        ))]
+        #[cfg(feature = "portable-simd")]
         ProductionKernel::Portable(kernel) => transcode_q6_blocks(
             kernel,
             source_blocks,
