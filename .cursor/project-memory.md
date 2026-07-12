@@ -120,12 +120,25 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
   `traits.attention`, so `graph_feasible` rejected ShortConv/mutable-state write regions unless
   `GGML_NPU_ATTENTION=full`. SetRows is stateful scatter (also used by LFM `cache_r*` recurrent
-  writes via CPY/GET_ROWS adjacency), not attention SoftMax/FA/Rope. Under
+  writes via CPY/GET_ROWS adjacency), not attention SoftMax/FA. Under
   `GGML_NPU_LFM_SHORTCONV`, placement now pulls SSM_CONV/SET_ROWS/GET_ROWS/CPY when they sit under
   `.conv.` ancestry or touch `cache_r*` (not `cache_k`/`cache_v`).
   - Scope: Capability/placement for ShortConv state edges (#9); not a claim that one OpenVINO
     program can fuse SSM_CONV+SET_ROWS (Intel NPU compile currently rejects that fusion).
   - Evidence: `src/graph.rs`, `src/policy.rs`, `tests/graph_ir_shortconv_check.c`, GitHub issue #9.
+  - Verified: 2026-07-12
+
+- `FINDING/prefill-qkv-rope-not-attention-gate` — `WireOp::Rope` and `WireOp::Permute` were tagged
+  `traits.attention`, so default env rejected fused prefill QKV+RoPE regions unless
+  `GGML_NPU_ATTENTION=full` (which also admits SoftMax/FA). RoPE modes 0|2 (LFM NEOX=2) are
+  QKV-adjacent; Permute is layout metadata. PR #39 untags both; SoftMax/FlashAttention and
+  runtime-weight matmul stay behind `ATTENTION=full`. Policy pulls QKV-adjacent RoPE, qk RMSNorm,
+  and `cache_k`/`cache_v` SetRows/CPY/GET_ROWS for region continuity (distinct from ShortConv
+  `cache_r*`).
+  - Scope: Capability + `should_pull` for prefill QKV continuity (#10/#5); not a claim that
+    SoftMax/FA or full attention-core fusion is default-on or measured for tok/s.
+  - Evidence: `src/graph.rs`, `src/policy.rs`, `src/vendor/ivpu/compile.rs`,
+    `tests/coverage_matrix.csv`, GitHub issue #10, PR #39.
   - Verified: 2026-07-12
 
 - `FINDING/direct-warm-binding-reuse` — Direct resident programs historically keyed the full shared-binding identity into one cache entry, so weightless/glue programs re-staged ELF+HPI+command for every distinct IO set. PR #25 caches artifacts ≤512 KiB by program semantic key (L0 `SG_GRAPHS` analogue), retains a pre-JIT section snapshot, and re-JITs IO bindings in place; larger baked-weight programs keep the binding-set key to avoid host double-keep of weight blobs.
@@ -226,9 +239,9 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). Next: short attribution once swap is calm; safe async overlap only after per-submission completion objects.
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). Next: short attribution once swap is calm; safe async overlap only after per-submission completion objects.
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, with attribution hooks and tok/s movement toward Vulkan under the locked harness.
-  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39.
 
 - `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks.
   - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice).
