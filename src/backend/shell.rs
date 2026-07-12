@@ -324,6 +324,8 @@ unsafe extern "C" fn backend_graph_compute(
     _backend: ggml_backend_t,
     cgraph: *mut ggml_cgraph,
 ) -> ggml_status {
+    // Fail closed: a claimed split that did not execute on NPU must never report SUCCESS (#8).
+    // ggml may then reschedule elsewhere; that fallback is explicit FAILED, not silent success.
     if crate::engine::compute(cgraph) {
         GGML_STATUS_SUCCESS
     } else {
