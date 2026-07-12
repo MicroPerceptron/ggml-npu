@@ -92,8 +92,8 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `.cursor/rules/benchmark-invocation.mdc`, `docs/benchmarking.md`, `benchmarks/README.md`, `benchmarks/lib/lfm_process_guard.sh`.
   - Verified: 2026-07-12
 
-- `CONSTRAINT/upstream-ggml-npu-device-type` — CI builds that bind against upstream llama.cpp headers fail when `GGML_BACKEND_DEVICE_TYPE_NPU` is absent; `src/backend/shell.rs` currently requires that constant.
-  - Evidence: `src/backend/shell.rs`, GitHub Actions build logs for `develop`.
+- `CONSTRAINT/upstream-ggml-npu-device-type` — Stock `ggml-org/llama.cpp` lacks `GGML_BACKEND_DEVICE_TYPE_NPU` and the external-memory registry ABI. `build.rs` feature-detects both: without NPU the backend defaults to `ACCEL` (and maps `GGML_NPU_DEVICE_CLASS=npu` to `ACCEL`) rather than inventing an enum value; without external memory the registry extension is omitted. Native NPU typing + external memory require MicroPerceptron/llama.cpp. CI uses public `ggml-org` (the private fork is not clonable from Actions without credentials). Issue #13.
+  - Evidence: `.github/workflows/ci.yml`, `build.rs`, `src/backend/shell.rs`, `src/backend/mod.rs`, `tests/registration_check.c`, `tests/run_registration_check.sh`, `README.md`.
   - Verified: 2026-07-12
 
 - `CONSTRAINT/shared-memory-promotion` — Generic interop currently proves only allocation identity, access intent, and an owner-controlled host mapping. External handles, visibility, ownership transfer, synchronization, cache maintenance, and queue-family rules stay adapter-owned until at least two implementations share their invariants and failure semantics without convention-based translation.
@@ -105,6 +105,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Rejected alternatives
+
+- `REJECTED/invent-npu-device-type-vs-upstream` — Do not define a local `GGML_BACKEND_DEVICE_TYPE_NPU` (or fake external-memory ABI) against stock `ggml-org/llama.cpp` headers to green CI.
+  - Rationale: A backend-local enum value the host scheduler does not understand would mis-report device class; use ACCEL fallback + omit external memory when headers lack the ABI, and MicroPerceptron/llama.cpp when native NPU typing is required (issue #13). Pinning CI to the private MicroPerceptron fork was also rejected for Actions: anonymous HTTPS clone fails without credentials.
+  - Evidence: `.github/workflows/ci.yml`, `build.rs`, `src/backend/shell.rs`.
+  - Verified: 2026-07-12
 
 - `REJECTED/half-crate-for-f16` — Do not switch IEEE F16 constants or intermediates to the `half` crate (or any crate `f16` type). Keep nightly `f16`.
   - Rationale: Nightly `f16` is the objective baseline; `half::f16` collides in naming/API surface and would pull F16 off the NPU interior type.

@@ -10,7 +10,10 @@ on:
   workflow_dispatch:
 
 env:
-  # Pin the llama.cpp source used for headers. Bump deliberately.
+  # Public ggml-org headers for CI. Stock master lacks GGML_BACKEND_DEVICE_TYPE_NPU and the
+  # external-memory registry ABI; build.rs feature-detects and keeps device typing honest
+  # (ACCEL default / no invented NPU enum). Production hosts should use MicroPerceptron/llama.cpp
+  # which carries the native NPU tier + external-memory ABI (issue #13). Bump deliberately.
   LLAMA_CPP_REF: master
 
 jobs:

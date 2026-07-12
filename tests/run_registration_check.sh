@@ -22,9 +22,19 @@ OUTDIR="$(mktemp -d)"
 trap 'rm -rf "$OUTDIR"' EXIT
 CC="${CC:-cc}"
 
+# Feature-detect host NPU device typing (issue #13). Enum members are not preprocessor
+# macros, so probe the header text the same way build.rs does.
+NPU_DEFS=()
+if grep -q 'GGML_BACKEND_DEVICE_TYPE_NPU' "$GGML/ggml/include/ggml-backend.h"; then
+    NPU_DEFS+=(-DGGML_NPU_HEADERS_HAVE_NPU=1)
+    echo "registration_check: host headers declare GGML_BACKEND_DEVICE_TYPE_NPU"
+else
+    echo "registration_check: host headers lack NPU device type — expecting ACCEL default"
+fi
+
 # -rdynamic exports our stub ggml symbol so the dlopened .so (RTLD_NOW) can resolve it,
 # exactly as a real host exports ggml's symbols to loaded backends.
-"$CC" -rdynamic -Wall -I"$GGML/ggml/include" -I"$GGML/ggml/src" \
+"$CC" -rdynamic -Wall -I"$GGML/ggml/include" -I"$GGML/ggml/src" "${NPU_DEFS[@]}" \
     "$CRATE/tests/registration_check.c" -o "$OUTDIR/registration_check" -ldl
 
 env -u GGML_NPU_DEVICE_CLASS "$OUTDIR/registration_check" "$SO"

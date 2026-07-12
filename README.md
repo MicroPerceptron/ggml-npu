@@ -54,7 +54,10 @@ build.rs                bindgen driver (locates ggml headers + clang resource di
 - **Rust nightly** (pinned by `rust-toolchain.toml`) — required for `allocator_api`.
 - **clang** with its resource headers (`build.rs` uses `clang -print-resource-dir`).
 - A **llama.cpp checkout** for the ggml headers: sibling `../llama.cpp` by default, or set
-  `GGML_DIR=/path/to/llama.cpp`.
+  `GGML_DIR=/path/to/llama.cpp`. Stock `ggml-org/llama.cpp` builds (CI) feature-detect missing
+  `GGML_BACKEND_DEVICE_TYPE_NPU` / external-memory ABI and keep device typing honest (`ACCEL`
+  default; no invented NPU enum). Production hosts that need native NPU scheduling should use
+  **MicroPerceptron/llama.cpp** (see issue #13).
 - Cross-ISA: `rustup target add aarch64-unknown-linux-gnu` + a cross linker
   (`aarch64-linux-gnu-gcc`).
 
