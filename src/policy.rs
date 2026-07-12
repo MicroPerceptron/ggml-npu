@@ -60,11 +60,12 @@ unsafe fn has_shortconv_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
 
 unsafe fn is_shortconv_candidate(t: *const ggml_tensor) -> bool {
     // Explicit architecture boundaries stop ancestry from leaking through the residual stream
-    // into the following FFN/attention block.
+    // into the following FFN/attention block. Depth 12 covers LFM ShortConv gather/state spans
+    // that previously fragmented across CPU/NPU when ancestry stopped at 6 (#5).
     !name_contains(t, b"ffn")
         && !name_contains(t, b"self_attn")
         && !name_contains(t, b"operator_norm")
-        && has_shortconv_ancestor(t, 6)
+        && has_shortconv_ancestor(t, 12)
 }
 
 unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
@@ -195,15 +196,23 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         _ => return false,
     };
     // Orphan/attention-side matmuls (not FFN-local) pay full handoff cost as unitary programs.
-    // Opt-in higher floor via GGML_NPU_MIN_UNITARY_OFFLOAD_WORK (defaults to MIN_OFFLOAD_WORK).
+    // Default unitary floor is 4× MIN_OFFLOAD_WORK so uneconomic 1-node MUL_MAT pulls stay off
+    // NPU unless explicitly lowered via GGML_NPU_MIN_UNITARY_OFFLOAD_WORK (#5).
     let min_work = if x.op == GGML_OP_MUL_MAT
         && !crate::ops::subgraph::is_ffn_shaped_matmul(node)
     {
-        env_u64(c"GGML_NPU_MIN_UNITARY_OFFLOAD_WORK", min_work).max(min_work)
+        unitary_offload_floor(min_work)
     } else {
         min_work
     };
     work >= min_work
+}
+
+/// Higher offload floor for non-FFN unitary matmul pulls. `GGML_NPU_MIN_UNITARY_OFFLOAD_WORK`
+/// overrides the default (`4 * min_work`) but never drops below the general floor.
+fn unitary_offload_floor(min_work: u64) -> u64 {
+    let default = min_work.saturating_mul(4).max(min_work);
+    env_u64(c"GGML_NPU_MIN_UNITARY_OFFLOAD_WORK", default).max(min_work)
 }
 
 #[cfg(test)]
@@ -241,5 +250,13 @@ mod tests {
         assert!(region_supported(
             standalone, 32_768, false, false, false, 32_768
         ));
+    }
+
+    #[test]
+    fn unitary_offload_floor_defaults_to_four_times_general_floor() {
+        // No env override in unit tests: default is 4× and never below min_work.
+        assert_eq!(unitary_offload_floor(4_000_000), 16_000_000);
+        assert_eq!(unitary_offload_floor(0), 0);
+        assert_eq!(unitary_offload_floor(u64::MAX / 2 + 1), u64::MAX);
     }
 }

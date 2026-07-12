@@ -83,7 +83,15 @@ unsafe extern "C" fn buft_alloc_buffer(
         return ptr::null_mut();
     };
     let owner = vendor.alloc_shared_backend(size.max(1));
-    let base = owner.as_ref().map_or_else(
+    // Direct IVPU can only import SharedAllocationOwner-backed buffers. Falling back to bare
+    // alloc_host creates owned-but-unimportable tensors that always stage at dispatch (#6).
+    #[cfg(all(feature = "direct-ivpu", not(feature = "level-zero-compat")))]
+    let base: *mut c_void = match owner.as_ref() {
+        Some(owner) => owner.address().as_ptr().cast(),
+        None => return ptr::null_mut(),
+    };
+    #[cfg(any(not(feature = "direct-ivpu"), feature = "level-zero-compat"))]
+    let base: *mut c_void = owner.as_ref().map_or_else(
         || vendor.alloc_host(size.max(1)),
         |owner| owner.address().as_ptr().cast(),
     );

@@ -116,11 +116,12 @@ fn buffer_type() -> *mut ggml_backend_buffer_type {
 }
 
 /// Whether `tensor` lives in **our** buffer type — i.e. its `data` is NPU-mapped memory
-/// (allocated via the vendor's `alloc_host`) that can be bound as a graph argument with **no
-/// copy**. False for foreign buffers (a CPU-produced activation, a weight the model kept on
-/// CPU), which the vendor must stage through a bounce buffer. O(1): a pointer compare against
-/// our singleton buffer-type. Since our buffer type only ever hands out NPU memory (it fails
-/// the allocation otherwise), "our buft" ⟺ "NPU-mapped", so this is exact.
+/// (shared-backend allocation under Direct IVPU; Level Zero may use `alloc_host`) that can be
+/// bound as a graph argument with **no copy**. False for foreign buffers (a CPU-produced
+/// activation, a weight the model kept on CPU), which the vendor must stage through a bounce
+/// buffer. O(1): a pointer compare against our singleton buffer-type. Since our buffer type
+/// only ever hands out NPU memory (it fails the allocation otherwise), "our buft" ⟺
+/// "NPU-mapped", so this is exact.
 pub(crate) unsafe fn owns_tensor(tensor: *const ggml_tensor) -> bool {
     if tensor.is_null() {
         return false;

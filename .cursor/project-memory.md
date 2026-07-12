@@ -56,6 +56,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `benchmarks/results/develop-8cc351f-pp512-fullperf-locked/`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #19.
   - Verified: 2026-07-12
 
+- `FINDING/direct-host-buft-forced-staging` — Under Direct IVPU, `supports_buft` historically accepted every host buffer type (Level Zero–era “shared RAM ⇒ bind without copy”). Direct can only import `SharedAllocationOwner` allocations from the NPU buft, so CPU-host tensors stayed foreign and were staged at dispatch. Remediation sharing-on still showed 416 staged / 880 imported under that contract. PR #22 narrows Direct-only `supports_buft` to our buft and refuses unimportable `alloc_host` fallbacks when shared alloc fails.
+  - Scope: Placement/buffer-type policy for Direct zero-copy; not a claim that staged volume is already at remediation or better without a short attribution re-measure.
+  - Evidence: `src/backend/shell.rs`, `src/backend/buffer.rs`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #22.
+  - Verified: 2026-07-12
+
 ## Constraints
 
 - `CONSTRAINT/no-default-full-pp512` — Full LFM pp512 and similarly long multi-sample locked llama-bench runs must not be started by default; prefer tests → Criterion → short attribution/profile → optional `r=1` smoke, and reserve full locked pp512 for explicit requests, acceptance criteria, or tok/s-moving changes after cheaper gates. Do not run locked fullperf inside a memory-/swap-stressed Cursor session; prefer a separate terminal/session and the cheaper ladder first. Respect the global flock; keep shim/`compile_graph_v3` current before NPU full benches; do not re-run only to “confirm.”
@@ -116,13 +121,13 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`).
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on.
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, with attribution hooks and tok/s movement toward Vulkan under the locked harness.
-  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, issue #5, PR #15, PR #20.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, issue #5, PR #15, PR #20, PR #22.
 
-- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract.
+- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks.
   - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice).
-  - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, issue #6, PR #19.
+  - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, `src/backend/shell.rs`, `src/backend/buffer.rs`, issue #6, PR #19, PR #22.
 
 - `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact.
   - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven.

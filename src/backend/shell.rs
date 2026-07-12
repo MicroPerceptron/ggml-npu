@@ -166,9 +166,20 @@ unsafe extern "C" fn dev_supports_buft(
     _dev: ggml_backend_dev_t,
     buft: ggml_backend_buffer_type_t,
 ) -> bool {
-    // Integrated SoC: NPU and CPU share RAM, so we can read operands from any host buffer
-    // (ours or the CPU backend's) without a copy. Accept host bufts.
-    !buft.is_null() && ggml_backend_buft_is_host(buft)
+    if buft.is_null() {
+        return false;
+    }
+    // Direct IVPU zero-copy imports only our shared allocations. Accepting every host buft
+    // (LZ-era) left tensors on CPU buffers and forced Direct to stage them at dispatch (#6).
+    // Level Zero can still bind foreign host pointers, so keep the broad host contract there.
+    #[cfg(all(feature = "direct-ivpu", not(feature = "level-zero-compat")))]
+    {
+        buft == super::buffer_type()
+    }
+    #[cfg(any(not(feature = "direct-ivpu"), feature = "level-zero-compat"))]
+    {
+        ggml_backend_buft_is_host(buft)
+    }
 }
 
 unsafe extern "C" fn dev_offload_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
