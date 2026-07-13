@@ -5,18 +5,28 @@
 //! between the same backend and recolors them when every island node is
 //! feasible on the surrounding backend (via the caller-supplied mask).
 //!
+//! With cut-cost mode (`OPT_WEIGHTED_CUT_COST` / v2 ABI), absorbs are gated by
+//! heuristic handoff cost and NPU preservation (#48): never dissolve an NPU
+//! island into Vulkan/CPU, prefer growing onto NPU, boost max-island across
+//! heavy NPU boundaries.
+//!
 //! Profitability / claim policy stays in `offload_op` / `policy::should_pull`.
 //! This only widens homogeneous splits the scheduler already painted.
 
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
 
+use super::cut_cost::{
+    decide_absorb, effective_max_island, total_cut_cost, AbsorbDecision, BackendKind,
+    OPT_WEIGHTED_CUT_COST,
+};
+
 /// Skip this node in interval scans (view / reshape glue that does not cut).
 pub const FLAG_VIEW: u32 = 1 << 0;
 /// Do not recolor (graph input, weight buffer, or other pinned placement).
 pub const FLAG_PINNED: u32 = 1 << 1;
 
-/// POD node row packed by the llama.cpp scheduler hook.
+/// POD node row packed by the llama.cpp scheduler hook (v1 ABI).
 ///
 /// Layout must stay in sync with `struct ggml_sched_region_coalesce_node` in
 /// MicroPerceptron/llama.cpp `ggml-backend` (see
@@ -31,18 +41,56 @@ pub struct SchedRegionCoalesceNode {
     pub flags: u32,
 }
 
-const PROC_NAME: &[u8] = b"ggml_backend_sched_region_coalesce";
+/// Extended POD row for weighted cut-cost coalesce (v2 ABI).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedCutCostNode {
+    pub backend_id: i32,
+    pub feasible_mask: u32,
+    pub flags: u32,
+    /// `ggml_nbytes(node)` capped to `u32::MAX` (0 ⇒ unknown / unweighted fallback).
+    pub nbytes: u32,
+}
 
-/// Pure analysis: mutate `nodes[..]` backend ids; return how many were recolored.
-///
-/// `n_backends` must be in `1..=32` (mask width). `max_island` is the longest
-/// foreign run that may be absorbed (clamped to at least 1).
+const PROC_NAME: &[u8] = b"ggml_backend_sched_region_coalesce";
+const PROC_NAME_V2: &[u8] = b"ggml_backend_sched_region_coalesce_v2";
+
+/// Pure analysis (v1): mutate `nodes[..]` backend ids; return how many were recolored.
 pub fn coalesce_regions(
     nodes: &mut [SchedRegionCoalesceNode],
     n_backends: usize,
     max_island: usize,
 ) -> usize {
+    let mut ext: alloc::vec::Vec<SchedCutCostNode> = nodes
+        .iter()
+        .map(|n| SchedCutCostNode {
+            backend_id: n.backend_id,
+            feasible_mask: n.feasible_mask,
+            flags: n.flags,
+            nbytes: 0,
+        })
+        .collect();
+    // Unknown kinds ⇒ cut-cost gate off; classic island absorb.
+    let kinds = alloc::vec![BackendKind::Unknown; n_backends];
+    let n = coalesce_regions_weighted(&mut ext, n_backends, max_island, &kinds, false);
+    for (dst, src) in nodes.iter_mut().zip(ext.iter()) {
+        dst.backend_id = src.backend_id;
+    }
+    n
+}
+
+/// Weighted / NPU-aware coalesce (v2 core).
+pub fn coalesce_regions_weighted(
+    nodes: &mut [SchedCutCostNode],
+    n_backends: usize,
+    max_island: usize,
+    kinds: &[BackendKind],
+    weighted: bool,
+) -> usize {
     if nodes.is_empty() || n_backends < 2 || n_backends > 32 {
+        return 0;
+    }
+    if kinds.len() < n_backends {
         return 0;
     }
     let max_island = max_island.max(1);
@@ -73,30 +121,57 @@ pub fn coalesce_regions(
             }
             let run_len = run_end - run_start;
 
-            if run_start > 0 && run_end < ops.len() && run_len <= max_island {
+            if run_start > 0 && run_end < ops.len() {
                 let left = nodes[ops[run_start - 1]].backend_id;
                 let right = nodes[ops[run_end]].backend_id;
                 if left == right && left != bid && left >= 0 {
-                    let left_u = left as u32;
-                    if left_u < 32 {
-                        let bit = 1u32 << left_u;
-                        let mut ok = true;
-                        for &op_i in &ops[run_start..run_end] {
-                            let n = &nodes[op_i];
-                            if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
+                    let left_edge_nb = nodes[ops[run_start]].nbytes;
+                    let right_edge_nb = nodes[ops[run_end]].nbytes;
+                    let eff_max = effective_max_island(
+                        max_island,
+                        left,
+                        kinds,
+                        left_edge_nb,
+                        right_edge_nb,
+                        weighted,
+                    );
+                    if run_len <= eff_max {
+                        let left_u = left as u32;
+                        if left_u < 32 {
+                            let bit = 1u32 << left_u;
+                            let mut ok = true;
+                            let mut island_bytes = 0u64;
                             for &op_i in &ops[run_start..run_end] {
-                                if nodes[op_i].backend_id != left {
-                                    nodes[op_i].backend_id = left;
-                                    reassigned += 1;
+                                let n = &nodes[op_i];
+                                if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
+                                    ok = false;
+                                    break;
+                                }
+                                island_bytes =
+                                    island_bytes.saturating_add(n.nbytes as u64);
+                            }
+                            if ok {
+                                let decision = decide_absorb(
+                                    bid,
+                                    left,
+                                    kinds,
+                                    island_bytes,
+                                    run_len,
+                                    left_edge_nb,
+                                    right_edge_nb,
+                                    weighted,
+                                );
+                                if decision == AbsorbDecision::Absorb {
+                                    for &op_i in &ops[run_start..run_end] {
+                                        if nodes[op_i].backend_id != left {
+                                            nodes[op_i].backend_id = left;
+                                            reassigned += 1;
+                                        }
+                                    }
+                                    changed = true;
+                                    break;
                                 }
                             }
-                            changed = true;
-                            break;
                         }
                     }
                 }
@@ -108,15 +183,25 @@ pub fn coalesce_regions(
     // Views stay untouched here. The llama.cpp hook (1) applies NPU / same-buft
     // always, and other targets only when committed buffers are supported by
     // the destination (buffer-safe Vulkan sandwiches), then (2) re-syncs view
-    // ops to view_src. Nearest-neighbor view painting broke weight views and
-    // still SIGSEGV'd in ggml_vk_build_graph on pp128.
+    // ops to view_src.
 
-    // Edge-cost stub site: future weighted cuts can score handoff bytes here
-    // without changing the C ABI (see docs/sched-region-coalesce.md).
-    let _edge_cost_stub = 0usize;
-    let _ = (_edge_cost_stub, n_backends);
-
+    let _ = total_cut_cost_of_nodes(nodes, &ops, kinds); // keep scoring path warm / testable
     reassigned
+}
+
+/// Attribution: sum cut costs over non-view ops after coloring.
+pub fn total_cut_cost_of_nodes(
+    nodes: &[SchedCutCostNode],
+    ops: &[usize],
+    kinds: &[BackendKind],
+) -> u64 {
+    let mut ids = alloc::vec::Vec::with_capacity(ops.len());
+    let mut nb = alloc::vec::Vec::with_capacity(ops.len());
+    for &i in ops {
+        ids.push(nodes[i].backend_id);
+        nb.push(nodes[i].nbytes);
+    }
+    total_cut_cost(&ids, &nb, kinds)
 }
 
 /// Count backend flips along non-view nodes (debug / tests).
@@ -137,9 +222,24 @@ pub fn count_backend_flips(nodes: &[SchedRegionCoalesceNode]) -> usize {
     flips
 }
 
-/// C ABI entry: `ggml_backend_sched_region_coalesce`.
-///
-/// Returns the number of nodes whose `backend_id` changed, or `-1` on bad args.
+pub fn count_backend_flips_cut(nodes: &[SchedCutCostNode]) -> usize {
+    let mut flips = 0usize;
+    let mut prev = None;
+    for n in nodes {
+        if n.flags & FLAG_VIEW != 0 || n.backend_id < 0 {
+            continue;
+        }
+        if let Some(p) = prev {
+            if p != n.backend_id {
+                flips += 1;
+            }
+        }
+        prev = Some(n.backend_id);
+    }
+    flips
+}
+
+/// C ABI entry: `ggml_backend_sched_region_coalesce` (v1, length-only).
 #[no_mangle]
 pub unsafe extern "C" fn ggml_backend_sched_region_coalesce(
     nodes: *mut SchedRegionCoalesceNode,
@@ -157,12 +257,50 @@ pub unsafe extern "C" fn ggml_backend_sched_region_coalesce(
     coalesce_regions(slice, n_backends as usize, max_island as usize) as c_int
 }
 
+/// C ABI entry: `ggml_backend_sched_region_coalesce_v2` (nbytes + kinds + options).
+///
+/// `backend_kinds` length must be `n_backends` (`ggml_backend_dev_type` ordinals).
+/// `options` bit0 = [`OPT_WEIGHTED_CUT_COST`].
+#[no_mangle]
+pub unsafe extern "C" fn ggml_backend_sched_region_coalesce_v2(
+    nodes: *mut SchedCutCostNode,
+    n_nodes: c_int,
+    n_backends: c_int,
+    max_island: c_int,
+    backend_kinds: *const u8,
+    options: u32,
+) -> c_int {
+    if nodes.is_null()
+        || backend_kinds.is_null()
+        || n_nodes < 0
+        || n_backends < 0
+        || max_island < 0
+    {
+        return -1;
+    }
+    if n_nodes == 0 {
+        return 0;
+    }
+    let n_b = n_backends as usize;
+    let slice = unsafe { core::slice::from_raw_parts_mut(nodes, n_nodes as usize) };
+    let kind_bytes = unsafe { core::slice::from_raw_parts(backend_kinds, n_b) };
+    let mut kinds = alloc::vec::Vec::with_capacity(n_b);
+    for &k in kind_bytes {
+        kinds.push(BackendKind::from_u8(k));
+    }
+    let weighted = options & OPT_WEIGHTED_CUT_COST != 0;
+    coalesce_regions_weighted(slice, n_b, max_island as usize, &kinds, weighted) as c_int
+}
+
 pub(crate) unsafe fn proc_address(name: *const c_char) -> *mut c_void {
     if name.is_null() {
         return ptr::null_mut();
     }
-    if unsafe { CStr::from_ptr(name) }.to_bytes() == PROC_NAME {
+    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    if bytes == PROC_NAME {
         ggml_backend_sched_region_coalesce as *mut c_void
+    } else if bytes == PROC_NAME_V2 {
+        ggml_backend_sched_region_coalesce_v2 as *mut c_void
     } else {
         ptr::null_mut()
     }
@@ -171,6 +309,7 @@ pub(crate) unsafe fn proc_address(name: *const c_char) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sched::cut_cost::BackendKind;
 
     fn node(backend: i32, feasible: u32, flags: u32) -> SchedRegionCoalesceNode {
         SchedRegionCoalesceNode {
@@ -180,9 +319,17 @@ mod tests {
         }
     }
 
+    fn cut_node(backend: i32, feasible: u32, flags: u32, nbytes: u32) -> SchedCutCostNode {
+        SchedCutCostNode {
+            backend_id: backend,
+            feasible_mask: feasible,
+            flags,
+            nbytes,
+        }
+    }
+
     #[test]
     fn absorbs_single_foreign_island() {
-        // A A B A A  with B feasible on A → all A
         let both = 0b11;
         let mut nodes = [
             node(0, both, 0),
@@ -202,7 +349,7 @@ mod tests {
     fn refuses_infeasible_island() {
         let mut nodes = [
             node(0, 0b01, 0),
-            node(1, 0b10, 0), // only backend 1
+            node(1, 0b10, 0),
             node(0, 0b01, 0),
         ];
         let n = coalesce_regions(&mut nodes, 2, 4);
@@ -227,11 +374,10 @@ mod tests {
         let both = 0b11;
         let mut nodes = [
             node(0, both, 0),
-            node(1, both, FLAG_VIEW), // ignored for island scan; left for host sync
+            node(1, both, FLAG_VIEW),
             node(1, both, 0),
             node(0, both, 0),
         ];
-        // Non-view sequence: 0, 1, 0 → absorb middle; view row unchanged here
         assert_eq!(coalesce_regions(&mut nodes, 2, 4), 1);
         assert_eq!(nodes[0].backend_id, 0);
         assert_eq!(nodes[1].backend_id, 1);
@@ -241,7 +387,6 @@ mod tests {
 
     #[test]
     fn leaves_sandwiched_views_for_host_view_src_sync() {
-        // Host reapplies view backends from view_src after guarded apply.
         let both = 0b11;
         let mut nodes = [
             node(0, both, 0),
@@ -280,5 +425,100 @@ mod tests {
     fn c_abi_null_is_error() {
         let rc = unsafe { ggml_backend_sched_region_coalesce(ptr::null_mut(), 1, 2, 4) };
         assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn weighted_preserves_fat_npu_island_inside_gpu() {
+        // backend 0 = GPU, backend 1 = NPU; multi-op NPU island stays
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 8192),
+            cut_node(1, both, 0, 8192), // 2-op NPU island
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 0);
+        assert_eq!(nodes[1].backend_id, 1);
+        assert_eq!(nodes[2].backend_id, 1);
+    }
+
+    #[test]
+    fn weighted_dissolves_tiny_npu_unitary_into_gpu() {
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 1024), // tiny unitary NPU
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 1);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn weighted_absorbs_gpu_island_into_npu() {
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 1024), // GPU glue between NPU
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 1);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn weighted_off_dissolves_npu_like_v1() {
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 8192),
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, false);
+        assert_eq!(n, 1);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn v2_abi_null_kinds_is_error() {
+        let mut nodes = [cut_node(0, 0b01, 0, 0)];
+        let rc = unsafe {
+            ggml_backend_sched_region_coalesce_v2(
+                nodes.as_mut_ptr(),
+                1,
+                2,
+                4,
+                ptr::null(),
+                OPT_WEIGHTED_CUT_COST,
+            )
+        };
+        assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn heavy_npu_boundary_boosts_island() {
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        // Five-node GPU island between NPU — base max_island=4 would refuse;
+        // 1 MiB edge boosts to allow absorb.
+        let mut nodes = [
+            cut_node(0, both, 0, 1 << 20),
+            cut_node(1, both, 0, 64),
+            cut_node(1, both, 0, 64),
+            cut_node(1, both, 0, 64),
+            cut_node(1, both, 0, 64),
+            cut_node(1, both, 0, 64),
+            cut_node(0, both, 0, 1 << 20),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert!(n >= 5);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
     }
 }

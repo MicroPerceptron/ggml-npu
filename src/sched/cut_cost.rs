@@ -1,0 +1,330 @@
+//! Weighted DAG cut-cost helpers for region coalesce (#48).
+//!
+//! Heuristic edge cost = tensor nbytes × backend-pair handoff factor.
+//! Prefer growing / preserving NPU regions; never invent NPU claims
+//! (feasibility still comes from the caller's `feasible_mask`).
+//!
+//! Not a per-ioctl bandwidth oracle. Factors are tunable constants.
+
+#![allow(dead_code)]
+
+/// Matches `enum ggml_backend_dev_type` ordinals in ggml-backend.h.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Cpu = 0,
+    Gpu = 1,
+    Igpu = 2,
+    Accel = 3,
+    Meta = 4,
+    Npu = 5,
+    Unknown = 255,
+}
+
+impl BackendKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Cpu,
+            1 => Self::Gpu,
+            2 => Self::Igpu,
+            3 => Self::Accel,
+            4 => Self::Meta,
+            5 => Self::Npu,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[inline]
+    pub fn is_npu(self) -> bool {
+        matches!(self, Self::Npu)
+    }
+}
+
+/// Options bit for `ggml_backend_sched_region_coalesce_v2`.
+pub const OPT_WEIGHTED_CUT_COST: u32 = 1 << 0;
+
+/// Fixed-point handoff factor (×16). Higher ⇒ more expensive cross-backend edge.
+#[inline]
+pub fn handoff_factor(from: BackendKind, to: BackendKind) -> u32 {
+    if from == to {
+        return 0;
+    }
+    match (from, to) {
+        (BackendKind::Npu, BackendKind::Gpu) | (BackendKind::Gpu, BackendKind::Npu) => 48, // 3.0×
+        (BackendKind::Npu, BackendKind::Igpu) | (BackendKind::Igpu, BackendKind::Npu) => 40, // 2.5×
+        (BackendKind::Npu, BackendKind::Cpu) | (BackendKind::Cpu, BackendKind::Npu) => 32, // 2.0×
+        (BackendKind::Npu, BackendKind::Accel) | (BackendKind::Accel, BackendKind::Npu) => 28, // 1.75×
+        (BackendKind::Gpu, BackendKind::Cpu) | (BackendKind::Cpu, BackendKind::Gpu) => 24, // 1.5×
+        (BackendKind::Gpu, BackendKind::Accel) | (BackendKind::Accel, BackendKind::Gpu) => 20, // 1.25×
+        _ => 16, // 1.0× default hop
+    }
+}
+
+/// Cost of one cut edge in fixed-point (nbytes × factor).
+#[inline]
+pub fn edge_cost(nbytes: u32, from: BackendKind, to: BackendKind) -> u64 {
+    let f = handoff_factor(from, to) as u64;
+    if f == 0 {
+        return 0;
+    }
+    (nbytes as u64).saturating_mul(f)
+}
+
+/// Sum cut costs along a linear backend coloring (non-view ops already filtered).
+///
+/// When `portable-simd` is on, scores adjacent edges in SIMD batches of 4 for
+/// the nbytes×factor product; kinds still resolve per-lane (table lookup).
+pub fn total_cut_cost(
+    backend_ids: &[i32],
+    nbytes: &[u32],
+    kinds: &[BackendKind],
+) -> u64 {
+    debug_assert_eq!(backend_ids.len(), nbytes.len());
+    if backend_ids.len() < 2 {
+        return 0;
+    }
+
+    #[cfg(feature = "portable-simd")]
+    {
+        total_cut_cost_simd(backend_ids, nbytes, kinds)
+    }
+    #[cfg(not(feature = "portable-simd"))]
+    {
+        total_cut_cost_scalar(backend_ids, nbytes, kinds)
+    }
+}
+
+fn total_cut_cost_scalar(
+    backend_ids: &[i32],
+    nbytes: &[u32],
+    kinds: &[BackendKind],
+) -> u64 {
+    let mut sum = 0u64;
+    for i in 1..backend_ids.len() {
+        let a = backend_ids[i - 1];
+        let b = backend_ids[i];
+        if a < 0 || b < 0 || a == b {
+            continue;
+        }
+        let ka = kind_at(kinds, a);
+        let kb = kind_at(kinds, b);
+        // Edge weight uses the destination tensor bytes (activation crossing the cut).
+        sum = sum.saturating_add(edge_cost(nbytes[i], ka, kb));
+    }
+    sum
+}
+
+#[cfg(feature = "portable-simd")]
+fn total_cut_cost_simd(
+    backend_ids: &[i32],
+    nbytes: &[u32],
+    kinds: &[BackendKind],
+) -> u64 {
+    use core::simd::u32x4;
+
+    let mut sum = 0u64;
+    let n = backend_ids.len();
+    let mut i = 1usize;
+    // Process edges in groups of 4: product nbytes[i] × factor, then horizontal add.
+    while i + 3 < n {
+        let mut factors = [0u32; 4];
+        let mut bytes = [0u32; 4];
+        for lane in 0..4 {
+            let idx = i + lane;
+            let a = backend_ids[idx - 1];
+            let b = backend_ids[idx];
+            if a >= 0 && b >= 0 && a != b {
+                factors[lane] = handoff_factor(kind_at(kinds, a), kind_at(kinds, b));
+                bytes[lane] = nbytes[idx];
+            }
+        }
+        let fb = u32x4::from_array(bytes) * u32x4::from_array(factors);
+        let arr = fb.to_array();
+        sum = sum
+            .saturating_add(arr[0] as u64)
+            .saturating_add(arr[1] as u64)
+            .saturating_add(arr[2] as u64)
+            .saturating_add(arr[3] as u64);
+        i += 4;
+    }
+    while i < n {
+        let a = backend_ids[i - 1];
+        let b = backend_ids[i];
+        if a >= 0 && b >= 0 && a != b {
+            sum = sum.saturating_add(edge_cost(
+                nbytes[i],
+                kind_at(kinds, a),
+                kind_at(kinds, b),
+            ));
+        }
+        i += 1;
+    }
+    sum
+}
+
+#[inline]
+fn kind_at(kinds: &[BackendKind], backend_id: i32) -> BackendKind {
+    let u = backend_id as usize;
+    if u < kinds.len() {
+        kinds[u]
+    } else {
+        BackendKind::Unknown
+    }
+}
+
+/// Minimum island payload (bytes) worth keeping on NPU instead of dissolving
+/// into Vulkan/CPU. Below this, classic coalesce may absorb (avoids 400-disp
+/// unitary explosion from preserving every tiny feasible NPU sandwich).
+pub const NPU_PRESERVE_MIN_BYTES: u64 = 64 * 1024;
+/// Or keep NPU islands with at least this many non-view ops.
+pub const NPU_PRESERVE_MIN_OPS: usize = 2;
+
+/// Decision for absorbing a foreign island into the surrounding backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbsorbDecision {
+    Absorb,
+    RefusePreserveNpu,
+    RefuseNoGain,
+}
+
+/// NPU-aware absorb gate for a sandwich `left | island | right` with `left == right`.
+///
+/// - Growing onto NPU: absorb when feasible (caller already checked mask).
+/// - Dissolving an NPU island into non-NPU: refuse only when the island is
+///   "fat" (multi-op or ≥ [`NPU_PRESERVE_MIN_BYTES`]); tiny unitaries may
+///   dissolve so buft-safe coalesce duty-cycle wins are not undone.
+/// - Other sandwiches: absorb when estimated cut cost drops (or nbytes unknown).
+pub fn decide_absorb(
+    island_backend: i32,
+    target_backend: i32,
+    kinds: &[BackendKind],
+    island_nbytes_sum: u64,
+    island_op_count: usize,
+    left_edge_nbytes: u32,
+    right_edge_nbytes: u32,
+    weighted: bool,
+) -> AbsorbDecision {
+    if !weighted {
+        return AbsorbDecision::Absorb;
+    }
+    let island_k = kind_at(kinds, island_backend);
+    let target_k = kind_at(kinds, target_backend);
+
+    // Prefer fat NPU regions: keep multi-op / heavy islands off Vulkan/CPU.
+    if island_k.is_npu() && !target_k.is_npu() {
+        let fat = island_op_count >= NPU_PRESERVE_MIN_OPS
+            || island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES;
+        if fat {
+            return AbsorbDecision::RefusePreserveNpu;
+        }
+        // Tiny unitary NPU: allow classic dissolve into surround.
+        return AbsorbDecision::Absorb;
+    }
+
+    // Absorbs onto NPU always welcome when feasible.
+    if target_k.is_npu() {
+        return AbsorbDecision::Absorb;
+    }
+
+    // Non-NPU sandwich: require estimated cost improvement when we have sizes.
+    if island_nbytes_sum == 0 && left_edge_nbytes == 0 && right_edge_nbytes == 0 {
+        return AbsorbDecision::Absorb; // fall back to length-only coalesce
+    }
+    let before = edge_cost(left_edge_nbytes, target_k, island_k)
+        .saturating_add(edge_cost(right_edge_nbytes, island_k, target_k));
+    // After absorb there is no cut at this sandwich.
+    let after = 0u64;
+    if after < before {
+        AbsorbDecision::Absorb
+    } else {
+        AbsorbDecision::RefuseNoGain
+    }
+}
+
+/// Effective max island length: boost when absorbing into NPU across heavy edges.
+pub fn effective_max_island(
+    base: usize,
+    target_backend: i32,
+    kinds: &[BackendKind],
+    left_edge_nbytes: u32,
+    right_edge_nbytes: u32,
+    weighted: bool,
+) -> usize {
+    if !weighted {
+        return base;
+    }
+    if !kind_at(kinds, target_backend).is_npu() {
+        return base;
+    }
+    let edge = left_edge_nbytes.max(right_edge_nbytes);
+    // ≥256 KiB boundary → allow up to 2× island; ≥1 MiB → 3× (capped).
+    if edge >= 1 << 20 {
+        base.saturating_mul(3).min(base.saturating_add(12))
+    } else if edge >= 1 << 18 {
+        base.saturating_mul(2).min(base.saturating_add(8))
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npu_gpu_factor_exceeds_default() {
+        assert!(handoff_factor(BackendKind::Npu, BackendKind::Gpu) > 16);
+        assert_eq!(handoff_factor(BackendKind::Cpu, BackendKind::Cpu), 0);
+    }
+
+    #[test]
+    fn refuse_dissolving_fat_npu_island() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let d = decide_absorb(1, 0, &kinds, 128 * 1024, 1, 4096, 4096, true);
+        assert_eq!(d, AbsorbDecision::RefusePreserveNpu);
+        let multi = decide_absorb(1, 0, &kinds, 1024, 2, 4096, 4096, true);
+        assert_eq!(multi, AbsorbDecision::RefusePreserveNpu);
+    }
+
+    #[test]
+    fn allow_dissolving_tiny_npu_unitary() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let d = decide_absorb(1, 0, &kinds, 4096, 1, 4096, 4096, true);
+        assert_eq!(d, AbsorbDecision::Absorb);
+    }
+
+    #[test]
+    fn absorb_into_npu() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let d = decide_absorb(1, 0, &kinds, 1024, 1, 1024, 1024, true);
+        assert_eq!(d, AbsorbDecision::Absorb);
+    }
+
+    #[test]
+    fn unweighted_always_absorbs() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        assert_eq!(
+            decide_absorb(1, 0, &kinds, 128 * 1024, 2, 4096, 4096, false),
+            AbsorbDecision::Absorb
+        );
+    }
+
+    #[test]
+    fn total_cut_cost_counts_hops() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let ids = [0i32, 1, 0];
+        let nb = [100u32, 200, 300];
+        let c = total_cut_cost(&ids, &nb, &kinds);
+        let expect = edge_cost(200, BackendKind::Npu, BackendKind::Gpu)
+            + edge_cost(300, BackendKind::Gpu, BackendKind::Npu);
+        assert_eq!(c, expect);
+    }
+
+    #[test]
+    fn npu_max_island_boost_on_heavy_edge() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true);
+        assert!(boosted > 4);
+        assert_eq!(effective_max_island(4, 1, &kinds, 1 << 20, 64, true), 4);
+    }
+}
