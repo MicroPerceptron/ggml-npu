@@ -10,7 +10,8 @@ source "$ROOT/benchmarks/lib/lfm_process_guard.sh"
 LLAMA_ROOT="${LLAMA_ROOT:-$ROOT/../llama.cpp}"
 MODEL="${MODEL:-}"
 MODE="${MODE:-cpu-native}" # cpu-native | cpu-openblas | cpu-flexiblas | cpu-mkl | vulkan | npu
-THREADS="${THREADS:-$(nproc)}"
+# Default 6: measured sweet spot on shared Lunar Lake hosts; nproc saturates CPUs.
+THREADS="${THREADS:-6}"
 case "$MODE" in
     cpu|cpu-native) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-native/bin/llama-bench" ;;
     cpu-openblas) DEFAULT_BENCH="$LLAMA_ROOT/build-cpu-openblas/bin/llama-bench" ;;
@@ -64,8 +65,9 @@ if [[ "$MODE" == cpu || "$MODE" == cpu-* ]]; then
     clear_npu_environment
     : "${OMP_NUM_THREADS:=$THREADS}"
     : "${OPENBLAS_NUM_THREADS:=$THREADS}"
+    : "${GOTO_NUM_THREADS:=$THREADS}"
     : "${MKL_NUM_THREADS:=$THREADS}"
-    export OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS
+    export OMP_NUM_THREADS OPENBLAS_NUM_THREADS GOTO_NUM_THREADS MKL_NUM_THREADS
 fi
 
 if [[ -z "$MODEL" || ! -f "$MODEL" ]]; then

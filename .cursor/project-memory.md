@@ -332,6 +332,10 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `.cursor/rules/benchmark-invocation.mdc`, `docs/benchmarking.md`, `benchmarks/README.md`, `benchmarks/lib/lfm_process_guard.sh`.
   - Verified: 2026-07-12
 
+- `CONSTRAINT/bench-default-threads-6` — LFM harness default is `THREADS=6` (llama-bench `-t`, and on CPU modes `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `GOTO_NUM_THREADS` / `MKL_NUM_THREADS`). Do not default to `nproc`; full logical-core counts saturate shared Lunar Lake hosts and inflate variance. Override explicitly when reproducing historical 8-thread citations.
+  - Evidence: `benchmarks/run_lfm_baseline.sh`, `docs/benchmarking.md`, `.cursor/rules/benchmark-invocation.mdc`.
+  - Verified: 2026-07-13
+
 - `CONSTRAINT/upstream-ggml-npu-device-type` — Stock `ggml-org/llama.cpp` lacks `GGML_BACKEND_DEVICE_TYPE_NPU` and the external-memory registry ABI. `build.rs` feature-detects both: without NPU the backend defaults to `ACCEL` (and maps `GGML_NPU_DEVICE_CLASS=npu` to `ACCEL`) rather than inventing an enum value; without external memory the registry extension is omitted. Native NPU typing + external memory require MicroPerceptron/llama.cpp. CI uses public `ggml-org` (the private fork is not clonable from Actions without credentials). Issue #13.
   - Evidence: `.github/workflows/ci.yml`, `build.rs`, `src/backend/shell.rs`, `src/backend/mod.rs`, `tests/registration_check.c`, `tests/run_registration_check.sh`, `README.md`.
   - Verified: 2026-07-12

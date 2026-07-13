@@ -29,6 +29,9 @@ Only if one of these is true:
 
 ## Also
 
+- Default LFM harness threads to **6** (`THREADS` → llama-bench `-t`, plus CPU-mode
+  `OMP_NUM_THREADS` / OpenBLAS/GOTO / MKL). Do not default to `nproc`; override explicitly when
+  comparing historical 8-thread baselines.
 - Never stack concurrent full benches; respect the global flock (`/tmp/ggml-npu-bench-global.lock`)
 - Ensure shim / `compile_graph_v3` is current before any NPU full bench (avoid multi-hour invalid
   Vulkan-fallback runs)
