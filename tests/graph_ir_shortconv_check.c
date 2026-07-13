@@ -309,6 +309,80 @@ int main(int argc, char ** argv) {
         free_blob(blob);
     }
 
+    /* Adjacent SSM_CONV → SetRows writeback. Intel NPU rejects fusing SSM_CONV+SET_ROWS into one
+     * OV model; the intended claimed path is adjacent programs (FeasibilityLimit peels) (#9).
+     * Gather is covered by the state gather/write fixture above; this chains conv→write. */
+    {
+        const uint16_t adj_kernels[] = {0x3c00, 0x3c00, 0x3c00, 0x3800, 0x0000, 0xb800};
+        struct ir_tensor conv_tensors[3] = {
+            {.role=IR_INPUT, .dtype=0, .ne={4,2,1,1}},
+            {.role=IR_CONSTANT, .dtype=0, .ne={3,2,1,1},
+             .constant=ir_f16_constant(adj_kernels, 6)},
+            {.role=IR_OUTPUT, .dtype=0, .ne={2,2,1,1}},
+        };
+        struct ir_node conv_node = {.op=IR_SSM_CONV, .n_inputs=2, .inputs={0,1}, .output=2};
+        uint32_t conv_inputs[] = {0}, conv_outputs[] = {2};
+        blob = NULL; blob_len = 0;
+        rc = compile(3, conv_tensors, 1, &conv_node, 1, conv_inputs, 1, conv_outputs,
+                     "ir3-shortconv-adjacent-conv-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "adjacent SSM_CONV compile failed: %d\n", rc);
+            return 1;
+        }
+        const float conv_x[] = {1,2,3,4, 10,20,30,40};
+        const float conv_expected[] = {6,-10, 9,-10};
+        float conv_actual[4] = {0};
+        rc = run(blob, blob_len, conv_x, 8, conv_actual, 4);
+        free_blob(blob);
+        if (rc != 4) {
+            fprintf(stderr, "adjacent SSM_CONV NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (fabsf(conv_actual[i] - conv_expected[i]) > 0.05f) {
+                fprintf(stderr, "adjacent SSM_CONV mismatch[%d]: got %.5f expected %.5f\n",
+                        i, conv_actual[i], conv_expected[i]);
+                return 1;
+            }
+        }
+
+        struct ir_tensor wr_tensors[4] = {
+            {.role=IR_INPUT, .dtype=0, .ne={2,2,1,1}},
+            {.role=IR_INPUT, .dtype=2, .ne={2,1,1,1}},
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+        };
+        struct ir_node wr_node = {.op=IR_SET_ROWS, .n_inputs=3, .inputs={0,1,2}, .output=3};
+        uint32_t wr_inputs[] = {0,1,2}, wr_outputs[] = {3};
+        blob = NULL; blob_len = 0;
+        rc = compile(4, wr_tensors, 1, &wr_node, 3, wr_inputs, 1, wr_outputs,
+                     "ir3-shortconv-adjacent-write-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "adjacent SetRows writeback compile failed: %d\n", rc);
+            return 1;
+        }
+        const int64_t wr_idx[] = {1,3};
+        const float wr_state[] = {1,2,3,4,5,6,7,8};
+        /* Write conv outputs {6,-10} / {9,-10} into state rows 1 and 3. */
+        const float wr_expected[] = {1,2, 6,-10, 5,6, 9,-10};
+        const void * wr_args[] = {conv_actual, wr_idx, wr_state};
+        const size_t wr_lens[] = {4,4,8};
+        float wr_actual[8] = {0};
+        rc = run_multi(blob, blob_len, wr_args, wr_lens, 3, wr_actual, 8);
+        free_blob(blob);
+        if (rc != 8) {
+            fprintf(stderr, "adjacent SetRows writeback NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (fabsf(wr_actual[i] - wr_expected[i]) > 0.05f) {
+                fprintf(stderr, "adjacent SetRows writeback mismatch[%d]: got %.5f expected %.5f\n",
+                        i, wr_actual[i], wr_expected[i]);
+                return 1;
+            }
+        }
+    }
+
     struct ir_tensor rope_tensors[3] = {
         {.role=IR_INPUT, .dtype=0, .ne={8,2,2,1}},
         {.role=IR_INPUT, .dtype=1, .ne={2,1,1,1}},
