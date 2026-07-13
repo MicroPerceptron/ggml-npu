@@ -48,8 +48,13 @@ All timed full-model and cache/quant microbenchmarks on a shared host use the sa
 ```sh
 flock -x /tmp/ggml-npu-bench-global.lock \
   taskset -c 0-7 env GGML_NPU_BENCH_LOCK=/tmp/ggml-npu-bench-global.lock \
-  THREADS=8 ./benchmarks/run_lfm_baseline.sh
+  ./benchmarks/run_lfm_baseline.sh
 ```
+
+Default `THREADS=6` (override with `THREADS=N`). That sets llama-bench `-t`, and on CPU
+modes also `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `GOTO_NUM_THREADS` / `MKL_NUM_THREADS`
+(FlexiBLAS→OpenBLAS inherits the OpenBLAS/GOTO caps). Prefer 6 over `nproc` on shared hosts —
+full logical-core counts saturate CPUs and inflate variance.
 
 The harness records the lock path, inherited CPU affinity, start/end load average, memory pressure,
 RSS, swap, and device memory. A run that overlaps another benchmark is invalid for comparison even
