@@ -24,7 +24,7 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t b) { (void)b; return f
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type t) { (void)t; return NULL; }
 
 enum { IR_INPUT = 0, IR_CONSTANT = 1, IR_STATE = 2, IR_INTERMEDIATE = 3, IR_OUTPUT = 4,
-       IR_SSM_CONV = 12, IR_ROPE = 13, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
+       IR_SSM_CONV = 12, IR_ROPE = 13, IR_SOFTMAX = 14, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
        IR_FLASH_ATTN = 22, IR_SET_ROWS = 26,
        IR_MAX_INPUTS = 16 };
 /* Matches shim `npu_constant_desc` / Rust `ConstantAbi` for compile_graph_v3. */
@@ -345,6 +345,42 @@ int main(int argc, char ** argv) {
         if (fabsf(rope_actual[i] - rope_data[i]) > 0.01f) {
             fprintf(stderr, "RoPE zero-position mismatch[%d]: got %.5f expected %.5f\n",
                     i, rope_actual[i], rope_data[i]);
+            return 1;
+        }
+    }
+    free_blob(blob);
+
+
+    struct ir_tensor sm_tensors[2] = {
+        {.role=IR_INPUT, .dtype=0, .ne={4,1,1,1}},
+        {.role=IR_OUTPUT, .dtype=0, .ne={4,1,1,1}},
+    };
+    struct ir_node sm_node = {.op=IR_SOFTMAX, .n_inputs=1, .inputs={0}, .output=1};
+    float sm_scale = 1.0f;
+    memcpy(sm_node.params, &sm_scale, sizeof(sm_scale));
+    uint32_t sm_inputs[] = {0}, sm_outputs[] = {1};
+    blob = NULL; blob_len = 0;
+    rc = compile(2, sm_tensors, 1, &sm_node, 1, sm_inputs, 1, sm_outputs,
+                 "ir3-softmax-axis0-v1", &blob, &blob_len);
+    if (rc != 0 || !blob || !blob_len) {
+        fprintf(stderr, "SoftMax compile failed: %d\n", rc);
+        return 1;
+    }
+    /* Uniform logits → uniform probs on ggml ne0 / OV axis 3. */
+    const float sm_logits[4] = {0, 0, 0, 0};
+    const float sm_expected[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    const void * sm_args[] = {sm_logits};
+    const size_t sm_lens[] = {4};
+    float sm_actual[4] = {0};
+    rc = run_multi(blob, blob_len, sm_args, sm_lens, 1, sm_actual, 4);
+    if (rc != 4) {
+        fprintf(stderr, "SoftMax NPU run failed: %d\n", rc);
+        return 1;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (fabsf(sm_actual[i] - sm_expected[i]) > 0.02f) {
+            fprintf(stderr, "SoftMax mismatch[%d]: got %.5f expected %.5f\n",
+                    i, sm_actual[i], sm_expected[i]);
             return 1;
         }
     }

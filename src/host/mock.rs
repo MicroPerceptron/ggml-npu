@@ -476,6 +476,18 @@ mod tests {
         };
         assert!(empty.is_set(c"GGML_NPU_MOE"));
         assert!(!empty.is_opt_in_one(c"GGML_NPU_MOE"));
+
+        // Attention core uses exact `full`, not `1` / presence (#10).
+        let full = MockConfig {
+            name: c"GGML_NPU_ATTENTION",
+            value: c"full",
+        };
+        assert!(full.is_exact(c"GGML_NPU_ATTENTION", b"full"));
+        let attn_one = MockConfig {
+            name: c"GGML_NPU_ATTENTION",
+            value: c"1",
+        };
+        assert!(!attn_one.is_exact(c"GGML_NPU_ATTENTION", b"full"));
     }
 
     #[test]

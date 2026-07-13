@@ -1246,6 +1246,60 @@ mod tests {
     }
 
     #[test]
+    fn softmax_and_flash_attention_supported_modes() {
+        // SoftMax: max_bias==0, arity 1 (logits) or 2 (logits+mask). Scale lives in op_params[0].
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 0.0, 0, 1).map(|s| s.placement),
+            Ok(PlacementClass::FusibleOnly)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 0.0, 0, 2).map(|s| (s.wire, s.traits.attention)),
+            Ok((WireOp::SoftMax, true))
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 1.0, 0, 1),
+            Err(OpReject::UnsupportedVariant)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_SOFT_MAX, 0, 0.0, 0, 3),
+            Err(OpReject::InvalidArity)
+        );
+        // FlashAttention: max_bias==0 and logit_softcap==0 (decode_node), arity 3–4, Anchor.
+        assert_eq!(
+            decode_spec(GGML_OP_FLASH_ATTN_EXT, 0, 0.0, 0, 3).map(|s| s.placement),
+            Ok(PlacementClass::Anchor)
+        );
+        assert_eq!(
+            decode_spec(GGML_OP_FLASH_ATTN_EXT, 0, 0.0, 0, 4).map(|s| s.wire),
+            Ok(WireOp::FlashAttention)
+        );
+        let mut softcap = [0u8; OP_PARAM_BYTES];
+        softcap[8..12].copy_from_slice(&1.0f32.to_ne_bytes());
+        assert_eq!(
+            OpRegistry::decode_node(&Node {
+                op: GGML_OP_FLASH_ATTN_EXT,
+                spec: Err(OpReject::UnsupportedOp),
+                inputs: alloc::vec![0, 1, 2],
+                output: 3,
+                op_params: softcap,
+            }),
+            Err(OpReject::UnsupportedVariant)
+        );
+        let mut bias = [0u8; OP_PARAM_BYTES];
+        bias[4..8].copy_from_slice(&1.0f32.to_ne_bytes());
+        assert_eq!(
+            OpRegistry::decode_node(&Node {
+                op: GGML_OP_FLASH_ATTN_EXT,
+                spec: Err(OpReject::UnsupportedOp),
+                inputs: alloc::vec![0, 1, 2],
+                output: 3,
+                op_params: bias,
+            }),
+            Err(OpReject::UnsupportedVariant)
+        );
+    }
+
+    #[test]
     fn prefill_qkv_rope_and_layout_are_not_attention_gated() {
         // RoPE + Permute must not require GGML_NPU_ATTENTION=full; SoftMax/FA still do (#10).
         assert_eq!(

@@ -35,6 +35,22 @@ fn env_u64(name: &'static CStr, default: u64) -> u64 {
     value
 }
 
+/// Exact `GGML_NPU_ATTENTION=full` — SoftMax / FlashAttention / runtime-weight KQ/KQV (#10).
+fn attention_full() -> bool {
+    crate::host::builtin()
+        .config()
+        .is_exact(c"GGML_NPU_ATTENTION", b"full")
+}
+
+/// SoftMax (fusible) / FlashAttention (anchor) pull candidates under `ATTENTION=full` only.
+fn attention_core_should_pull(spec: OpSpec) -> bool {
+    spec.traits.attention
+        && matches!(
+            spec.placement,
+            PlacementClass::Anchor | PlacementClass::FusibleOnly
+        )
+}
+
 unsafe fn name_contains(t: *const ggml_tensor, needle: &[u8]) -> bool {
     if t.is_null() || needle.is_empty() {
         return false;
@@ -351,6 +367,15 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     if is_qkv_continuity_candidate(node) {
         return true;
     }
+    // Opt-in attention core (#10): FlashAttention anchors and SoftMax under an anchor only when
+    // GGML_NPU_ATTENTION=full. Default must not vanity-pull SoftMax/FA.
+    if attention_full() && attention_core_should_pull(spec) {
+        return match spec.placement {
+            PlacementClass::Anchor => true,
+            PlacementClass::FusibleOnly => has_anchor_ancestor(node, 12),
+            _ => false,
+        };
+    }
     if crate::host::builtin()
         .config()
         .is_set(c"GGML_NPU_FORCE_GRAPH")
@@ -365,6 +390,7 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         };
     }
     let min_work = env_u64(c"GGML_NPU_MIN_OFFLOAD_WORK", 4_000_000);
+    let attention_runtime = attention_full();
     let work = match x.op {
         GGML_OP_MUL_MAT | GGML_OP_MUL_MAT_ID => {
             let a = x.src[0];
@@ -372,9 +398,12 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
                 return false;
             }
             // Runtime-weight matmuls cannot bake into fused NPU programs; pulling them creates
-            // uneconomic unitary islands. Const-weight projections remain eligible even when
-            // activations are non-contiguous (Graph IR + layout glue) — do not require match_node.
-            if x.op == GGML_OP_MUL_MAT && !crate::ops::subgraph::is_const_weight_matmul(node) {
+            // uneconomic unitary islands unless ATTENTION=full admits KQ/KQV (#10). Const-weight
+            // projections remain eligible even when activations are non-contiguous.
+            if x.op == GGML_OP_MUL_MAT
+                && !crate::ops::subgraph::is_const_weight_matmul(node)
+                && !attention_runtime
+            {
                 return false;
             }
             (x.ne[0].max(0) as u64)
@@ -391,11 +420,13 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
         _ => return should_pull_fusible_neighborhood(node, spec),
     };
     // Orphan/attention-side decode matmuls pay full handoff as unitary programs. Prefill-sized
-    // const projections (QKV/FFN/conv) and FFN-shaped mats use the general floor (#5).
+    // const projections (QKV/FFN/conv), FFN-shaped mats, and ATTENTION=full runtime KQ/KQV use
+    // the general floor (#5/#10).
     let min_work = if x.op == GGML_OP_MUL_MAT
         && !crate::ops::subgraph::is_ffn_shaped_matmul(node)
         && !crate::ops::subgraph::is_prefill_static_projection(node)
         && !has_shortconv_ancestor(node, 12)
+        && !(attention_runtime && !crate::ops::subgraph::is_const_weight_matmul(node))
     {
         unitary_offload_floor(min_work)
     } else {
@@ -460,6 +491,53 @@ mod tests {
         assert_eq!(unitary_offload_floor(4_000_000), 16_000_000);
         assert_eq!(unitary_offload_floor(0), 0);
         assert_eq!(unitary_offload_floor(u64::MAX / 2 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn attention_core_pull_candidates_are_softmax_and_flash_only() {
+        // Pure placement/trait contract for ATTENTION=full pull (#10).
+        use crate::graph::{Node, OpRegistry, OperationContract, OP_PARAM_BYTES};
+        let softmax = OpRegistry::decode_node(&Node {
+            op: GGML_OP_SOFT_MAX,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SoftMax");
+        assert!(attention_core_should_pull(softmax));
+        let flash = OpRegistry::decode_node(&Node {
+            op: GGML_OP_FLASH_ATTN_EXT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1, 2],
+            output: 3,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("FA");
+        assert!(attention_core_should_pull(flash));
+        let rope_params = {
+            let mut p = [0u8; OP_PARAM_BYTES];
+            p[8..12].copy_from_slice(&2i32.to_ne_bytes());
+            p
+        };
+        let rope = OpRegistry::decode_node(&Node {
+            op: GGML_OP_ROPE,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: rope_params,
+        })
+        .expect("RoPE");
+        assert!(!attention_core_should_pull(rope));
+        let matmul = OpRegistry::decode_node(&Node {
+            op: GGML_OP_MUL_MAT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("MatMul");
+        assert!(!attention_core_should_pull(matmul));
     }
 
     #[test]
