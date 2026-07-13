@@ -46,22 +46,28 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `ADR/sched-weighted-cut-cost` — Weighted cut-cost coalesce (#48) extends the Rust
   scheduler surface: `src/sched/cut_cost.rs` + `ggml_backend_sched_region_coalesce_v2`
-  packs `nbytes` and `ggml_backend_dev_type` kinds; gated by `GGML_SCHED_CUT_COST=1`
-  (requires coalesce ≥1). Heuristic edge cost = nbytes × backend-pair handoff factor.
-  **Anti-unitary grow-first**: absorb feasible foreign islands onto an *existing* NPU
-  neighbor (classic sandwich or asymmetric `NPU|foreign|other`), never invent NPU when
-  neither neighbor is NPU; then classic sandwiches. Preserve **fat** NPU islands
-  (≥3 ops or ≥64 KiB); dissolve thin unitaries / 2-op scraps; +2 light / 2–3× heavy
-  `max_island` on NPU growth edges. Process counters via
-  `ggml_backend_sched_cut_cost_stats[_reset]`. `core::simd` batches nbytes×factor under
-  `portable-simd`. llama.cpp stays thin packing + buft-safe apply + optional stats dump
-  (llama.cpp PR #13 / anti-unitary companion). Does not invent NPU claims or change MoE
-  `is_opt_in_one` / Argsort unclaim; does not widen Direct `supports_buft`.
+  packs `nbytes`, `ggml_op`, and `ggml_backend_dev_type` kinds; gated by
+  `GGML_SCHED_CUT_COST=1` (requires coalesce ≥1). **Two-objective scoring**:
+  latency = nbytes × backend-pair handoff factor; throughput = op-class compute
+  weight (MatMul/FA/conv/SSM **heavy**, norms/activations **medium**,
+  elementwise/layout **light**). **Anti-unitary grow-first**: absorb feasible
+  foreign islands onto an *existing* NPU neighbor (classic sandwich or asymmetric
+  `NPU|foreign|other`), never invent NPU when neither neighbor is NPU; then classic
+  sandwiches. Preserve **fat** NPU islands (≥3 ops or ≥64 KiB) **or** heavy-class
+  ≥16 KiB; dissolve thin light unitaries / 2-op scraps; +2 default / +3 all-light
+  glue (≥4 KiB edge) / 2–3× heavy `max_island` on NPU growth edges. Process counters
+  via `ggml_backend_sched_cut_cost_stats[_reset]` (incl. light-glue / heavy-preserve).
+  `core::simd` batches nbytes×factor under `portable-simd`. llama.cpp stays thin
+  packing + buft-safe apply + optional stats dump (llama.cpp PR #13 / #16). Does not
+  invent NPU claims or change MoE `is_opt_in_one` / Argsort unclaim; does not widen
+  Direct `supports_buft`.
   - Rationale: Length-only coalesce can dissolve feasible NPU sandwiches into Vulkan;
-    cut costs + selective absorb-into-NPU move toward fat NPU_HOST islands under Direct’s
-    honest buft contract without recreating preserve-all ~412 pp16 disp or PR #22 failure.
+    cut costs + selective absorb-into-NPU + compute weights move toward fat NPU_HOST
+    islands under Direct’s honest buft contract without recreating preserve-all ~412
+    pp16 disp or PR #22 failure.
   - Evidence: `docs/sched-region-coalesce.md`, `src/sched/cut_cost.rs`,
-    `src/sched/region_coalesce.rs`, PR #51, issue #48, `FINDING/sched-anti-unitary-npu-absorb`.
+    `src/sched/region_coalesce.rs`, PR #51, PR #66, llama.cpp#16, issue #48,
+    `FINDING/sched-anti-unitary-npu-absorb`, `FINDING/sched-cut-cost-compute-weight`.
   - Verified: 2026-07-13
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
@@ -154,6 +160,19 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/sched/cut_cost.rs`, `src/sched/region_coalesce.rs`,
     `docs/sched-region-coalesce.md`, `BENCH/lfm-anti-unitary-coa1-targeted`,
     `REJECTED/sched-cut-cost-aggressive-light-island-boost`, issues #48/#5.
+  - Verified: 2026-07-13
+
+- `FINDING/sched-cut-cost-compute-weight` — Compute-weight DAG dimension (PR #66 +
+  llama.cpp#16) packs `ggml_op` and scores throughput beside handoff latency. On tip
+  with claim-stage + ELF pad (#62), LFM sharing-on ShortConv=1 MoE=0 ATTENTION=full
+  FlexiBLAS+Vulkan+Direct `COALESCE=1` `CUT_COST=1` `CLAIM_STAGE=1` THREADS=6 r=1
+  **shape-matches** prior cut-cost+claim cells: pp16 **394**/39.6%/2.43/96.0%; pp128
+  **428**/27.1%/2.59/99.8%. Soft tok/s not comparable. No ~412 preserve-all regression.
+  Does not yet move dispatch count vs prior cut-cost on this config; remaining #48 work
+  is calibrated factors / bit-row reachability / pp16 108-class reduction.
+  - Scope: Targeted r=1 attribution; not locked pp512.
+  - Evidence: `src/sched/cut_cost.rs`, `docs/sched-region-coalesce.md`, PR #66,
+    llama.cpp#16, `BENCH/lfm-cut-cost-compute-weight-targeted`, issues #48/#5.
   - Verified: 2026-07-13
 
 - `FINDING/coverage-prs-gated-surface-not-duty-cycle` — After merges #45/#46/#47 on develop
@@ -510,6 +529,21 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Reproduce: same as `BENCH/lfm-cut-cost-coa1-targeted` on the anti-unitary branch.
   - Verified: 2026-07-13
 
+- `BENCH/lfm-cut-cost-compute-weight-targeted` — PR #66 tip `c10c370` + llama.cpp#16,
+  LFM Q4_K_M targeted r=1 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS+Vulkan+Direct,
+  `-t 6`, `COALESCE=1` `CUT_COST=1` `CLAIM_STAGE=1`: pp16 **394**/39.6%/2.43/96.0%
+  (soft ~26 tok/s); pp128 **428**/27.1%/2.59/99.8% (soft ~146 tok/s). Matches
+  `BENCH/lfm-tip-5c1acb3-coa-cut-claim-matrix` coa1/cut1/cs1 cells; claim-stage+#62
+  compatible; no ~412 regression.
+  - Limitation: Soft r=1 only; soft tok/s not comparable; not locked pp512.
+  - Evidence: `benchmarks/results/develop-371b06d-targeted-pp16-sharing-on-coa1-cut1-cs1-cwt/`,
+    `benchmarks/results/develop-c10c370-targeted-pp128-sharing-on-coa1-cut1-cs1-cwt/`,
+    PR #66, llama.cpp#16, issue #48.
+  - Reproduce: `THREADS=6` `GGML_SCHED_REGION_COALESCE=1` `GGML_SCHED_CUT_COST=1`
+    `GGML_SCHED_NPU_CLAIM_STAGE=1` `./benchmarks/results/_run_targeted_smoke.sh`
+    with `PROMPT_TOKENS=16|128`.
+  - Verified: 2026-07-13
+
 - `BENCH/lfm-pp512-68b7e8d-flexiblas-coa1` — Develop `68b7e8d` locked LFM Q4_K_M pp512 r=3
   t=8 sharing-on ShortConv=1 MoE=0 ATTENTION=full FA on `GGML_SCHED_REGION_COALESCE=1`,
   llama.cpp `2a365b784` (buft-safe #12) `build-interop` with **Vulkan + FlexiBLAS**
@@ -630,8 +664,10 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   pp128 coa1/cut0/cs0 **10**/60%/3.20/93.8%/~40; coa0/cs1 **516**/30.6%/2.41/100%/~65;
   coa1/cut1/cs1 **428**/27.1%/2.59/99.8%/~89; coa1/cut1/cs0 **20**/40%/3.20/96.8%/~44.
   Pre-fix locked pp512 r=3 coa1+cut1+cs1 warmup failed (`res = -3` /
-  `BindingMismatch`); see `FINDING/claim-stage-elf-pad-binding-mismatch`.
-  - Limitation: Soft r=1 only for greens; pre-fix pp512 not baseline-eligible.
+  `BindingMismatch`); post-fix locked baseline is
+  `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`.
+  - Limitation: Soft r=1 only for greens on `5c1acb3`; pre-fix pp512 not
+    baseline-eligible.
   - Evidence: `benchmarks/results/develop-5c1acb3-targeted-pp{16,128}-sharing-on-coa*-cut*-cs*/`,
     `benchmarks/results/develop-5c1acb3-pp512-fullperf-locked-sharing-on-coa1-cut1-cs1-t6/`,
     issues #5/#6.
@@ -646,14 +682,38 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   logical `nbytes`; `offset + allocation_bytes` then overruns the owner (observed
   logical 14680064 vs alloc 14705872 near the end of a 60686336-byte shared buffer).
   Trigger is **claim-stage**, not coalesce/cut-cost: pp512 r=1 passes with cs0
-  (coa1 cut0/cut1) and fails with cs1 (coa0 or coa1). Fix: stage-copy into a fresh
-  BO when the shared view cannot cover the padded section (keep no-copy when it can);
-  unit tests lock the cover predicate.
+  (coa1 cut0/cut1) and fails with cs1 (coa0 or coa1). Fix (PR #62 / `371b06d`):
+  stage-copy into a fresh BO when the shared view cannot cover the padded section
+  (keep no-copy when it can); unit tests lock the cover predicate. Soft r=1 and
+  locked r=3 coa1+cut1+cs1 complete without `BindingMismatch`
+  (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`).
   - Scope: Direct prepare path; llama.cpp claim-stage host unchanged.
-  - Evidence: `src/vendor/ivpu/direct/prepare.rs`,
+  - Evidence: `src/vendor/ivpu/direct/prepare.rs`, PR #62,
     `benchmarks/results/develop-5c1acb3-targeted-pp512-coa*-bisect/`,
     `benchmarks/results/develop-5c1acb3-targeted-pp512-coa1-cut1-cs1-warmup-fix/`
-    (exit 0, 470 disp), issues #5/#6.
+    (exit 0, 470 disp),
+    `benchmarks/results/develop-371b06d-pp512-fullperf-locked-sharing-on-coa1-cut1-cs1-t6/`,
+    issues #5/#6.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` — Develop `371b06d` (PR #62 BindingMismatch
+  pad-stage fix) locked LFM Q4_K_M pp512 r=3 t=6 sharing-on ShortConv=1 MoE=0
+  ATTENTION=full FA on FlexiBLAS+Vulkan+Direct, llama.cpp `a95d49e3c`,
+  `COALESCE=1` `CUT_COST=1` `CLAIM_STAGE=1`: **204.963 ± 31.124 tok/s**,
+  2.540 ± 0.420 s; exit 0; baseline-eligible direct-ivpu; profile **940** disp
+  (~**470**/pass) / 33.6% unitary / avg nodes 2.45 / **99.3%** no-copy /
+  ~0.82 GiB NPU; samples 169.4 / 218.0 / 227.5. Soft r=1 same tip config
+  ~242.6 tok/s / 470 disp. Vs L0 FlexiBLAS coa1 ~266 / 488 disp; vs Direct
+  tip without claim (`68b7e8d` coa1) ~101 / 20 disp / 0.09 GiB.
+  - Limitation: High σ from cold first rep; warm reps ~218–227 still below soft
+    r=1 and L0 mean; `ALLOW_HIGH_SWAP=1`; does not close L0 tok/s gap.
+  - Evidence: `benchmarks/results/develop-371b06d-pp512-fullperf-locked-sharing-on-coa1-cut1-cs1-t6/`,
+    `benchmarks/results/summary-develop-371b06d-pp512.txt`, issue #5, PR #62,
+    `FINDING/claim-stage-elf-pad-binding-mismatch`.
+  - Reproduce: rebuild tip `libggml_npu.so`; flock + `THREADS=6`
+    `OMP_NUM_THREADS=6` `FLEXIBLAS=OPENBLAS-OPENMP` `GGML_SCHED_REGION_COALESCE=1`
+    `GGML_SCHED_CUT_COST=1` `GGML_SCHED_NPU_CLAIM_STAGE=1`
+    `./benchmarks/results/_run_pp512_fullperf.sh`.
   - Verified: 2026-07-13
 
 ## Pending milestones
@@ -688,19 +748,20 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). SoftMax/FA/runtime-weight KQ opt-in under exact `ATTENTION=full` is contracted (`FINDING/attention-runtime-core-opt-in`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse.   PR #44 + llama.cpp#11 guard coalesce apply (`FINDING/sched-region-coalesce-pp128-vulkan-segv`). Post-#45/#46/#47 attribution on `8ec283e` (`FINDING/coverage-prs-gated-surface-not-duty-cycle`, `BENCH/lfm-post-coverage-8ec283e-targeted`) confirmed gated surface only under NPU-only apply.   Buffer-safe Vulkan-sandwich absorbs (llama.cpp#12 / ggml-npu PR #50; `FINDING/sched-coalesce-buft-safe-duty-cycle`, `BENCH/lfm-buft-safe-coalesce-targeted`) restore short-smoke duty cycle (pp16 400→108 disp; pp128 12→8; no SEGV) without full unguarded 66-disp restore. Locked tip `68b7e8d` with FlexiBLAS+coa1 (`BENCH/lfm-pp512-68b7e8d-flexiblas-coa1`) is ~101 tok/s / 20 disp / 0.09 GiB — near remediation tok/s, not a restore of `5db8513` ~307. Next: close remaining gap toward `ab3eceb` 66-disp / locked pp512 handoff vs remediation and toward Vulkan; placement that grows proven NPU bytes vs `5db8513` 24/0.09 GiB; safe async overlap only after per-submission completion objects. Weighted cut-cost follow-on is `MILESTONE/sched-weighted-cut-cost` (#48).
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). SoftMax/FA/runtime-weight KQ opt-in under exact `ATTENTION=full` is contracted (`FINDING/attention-runtime-core-opt-in`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse.   PR #44 + llama.cpp#11 guard coalesce apply (`FINDING/sched-region-coalesce-pp128-vulkan-segv`). Post-#45/#46/#47 attribution on `8ec283e` (`FINDING/coverage-prs-gated-surface-not-duty-cycle`, `BENCH/lfm-post-coverage-8ec283e-targeted`) confirmed gated surface only under NPU-only apply.   Buffer-safe Vulkan-sandwich absorbs (llama.cpp#12 / ggml-npu PR #50; `FINDING/sched-coalesce-buft-safe-duty-cycle`, `BENCH/lfm-buft-safe-coalesce-targeted`) restore short-smoke duty cycle (pp16 400→108 disp; pp128 12→8; no SEGV) without full unguarded 66-disp restore.   Locked tip `68b7e8d` with FlexiBLAS+coa1 (`BENCH/lfm-pp512-68b7e8d-flexiblas-coa1`) is ~101 tok/s / 20 disp / 0.09 GiB — near remediation tok/s, not a restore of `5db8513` ~307. Claim+stage after PR #62 pad fix (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`) restores L0-shaped duty cycle (~470 disp / ~0.82 GiB) at **~205** locked tok/s (still below L0 ~266). Next: close remaining gap toward `ab3eceb` 66-disp / locked pp512 handoff vs remediation and toward Vulkan; placement that grows proven NPU bytes vs `5db8513` 24/0.09 GiB; safe async overlap only after per-submission completion objects. Weighted cut-cost follow-on is `MILESTONE/sched-weighted-cut-cost` (#48).
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, **or** (post-unclaim) a clearly larger proven NPU duty cycle (dispatches/bytes/avg nodes) vs `5db8513` 24 / 0.09 GiB without soft-success; attribution hooks and tok/s movement toward Vulkan under the locked harness.
-  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, `src/sched/region_coalesce.rs`, `src/sched/cut_cost.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39, PR #41, PR #50, PR #51, llama.cpp#12/#13.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, `src/sched/region_coalesce.rs`, `src/sched/cut_cost.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39, PR #41, PR #50, PR #51, PR #62, llama.cpp#12/#13/#15.
 
-- `MILESTONE/sched-weighted-cut-cost` — Weighted DAG / bitmat-inspired cut-cost scheduler on top of landed same-backend region coalesce (GitHub #48; follow-on to #5 coalesce, contributes toward #4). **MVP gated** in PR #51 + llama.cpp#13 (`ADR/sched-weighted-cut-cost`, `FINDING/sched-cut-cost-fat-npu-preserve`, `BENCH/lfm-cut-cost-coa1-targeted`). **Anti-unitary absorb** follow-on (`FINDING/sched-anti-unitary-npu-absorb`, `BENCH/lfm-anti-unitary-coa1-targeted`): grow onto existing NPU neighbors (incl. asymmetric), fat≥3 preserve, stats ABI; LFM shape matches MVP without beating pp16 108→324 residual. Remaining vs full #48: bit-row reachability / non-linear maximal regions; calibrated factors; pp16 dispatch-count reduction without regressing unitary%/no-copy or recreating ~412 preserve-all; optional default-on after more evidence. Do not widen Direct `supports_buft` to chase L0 duty cycle.
+- `MILESTONE/sched-weighted-cut-cost` — Weighted DAG / bitmat-inspired cut-cost scheduler on top of landed same-backend region coalesce (GitHub #48; follow-on to #5 coalesce, contributes toward #4). **MVP gated** in PR #51 + llama.cpp#13 (`ADR/sched-weighted-cut-cost`, `FINDING/sched-cut-cost-fat-npu-preserve`, `BENCH/lfm-cut-cost-coa1-targeted`). **Anti-unitary absorb** follow-on (`FINDING/sched-anti-unitary-npu-absorb`, `BENCH/lfm-anti-unitary-coa1-targeted`): grow onto existing NPU neighbors (incl. asymmetric), fat≥3 preserve, stats ABI; LFM shape matches MVP without beating pp16 108→324 residual. **Compute-weight dimension** in PR #66 + llama.cpp#16 (`FINDING/sched-cut-cost-compute-weight`, `BENCH/lfm-cut-cost-compute-weight-targeted`): latency+throughput scoring; shape-matches prior coa1/cut1/cs1 cells without ~412 regression. Remaining vs full #48: bit-row reachability / non-linear maximal regions; calibrated factors that move disp/unitary% without recreating preserve-all; optional default-on after more evidence. Do not widen Direct `supports_buft` to chase L0 duty cycle.
   - Acceptance: Measurable drop in handoff bytes and/or splits on short attribution/profile vs coalesce-only; higher NPU duty cycle without inventing unsupported claims; Rust-first in `src/sched/` with thin `get_proc_address` POD export; attribution counters for cut cost / handoff / split shape. Full locked pp512 only when explicitly warranted.
-  - Evidence: GitHub issue #48, PR #51, llama.cpp#13, `src/sched/cut_cost.rs`, `src/sched/region_coalesce.rs`, `docs/sched-region-coalesce.md`, issue #5.
+  - Evidence: GitHub issue #48, PR #51, PR #66, llama.cpp#13/#16, `src/sched/cut_cost.rs`, `src/sched/region_coalesce.rs`, `docs/sched-region-coalesce.md`, issue #5.
 
-- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks. PR #52 + llama.cpp#15 add residency attribution and claim+stage (`GGML_SCHED_NPU_CLAIM_STAGE=1`) for L0-shaped duty cycle under coalesce=0 / cut-cost; selective allowlist remains gated off.
+- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks. PR #52 + llama.cpp#15 add residency attribution and claim+stage (`GGML_SCHED_NPU_CLAIM_STAGE=1`) for L0-shaped duty cycle under coalesce=0 / cut-cost; selective allowlist remains gated off. PR #62 pad-stage fallback unblocks claim-stage pp512; locked tip shows **99.3%** no-copy with 20 staged pad covers (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`).
   - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice). Material reduction of `foreign_host_refused` → staged only via proven importable allowlist, never blind widen.
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`,
     `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
-    `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22, PR #52, llama.cpp#15.
+    `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22, PR #52, PR #62,
+    llama.cpp#15.
 
 - `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact. One locked LFM L0 pp512 baseline now exists (`BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`); that is evidence for parity comparison only — **not** acceptance to delete L0.
   - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven.
