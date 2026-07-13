@@ -975,10 +975,10 @@ fn moe_enabled() -> bool {
 }
 
 fn attention_full() -> bool {
+    // Exact `full` only — `=1` / presence must not vanity-claim SoftMax/FA/runtime KQ (#10).
     crate::host::builtin()
         .config()
-        .value(c"GGML_NPU_ATTENTION")
-        .is_some_and(|value| value.to_bytes() == b"full")
+        .is_exact(c"GGML_NPU_ATTENTION", b"full")
 }
 
 fn graph_artifact_key(graph: &GraphIr) -> Option<ArtifactKey> {
@@ -1847,6 +1847,57 @@ mod tests {
         assert!(env_policy_admits(&dense, false));
         // Runtime-weight matmul still requires ATTENTION=full even without traits.attention.
         assert!(!env_policy_admits(&dense, true));
+    }
+
+    #[test]
+    fn attention_full_requires_exact_full_string() {
+        use crate::host::ConfigService;
+        let full = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_ATTENTION",
+            value: c"full",
+        };
+        assert!(full.is_exact(c"GGML_NPU_ATTENTION", b"full"));
+        let one = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_ATTENTION",
+            value: c"1",
+        };
+        assert!(!one.is_exact(c"GGML_NPU_ATTENTION", b"full"));
+        let zero = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_ATTENTION",
+            value: c"0",
+        };
+        assert!(!zero.is_exact(c"GGML_NPU_ATTENTION", b"full"));
+    }
+
+    #[test]
+    fn runtime_weight_matmul_follows_attention_gate_without_attention_trait() {
+        // MatMul is not traits.attention; runtime-weight still needs ATTENTION=full (#10).
+        let dense = crate::graph::OpRegistry::decode_node(&crate::graph::Node {
+            op: crate::ffi::GGML_OP_MUL_MAT,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; crate::graph::OP_PARAM_BYTES],
+        })
+        .expect("MatMul");
+        assert!(!dense.traits.attention);
+        assert!(env_policy_admits(&dense, false)); // const-weight path
+        assert!(!env_policy_admits(&dense, true)); // runtime-weight path, default env
+        assert!(env_policy_admits_gated(&dense, true, false, true)); // ATTENTION=full
+        assert!(!env_policy_admits_gated(&dense, true, false, false));
+        let softmax = crate::graph::OpRegistry::decode_node(&crate::graph::Node {
+            op: crate::ffi::GGML_OP_SOFT_MAX,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0],
+            output: 1,
+            op_params: [0; crate::graph::OP_PARAM_BYTES],
+        })
+        .expect("SoftMax");
+        assert!(softmax.traits.attention);
+        assert!(!env_policy_admits_gated(&softmax, false, false, false));
+        assert!(env_policy_admits_gated(&softmax, false, false, true));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::SoftMax));
+        assert!(wire_op_compile_supported(crate::graph::WireOp::FlashAttention));
     }
 
     #[test]

@@ -24,7 +24,7 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t b) { (void)b; return f
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type t) { (void)t; return NULL; }
 
 enum { IR_INPUT = 0, IR_CONSTANT = 1, IR_STATE = 2, IR_INTERMEDIATE = 3, IR_OUTPUT = 4,
-       IR_SSM_CONV = 12, IR_ROPE = 13, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
+       IR_SSM_CONV = 12, IR_ROPE = 13, IR_SOFTMAX = 14, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
        IR_FLASH_ATTN = 22, IR_SIGMOID = 24, IR_SUM_ROWS = 25, IR_SET_ROWS = 26,
        IR_MAX_INPUTS = 16 };
 /* Matches shim `npu_constant_desc` / Rust `ConstantAbi` for compile_graph_v3. */
@@ -381,6 +381,80 @@ int main(int argc, char ** argv) {
         free_blob(blob);
     }
 
+    /* Adjacent SSM_CONV → SetRows writeback. Intel NPU rejects fusing SSM_CONV+SET_ROWS into one
+     * OV model; the intended claimed path is adjacent programs (FeasibilityLimit peels) (#9).
+     * Gather is covered by the state gather/write fixture above; this chains conv→write. */
+    {
+        const uint16_t adj_kernels[] = {0x3c00, 0x3c00, 0x3c00, 0x3800, 0x0000, 0xb800};
+        struct ir_tensor conv_tensors[3] = {
+            {.role=IR_INPUT, .dtype=0, .ne={4,2,1,1}},
+            {.role=IR_CONSTANT, .dtype=0, .ne={3,2,1,1},
+             .constant=ir_f16_constant(adj_kernels, 6)},
+            {.role=IR_OUTPUT, .dtype=0, .ne={2,2,1,1}},
+        };
+        struct ir_node conv_node = {.op=IR_SSM_CONV, .n_inputs=2, .inputs={0,1}, .output=2};
+        uint32_t conv_inputs[] = {0}, conv_outputs[] = {2};
+        blob = NULL; blob_len = 0;
+        rc = compile(3, conv_tensors, 1, &conv_node, 1, conv_inputs, 1, conv_outputs,
+                     "ir3-shortconv-adjacent-conv-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "adjacent SSM_CONV compile failed: %d\n", rc);
+            return 1;
+        }
+        const float conv_x[] = {1,2,3,4, 10,20,30,40};
+        const float conv_expected[] = {6,-10, 9,-10};
+        float conv_actual[4] = {0};
+        rc = run(blob, blob_len, conv_x, 8, conv_actual, 4);
+        free_blob(blob);
+        if (rc != 4) {
+            fprintf(stderr, "adjacent SSM_CONV NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (fabsf(conv_actual[i] - conv_expected[i]) > 0.05f) {
+                fprintf(stderr, "adjacent SSM_CONV mismatch[%d]: got %.5f expected %.5f\n",
+                        i, conv_actual[i], conv_expected[i]);
+                return 1;
+            }
+        }
+
+        struct ir_tensor wr_tensors[4] = {
+            {.role=IR_INPUT, .dtype=0, .ne={2,2,1,1}},
+            {.role=IR_INPUT, .dtype=2, .ne={2,1,1,1}},
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+            {.role=IR_STATE, .dtype=0, .ne={2,4,1,1}},
+        };
+        struct ir_node wr_node = {.op=IR_SET_ROWS, .n_inputs=3, .inputs={0,1,2}, .output=3};
+        uint32_t wr_inputs[] = {0,1,2}, wr_outputs[] = {3};
+        blob = NULL; blob_len = 0;
+        rc = compile(4, wr_tensors, 1, &wr_node, 3, wr_inputs, 1, wr_outputs,
+                     "ir3-shortconv-adjacent-write-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "adjacent SetRows writeback compile failed: %d\n", rc);
+            return 1;
+        }
+        const int64_t wr_idx[] = {1,3};
+        const float wr_state[] = {1,2,3,4,5,6,7,8};
+        /* Write conv outputs {6,-10} / {9,-10} into state rows 1 and 3. */
+        const float wr_expected[] = {1,2, 6,-10, 5,6, 9,-10};
+        const void * wr_args[] = {conv_actual, wr_idx, wr_state};
+        const size_t wr_lens[] = {4,4,8};
+        float wr_actual[8] = {0};
+        rc = run_multi(blob, blob_len, wr_args, wr_lens, 3, wr_actual, 8);
+        free_blob(blob);
+        if (rc != 8) {
+            fprintf(stderr, "adjacent SetRows writeback NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (fabsf(wr_actual[i] - wr_expected[i]) > 0.05f) {
+                fprintf(stderr, "adjacent SetRows writeback mismatch[%d]: got %.5f expected %.5f\n",
+                        i, wr_actual[i], wr_expected[i]);
+                return 1;
+            }
+        }
+    }
+
     struct ir_tensor rope_tensors[3] = {
         {.role=IR_INPUT, .dtype=0, .ne={8,2,2,1}},
         {.role=IR_INPUT, .dtype=1, .ne={2,1,1,1}},
@@ -417,6 +491,42 @@ int main(int argc, char ** argv) {
         if (fabsf(rope_actual[i] - rope_data[i]) > 0.01f) {
             fprintf(stderr, "RoPE zero-position mismatch[%d]: got %.5f expected %.5f\n",
                     i, rope_actual[i], rope_data[i]);
+            return 1;
+        }
+    }
+    free_blob(blob);
+
+
+    struct ir_tensor sm_tensors[2] = {
+        {.role=IR_INPUT, .dtype=0, .ne={4,1,1,1}},
+        {.role=IR_OUTPUT, .dtype=0, .ne={4,1,1,1}},
+    };
+    struct ir_node sm_node = {.op=IR_SOFTMAX, .n_inputs=1, .inputs={0}, .output=1};
+    float sm_scale = 1.0f;
+    memcpy(sm_node.params, &sm_scale, sizeof(sm_scale));
+    uint32_t sm_inputs[] = {0}, sm_outputs[] = {1};
+    blob = NULL; blob_len = 0;
+    rc = compile(2, sm_tensors, 1, &sm_node, 1, sm_inputs, 1, sm_outputs,
+                 "ir3-softmax-axis0-v1", &blob, &blob_len);
+    if (rc != 0 || !blob || !blob_len) {
+        fprintf(stderr, "SoftMax compile failed: %d\n", rc);
+        return 1;
+    }
+    /* Uniform logits → uniform probs on ggml ne0 / OV axis 3. */
+    const float sm_logits[4] = {0, 0, 0, 0};
+    const float sm_expected[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    const void * sm_args[] = {sm_logits};
+    const size_t sm_lens[] = {4};
+    float sm_actual[4] = {0};
+    rc = run_multi(blob, blob_len, sm_args, sm_lens, 1, sm_actual, 4);
+    if (rc != 4) {
+        fprintf(stderr, "SoftMax NPU run failed: %d\n", rc);
+        return 1;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (fabsf(sm_actual[i] - sm_expected[i]) > 0.02f) {
+            fprintf(stderr, "SoftMax mismatch[%d]: got %.5f expected %.5f\n",
+                    i, sm_actual[i], sm_expected[i]);
             return 1;
         }
     }
