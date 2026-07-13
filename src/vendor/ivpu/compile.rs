@@ -829,22 +829,21 @@ fn env_policy_admits(spec: &crate::graph::OpSpec, runtime_matmul: bool) -> bool 
 
 /// Testable gate body: MoE requires exact `GGML_NPU_MOE=1`; attention/runtime-matmul needs `=full`.
 ///
-/// Argsort and MatMulId stay unclaimed even under `MOE=1` until model-scale evidence exists:
-/// - Argsort: NPU TopK ids were not ggml-visible (device intermediates); host View aliases fed
-///   `MUL_MAT_ID` with garbage → `GGML_ASSERT(id >= 0 && id < n_expert)` (#11).
-/// - MatMulId: shim proves tiny float Gather→MatMul; LFM packed-bank bake is multi‑100 MiB and
-///   not yet a short-smoke-safe claim path. Prefer host/Vulkan experts until proven.
-/// Shim may still lower Argsort→MatMulId with ids internal. Sigmoid/SumRows remain MOE=1-gated.
+/// MoE claim contract (#11):
+/// - Argsort: admitted under `MOE=1` only with ggml-visible i32 id writeback (`capture` /
+///   `partition_range` force Argsort outputs). Claiming without writeback corrupted host Views
+///   feeding foreign `MUL_MAT_ID` → exit 134.
+/// - MatMulId: stays **unclaimed** — Vulkan/host owns routed experts until model-scale packed-bank
+///   evidence exists (shim may still lower fused Argsort→MatMulId with ids internal).
+/// - Sigmoid/SumRows: `MOE=1` gated glue.
 fn env_policy_admits_gated(
     spec: &crate::graph::OpSpec,
     runtime_matmul: bool,
     moe_on: bool,
     attention_on: bool,
 ) -> bool {
-    if matches!(
-        spec.wire,
-        crate::graph::WireOp::Argsort | crate::graph::WireOp::MatMulId
-    ) {
+    // Permanent Vulkan/host experts until model-scale MatMulId is proven (#11).
+    if spec.wire == crate::graph::WireOp::MatMulId {
         return false;
     }
     if spec.traits.moe && !moe_on {
@@ -934,11 +933,8 @@ pub(super) fn graph_feasible(graph: &GraphIr) -> bool {
                 .and_then(|&id| graph.values.get(id as usize))
                 .is_some_and(|value| value.role != TensorRole::Constant);
         if !env_policy_admits(&spec, runtime_matmul) {
-            let reason = if matches!(
-                op,
-                crate::graph::WireOp::Argsort | crate::graph::WireOp::MatMulId
-            ) {
-                "MoE Argsort/MatMulId unclaimed until model-scale ids/experts proven"
+            let reason = if op == crate::graph::WireOp::MatMulId {
+                "MoE MatMulId unclaimed: Vulkan/host owns routed experts until model-scale proven"
             } else if spec.traits.moe && !moe_enabled() {
                 "MoE op requires GGML_NPU_MOE=1"
             } else {
@@ -1937,8 +1933,8 @@ mod tests {
 
     #[test]
     fn moe_routing_ops_admit_only_when_moe_opt_in_one() {
-        // Sigmoid/SumRows: MoE-tagged; default/unset/=0 unclaim, =1 admits (#11).
-        // Argsort/MatMulId stay unclaimed even under MOE=1 (see moe_id_ops_stay_unclaimed_under_moe_opt_in).
+        // Sigmoid/SumRows/Argsort: MoE-tagged; default/unset/=0 unclaim, =1 admits (#11).
+        // MatMulId stays Vulkan/host (see moe_matmul_id_stays_unclaimed_under_moe_opt_in).
         use crate::graph::{Node, OpRegistry, OP_PARAM_BYTES};
         let cases = [
             (crate::ffi::GGML_OP_SUM_ROWS, 0, 1usize, crate::graph::WireOp::SumRows),
@@ -1947,6 +1943,12 @@ mod tests {
                 crate::ffi::GGML_UNARY_OP_SIGMOID as i32,
                 1,
                 crate::graph::WireOp::Sigmoid,
+            ),
+            (
+                crate::ffi::GGML_OP_ARGSORT,
+                0,
+                1usize,
+                crate::graph::WireOp::Argsort,
             ),
         ];
         for (op, unary, n_inputs, wire) in cases {
@@ -1972,41 +1974,29 @@ mod tests {
     }
 
     #[test]
-    fn moe_id_ops_stay_unclaimed_under_moe_opt_in() {
-        // Fail-closed: do not claim Argsort/MatMulId under MOE=1 until model-scale ids/experts
-        // are ggml-safe. Keep is_opt_in_one — never is_set (#38/#11).
+    fn moe_matmul_id_stays_unclaimed_under_moe_opt_in() {
+        // Fail-closed: Vulkan/host owns routed experts under MOE=1 until model-scale MatMulId
+        // is proven. Keep is_opt_in_one — never is_set (#38/#11). Argsort is separately
+        // reclaimable with ggml-visible id writeback.
         use crate::graph::{Node, OpRegistry, OP_PARAM_BYTES};
-        for (op, n_inputs, wire) in [
-            (
-                crate::ffi::GGML_OP_ARGSORT,
-                1usize,
-                crate::graph::WireOp::Argsort,
-            ),
-            (
-                crate::ffi::GGML_OP_MUL_MAT_ID,
-                3,
-                crate::graph::WireOp::MatMulId,
-            ),
-        ] {
-            let inputs: alloc::vec::Vec<u32> = (0..n_inputs as u32).collect();
-            let spec = OpRegistry::decode_node(&Node {
-                op,
-                spec: Err(crate::graph::OpReject::UnsupportedOp),
-                inputs,
-                output: n_inputs as u32,
-                op_params: [0; OP_PARAM_BYTES],
-            })
-            .unwrap_or_else(|_| panic!("{wire:?} must decode"));
-            assert_eq!(spec.wire, wire);
-            assert!(spec.traits.moe);
-            assert!(!env_policy_admits_gated(&spec, false, false, false));
-            assert!(
-                !env_policy_admits_gated(&spec, false, true, false),
-                "{wire:?} must stay unclaimed under GGML_NPU_MOE=1"
-            );
-            // Shim may still lower these inside fused IR programs.
-            assert!(wire_op_compile_supported(wire));
-        }
+        let inputs: alloc::vec::Vec<u32> = (0..3u32).collect();
+        let spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_MUL_MAT_ID,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs,
+            output: 3,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("MatMulId must decode");
+        assert_eq!(spec.wire, crate::graph::WireOp::MatMulId);
+        assert!(spec.traits.moe);
+        assert!(!env_policy_admits_gated(&spec, false, false, false));
+        assert!(
+            !env_policy_admits_gated(&spec, false, true, false),
+            "MatMulId must stay unclaimed under GGML_NPU_MOE=1"
+        );
+        // Shim may still lower MatMulId inside fused IR programs.
+        assert!(wire_op_compile_supported(crate::graph::WireOp::MatMulId));
     }
 
     #[test]

@@ -784,6 +784,22 @@ pub unsafe fn capture(cgraph: *mut ggml_cgraph) -> Option<GraphIr> {
             graph.outputs.push(id);
         }
     }
+    // Expert-id writeback (#11): Argsort i32 ids must stay ggml-visible even when a later
+    // View/GetRows consumes them inside this split. Otherwise NPU keeps TopK as a device
+    // intermediate, host Views alias a stale buffer, and foreign MUL_MAT_ID asserts.
+    for node in &graph.nodes {
+        if GraphIr::wire_op(node) != Some(WireOp::Argsort) {
+            continue;
+        }
+        let id = node.output;
+        if graph.values.get(id as usize).is_none() {
+            continue;
+        }
+        graph.values[id as usize].role = TensorRole::Output;
+        if !graph.outputs.contains(&id) {
+            graph.outputs.push(id);
+        }
+    }
     Some(graph)
 }
 
@@ -893,12 +909,16 @@ impl GraphIr {
         }
         let mut needed = vec![false; self.values.len()];
         let mut produced = vec![false; self.values.len()];
+        let mut argsort_ids = vec![false; self.values.len()];
         for node in &self.nodes[start..end] {
             for &input in &node.inputs {
                 *needed.get_mut(input as usize)? = true;
             }
             *needed.get_mut(node.output as usize)? = true;
             *produced.get_mut(node.output as usize)? = true;
+            if Self::wire_op(node) == Some(WireOp::Argsort) {
+                *argsort_ids.get_mut(node.output as usize)? = true;
+            }
         }
 
         let mut consumed_later = vec![false; self.values.len()];
@@ -933,9 +953,12 @@ impl GraphIr {
                 };
                 inputs.push(new);
             } else {
+                // Argsort i32 ids always cross to host storage (#11 writeback), even when a
+                // same-partition View/GetRows also consumes them as an OV intermediate.
                 let crosses = consumed_later[old]
                     || self.outputs.contains(&(old as ValueId))
-                    || self.values[old].role == TensorRole::MutableState;
+                    || self.values[old].role == TensorRole::MutableState
+                    || argsort_ids[old];
                 values[new as usize].role = if crosses {
                     if self.values[old].role == TensorRole::MutableState {
                         TensorRole::MutableState
@@ -1168,6 +1191,62 @@ mod tests {
     }
 
     #[test]
+    fn partition_range_forces_argsort_id_writeback_when_consumed() {
+        // LFM MoE abort class (#11): Argsort ids consumed by View/GetRows inside the same
+        // partition must still be graph outputs so copy-out materializes ggml-visible i32 ids.
+        let values = vec![
+            value(TensorRole::RuntimeInput, 1, Dim::Static(8)), // scores
+            value(TensorRole::Intermediate, 2, Dim::Static(2)), // argsort ids (would be intermediate)
+            value(TensorRole::Intermediate, 3, Dim::Static(2)), // view of ids
+            value(TensorRole::RuntimeInput, 4, Dim::Static(4)), // gather src
+            value(TensorRole::Output, 5, Dim::Static(2)),       // get_rows out
+        ];
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![
+                Node {
+                    op: GGML_OP_ARGSORT,
+                    spec: decode_spec(GGML_OP_ARGSORT, 0, 0.0, 0, 1),
+                    inputs: vec![0],
+                    output: 1,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: GGML_OP_VIEW,
+                    spec: decode_spec(GGML_OP_VIEW, 0, 0.0, 0, 1),
+                    inputs: vec![1],
+                    output: 2,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: GGML_OP_GET_ROWS,
+                    spec: decode_spec(GGML_OP_GET_ROWS, 0, 0.0, 0, 2),
+                    inputs: vec![3, 1],
+                    output: 4,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+            ],
+            inputs: vec![0, 3],
+            outputs: vec![4],
+        };
+        let part = graph.partition_range(0, 3).unwrap();
+        assert!(
+            part.outputs.iter().any(|&id| {
+                part.values[id as usize].role == TensorRole::Output
+                    && part.nodes.iter().any(|node| {
+                        node.output == id && GraphIr::wire_op(node) == Some(WireOp::Argsort)
+                    })
+            }),
+            "Argsort ids must be a partition output for ggml-visible writeback"
+        );
+        assert!(
+            part.outputs.len() >= 2,
+            "expect Argsort ids + GetRows result as outputs"
+        );
+    }
+
+    #[test]
     fn semantic_key_tracks_structure_shape_and_constant_identity() {
         let make = |constant, dim| GraphIr {
             generation: 7,
@@ -1324,8 +1403,8 @@ mod tests {
 
     #[test]
     fn moe_routing_ops_are_moe_tagged_not_attention() {
-        // Sparse MoE ops are MoE-gated (not ATTENTION=full). Argsort/MatMulId stay MoE-tagged but
-        // supports_op-unclaimed even under MOE=1 until model-scale ids/experts are proven (#11).
+        // Sparse MoE ops are MoE-gated (not ATTENTION=full). Argsort is MOE=1 + writeback;
+        // MatMulId stays MoE-tagged but supports_op-unclaimed (Vulkan/host experts) (#11).
         for (op, unary, n_inputs, wire) in [
             (GGML_OP_ARGSORT, 0, 1usize, WireOp::Argsort),
             (GGML_OP_SUM_ROWS, 0, 1, WireOp::SumRows),

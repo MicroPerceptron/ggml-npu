@@ -86,24 +86,32 @@ continuity pulls do **not** require this gate (PR #39).
 | SoftMax | unclaim | capability + fusible pull under an anchor | `max_bias == 0`; arity 1–2 (optional mask); scale in `op_params[0]` |
 | FlashAttention | unclaim | capability + anchor pull | `max_bias == 0` and `logit_softcap == 0`; arity 3–4; GQA when query heads divisible by KV heads |
 | Runtime-weight MatMul (KQ/KQV) | unclaim + no `offload_op` pull | capability + work-floor pull | same MatMul lowering as const-weight; weight is a non-`NONE` producer |
+| Attention-core fusible glue (Scale/Mul/Add/…) | unclaim (attention-side refused) | `offload_op` pull under SoftMax/FA/runtime-KQ or attention-side QKV/RoPE span | Non-Metadata only; layout View/Reshape/Permute stay supports_op-unclaimed (PR #35) |
 | Const-weight MatMul / RoPE / KV SetRows | claimable without `full` | unchanged | see prefill QKV row / ShortConv docs |
 
 Shim numerical proofs for SoftMax and FlashAttention live in `tests/graph_ir_shortconv_check.c`
 (gate=`shim`). Hermetic contract tests cover decode variants and the env gate without NPU hardware.
 Do not cite tok/s movement from enabling `ATTENTION=full` without a measured attribution run.
 
+**Duty-cycle note (Direct):** `ATTENTION=full` admits SoftMax/FA/runtime KQ and pulls their fusible
+neighborhood. LFM short smokes with `-fa on` still often show FA as thin NPU islands (FA+Reshape)
+because intervening layout Metadata cannot be `supports_op`-claimed. Shared tensor GiB may stay flat
+while program-resident ELF grows; coalesce/cut-cost may re-absorb thin FA into Vulkan. Growing fused
+NPU work further is a scheduler/layout-continuity problem, not a missing SoftMax/FA capability gate.
+
 ## Sparse MoE + output head (#11)
 
 | Path | Default (`MOE` unset/`=0`) | Opt-in (`GGML_NPU_MOE=1`) |
 | --- | --- | --- |
-| Argsort (expert ids) / MatMulId | **Unclaim** | **Unclaim** until model-scale ids/experts proven (shim may still lower Argsort→MatMulId with ids internal) |
+| Argsort (expert ids) | **Unclaim** | Claim when compile-ready **with ggml-visible i32 writeback** (`capture` / `partition_range` force Argsort outputs even if View/GetRows consume them in-graph) |
+| MatMulId (routed experts) | **Unclaim** | **Unclaim** — Vulkan/host owns routed expert banks until model-scale evidence; shim may still lower fused Argsort→MatMulId with ids internal |
 | Sigmoid / SumRows | **Unclaim** (`traits.moe` + `is_opt_in_one`) | Claim when compile-ready |
 | Packed Q4/Q6/Q8 expert banks | n/a | Canonical **requant** Fallback (unpacked) when MatMulId is later re-enabled; never packed source-native gather |
 | Float f16/bf16 expert banks | n/a | SourceBytes pass-through + Gather-before-MatMul (shim today; claim gated with MatMulId) |
 | Output-head-scale dense MatMul | **Unclaim** via `expanded_constant_budget` (GPU-class vocab×hidden); `GGML_NPU_ALLOW_GIANT_CONSTANTS` is the explicit escape hatch — do not claim then corrupt |
 
-Presence of `GGML_NPU_MOE=0` must not enable MoE (PR #38). Claiming Argsort under `MOE=1`
-corrupted expert ids for host/Vulkan `MUL_MAT_ID` (device-intermediate TopK never reached ggml
-tensors). MatMulId remains supports_op-unclaimed at model scale after the same opt-in. Shim
-numerical coverage lives in `tests/graph_ir_shortconv_check.c` (Argsort+MatMulId fused, Sigmoid,
-SumRows).
+Presence of `GGML_NPU_MOE=0` must not enable MoE (PR #38). Claiming Argsort **without** id
+writeback corrupted expert ids for host/Vulkan `MUL_MAT_ID` (device-intermediate TopK never
+reached ggml tensors — PR #49 unclaimed; writeback reclaim restores Argsort only). MatMulId remains
+supports_op-unclaimed at model scale (documented Vulkan/host experts). Shim numerical coverage
+lives in `tests/graph_ir_shortconv_check.c` (Argsort+MatMulId fused, Sigmoid, SumRows).

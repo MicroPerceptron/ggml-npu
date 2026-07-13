@@ -77,7 +77,7 @@ When `GGML_SCHED_CUT_COST=1`, the v2 provider additionally:
    absorb-other) via `ggml_backend_sched_cut_cost_stats[_reset]`; verbose
    coalesce (≥2) dumps them from the llama hook.
 
-MoE fail-closed policy is untouched (`is_opt_in_one`; Argsort/MatMulId unclaim).
+MoE policy remains `is_opt_in_one`; MatMulId stays unclaimed (Vulkan/host experts).
 Host apply stays buft-safe (NPU/same-buft always; other targets only when
 committed buffers are supported).
 
