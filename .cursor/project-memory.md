@@ -78,12 +78,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   Direct combo is coalesce=1 + cut-cost=1 + claim-stage=1 (~247 tok/s tip). Master opt-in
   `GGML_NPU_SCHED=auto` (exact value) enables that trio in llama.cpp only when an NPU
   backend is present **and** `ggml_backend_npu_sched_auto_eligible` returns 1 (Direct
-  narrow buft). Explicit `GGML_SCHED_*` overrides always win. Silent default-on deferred
+  narrow buft). **Decode-aware:** prefill-sized graphs (any `MUL_MAT` with `ne[1] > 1`)
+  keep the auto trio; decode/M=1 graphs (every `MUL_MAT` has `ne[1] <= 1`) **suspend**
+  auto-applied claim/cut/coalesce per `split_graph`, and Rust `should_pull` prefers
+  unclaim under exact `auto` so Vulkan/host win when Direct gen is a dispatch floor.
+  Explicit `GGML_SCHED_*` / `GGML_NPU_FORCE_GRAPH` always win. Silent default-on deferred
   until regression gates; does not widen `supports_buft` or delete L0.
-  - Rationale: Users should get L0-class duty cycle without memorizing three flags, without
-    reintroducing SEGV/BindingMismatch from silent enable or coalesce-only+claim.
+  - Rationale: Users should get L0-class prefill duty cycle without memorizing three
+    flags, without reintroducing SEGV/BindingMismatch from silent enable or
+    coalesce-only+claim, and without auto regressing tg128 below sched-off.
   - Evidence: `docs/sched-region-coalesce.md`, `docs/retire-level-zero-compat.md`,
-    `src/sched/auto.rs`, llama.cpp `ggml-backend.cpp` `GGML_NPU_SCHED=auto`, issues #63/#5.
+    `src/sched/auto.rs`, `src/policy.rs`, llama.cpp `ggml-backend.cpp`
+    `GGML_NPU_SCHED=auto` decode suspend, issues #63/#5/#4, PR #74, llama.cpp#18.
   - Verified: 2026-07-13
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
@@ -804,17 +810,35 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-13
 
 - `FINDING/sched-npu-auto-defaults-smoke` — `GGML_NPU_SCHED=auto` (no explicit
-  `GGML_SCHED_*`) on Direct+NPU reproduces the recommended trio duty-cycle shape:
-  LFM pp16 r=1 t=6 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS —
+  `GGML_SCHED_*`) on Direct+NPU reproduces the recommended trio duty-cycle shape on
+  **prefill**: LFM pp16 r=1 t=6 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS —
   exit 0, **394** disp / 39.6% unitary / avg nodes 2.43 / **96.0%** no-copy (matches
-  prior coa1+cut1+cs1 cell). No BindingMismatch / SEGV. Explicit overrides still win;
-  unset keeps default-off.
+  prior coa1+cut1+cs1 cell). Decode-aware follow-on: same pp16 shape still holds on tip
+  `456d38e` (**27.032 tok/s**, 394 disp). No BindingMismatch / SEGV. Explicit overrides
+  still win; unset keeps default-off.
   - Scope: Targeted r=1 smoke only; not locked pp512.
   - Evidence: `benchmarks/results/develop-f662b28-targeted-pp16-sharing-on-sched-auto/`,
-    `ADR/sched-npu-auto-defaults`, `src/sched/auto.rs`, issues #5/#63.
+    `benchmarks/results/develop-456d38e-targeted-pp16-decode-aware-auto/`,
+    `ADR/sched-npu-auto-defaults`, `src/sched/auto.rs`, issues #5/#63, PR #74.
   - Reproduce: `THREADS=6` `OMP_NUM_THREADS=6` `FLEXIBLAS=OPENBLAS-OPENMP`
     `GGML_NPU_SCHED=auto` unset `GGML_SCHED_REGION_COALESCE`/`CUT_COST`/`NPU_CLAIM_STAGE`
     `./benchmarks/results/_run_targeted_smoke.sh`.
+  - Verified: 2026-07-13
+
+- `FINDING/sched-decode-aware-auto-tg128` — Prefill auto trio hurt Direct token-gen
+  (locked prior auto ~1.8–1.9 tok/s / ~25k NPU disp vs sched-off ~2.5–2.6). Decode-aware
+  `GGML_NPU_SCHED=auto` (llama.cpp per-graph suspend of auto-applied claim/cut/coa +
+  Rust `should_pull` unclaim for M=1) flips gen placement toward Vulkan/host:
+  tip `456d38e` + llama.cpp `1a72884` THREADS=6 r=1 LFM Q4_K_M FA on ShortConv=1 MoE=0
+  ATTENTION=full FlexiBLAS+Vulkan+Direct → auto **25.784 tok/s** / **774** NPU disp vs
+  sched-off **2.943 tok/s** / **25929** disp on the same tip (sched-off still over-claims
+  via ordinary `offload_op`). Still below Vulkan-only ~53; does not widen `supports_buft`.
+  - Scope: r=1 smoke, not locked r≥3 tg; `#71` telemetry left alone; decode-dispatch
+    fusion WIP remains parked on `perf/decode-dispatch-fusion`.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-decode-aware-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-decode-aware-off-r1-t6/`,
+    `src/sched/auto.rs`, `src/policy.rs`, PR #74, llama.cpp#18, issues #4/#5/#63,
+    `ADR/sched-npu-auto-defaults`, `BENCH/lfm-tg128-f1c4c98-tip`.
   - Verified: 2026-07-13
 
 - `FINDING/direct-tg128-decode-ffn-invalid-metadata` — Direct tg128 gen warmup
@@ -865,8 +889,9 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   **97.0%** no-copy); `GGML_NPU_SCHED=auto` **1.812 tok/s** (25413 / 39.6% /
   2.43 / **92.8%** no-copy). Vulkan-only tip r=3 **53.433 ± 1.432 tok/s**; L0 soft
   r=1 (older .so) **7.029** tok/s / 22774 disp / 44.9% no-copy.
-  - Limitation: Direct r=1 only; decode still ~200 disp/token vs Vulkan; not locked
-    Direct tg; L0 soft + older .so; host swap may be elevated.
+  - Limitation: Pre–decode-aware auto; superseded for product `auto` gen by
+    `FINDING/sched-decode-aware-auto-tg128` / `BENCH/lfm-tg128-456d38e-decode-aware`.
+    Direct r=1 only; L0 soft + older .so; host swap may be elevated.
   - Evidence: `benchmarks/results/develop-wip-tg128-align-stage-smoke/`,
     `benchmarks/results/develop-wip-tg128-align-stage-sched-auto-smoke/`,
     `benchmarks/results/develop-f1c4c98-tg128-vulkan-only-t6-r3/`,
@@ -874,6 +899,24 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Reproduce: flock + `THREADS=6` `-p 0 -n 128 -r 1`; Direct with tip
     `libggml_npu.so` (± `GGML_NPU_SCHED=auto`); Vulkan without `GGML_BACKEND_PATH`
     `-ngl 99`.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-tg128-456d38e-decode-aware` — Develop `456d38e` (PR #74) + llama.cpp
+  `1a72884` (#18) LFM Q4_K_M tg128 r=1 t=6 FA on ShortConv=1 MoE=0 ATTENTION=full
+  FlexiBLAS+Vulkan+Direct, flock, fresh cache labels:
+  `GGML_NPU_SCHED=auto` **25.784 tok/s** / **774** NPU disp (0% unitary / avg 3.00 /
+  100% no-copy of 3096 bindings); sched-off **2.943 tok/s** / **25929** disp
+  (27.9% unitary / avg 2.45). Same tip pp16 `auto` sanity **27.032 tok/s** / 394
+  disp exit 0 (`FINDING/sched-npu-auto-defaults-smoke`).
+  - Limitation: r=1 only; elevated host swap (`ALLOW_HIGH_SWAP=1`); not locked r≥3;
+    not a claim that #4 Vulkan gap (~53) is closed.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-decode-aware-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-decode-aware-off-r1-t6/`,
+    `benchmarks/results/develop-456d38e-targeted-pp16-decode-aware-auto/`,
+    `FINDING/sched-decode-aware-auto-tg128`, issues #4/#5/#63, PR #74, llama.cpp#18.
+  - Reproduce: flock + `THREADS=6` `REPETITIONS=1` `GGML_NPU_SCHED=auto`
+    `./benchmarks/results/_run_tg128_fullperf.sh`; control with
+    `FORCE_SCHED_DEFAULT_OFF=1`.
   - Verified: 2026-07-13
 
 ## Pending milestones
@@ -937,7 +980,8 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   `benchmarks/run_direct_l0_corpus_parity.sh`) with hermetic structural goldens + lab
   Direct↔L0 binding/numeric gate on six representative blobs
   (`FINDING/direct-l0-corpus-parity-harness`); product **opt-in** `GGML_NPU_SCHED=auto`
-  (`ADR/sched-npu-auto-defaults`).
+  decode-aware (`ADR/sched-npu-auto-defaults`, PR #74 / llama.cpp#18;
+  `FINDING/sched-decode-aware-auto-tg128`).
   - Acceptance (delete blockers): expand/record corpus Direct↔L0 parity beyond the initial
     six-blob harness (full agreed LFM set / non-FP32 numeric / import-copy duty cycle);
     required Direct op coverage leftovers (#9/#10/#11) without depending on L0; decide
@@ -949,10 +993,12 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `docs/compiler-migration-plan.md`, `src/vendor/ivpu/direct/corpus.rs`,
     `src/vendor/ivpu/direct/oracle.rs`, `src/vendor/ivpu/direct/health.rs`,
     `src/vendor/ivpu/session.rs`, `src/sched/auto.rs`,
-    PRs #57/#59/#62/#64/#67/#68, issues #56/#63,
+    PRs #57/#59/#62/#64/#67/#68/#70/#74, issues #56/#63,
     `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`,
     `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`,
-    `FINDING/sched-npu-auto-defaults-smoke`.
+    `FINDING/sched-npu-auto-defaults-smoke`,
+    `FINDING/sched-decode-aware-auto-tg128`,
+    `BENCH/lfm-tg128-456d38e-decode-aware`.
 
 - `MILESTONE/neutral-compiler-providers` — Replace compiler-specific frontend coupling with dynamically loaded, versioned, neutral providers, starting with Intel and later adding AMD and Qualcomm adapters behind the same semantic request/artifact envelope.
   - Acceptance: Capability/compile agreement, stable diagnostics, ownership/error ABI tests, deterministic pinned builds, artifact validation, and target-specific fixture tests pass without linking incompatible LLVM/MLIR libraries into ggml-npu.
