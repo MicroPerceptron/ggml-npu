@@ -7,10 +7,12 @@
 pub mod budget;
 pub mod elf;
 mod firmware;
+pub mod health;
 pub mod hpi;
 pub mod link;
 pub(super) mod linux;
 pub mod load;
+pub mod oracle;
 pub mod prepare;
 pub mod transport;
 mod uapi;
@@ -966,17 +968,22 @@ mod tests {
             observed
         };
         let after = resources();
-        let mut max_absolute = 0.0f32;
-        let mut max_relative = 0.0f32;
-        for (actual, expected) in observed_outputs[0].iter().zip(oracle) {
-            let absolute = (actual - expected).abs();
-            max_absolute = max_absolute.max(absolute);
-            max_relative = max_relative.max(absolute / expected.abs().max(1.0));
-        }
+        let diff = super::oracle::compare_f32(
+            &observed_outputs[0],
+            &oracle,
+            MAX_ABS_ERROR,
+            MAX_REL_ERROR,
+        );
+        let max_absolute = diff.max_absolute;
+        let max_relative = diff.max_relative;
         std::println!(
             "device={path} queue_id={queue_id} artifact={} submissions={SUBMISSIONS} user_bo_bytes={user_bytes} preempt_buffer_bytes={preempt_bytes} accounted_bytes={accounted_bytes} firmware_api={firmware_api:?} output_shared_identity={output_identity:?} oracle={oracle:?} direct={:?} max_absolute={max_absolute} max_relative={max_relative} tolerance_abs={MAX_ABS_ERROR} tolerance_rel={MAX_REL_ERROR} elapsed={elapsed:?} before={before:?} after={after:?}",
             artifact_location,
             observed_outputs[0],
+        );
+        assert!(
+            diff.within(MAX_ABS_ERROR, MAX_REL_ERROR),
+            "direct vs Level Zero oracle mismatch: {diff:?}"
         );
         assert_eq!(after.open_fds, before.open_fds);
         if let (Some(before_rss), Some(after_rss)) = (before.rss_kib, after.rss_kib) {
