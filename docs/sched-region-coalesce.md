@@ -27,14 +27,20 @@ loaded.
 
 After llama.cpp assignment passes 1–4, for non-view nodes in topo order:
 
-1. Treat consecutive equal `backend_id` runs as intervals.
+1. Treat consecutive equal `backend_id` runs as intervals (views skipped for
+   cut detection only).
 2. If a short run (≤ max island) sits between two runs of backend `B`, and every
    island node has `feasible_mask` bit `B` set and is not `PINNED`, recolor the
    island to `B`.
 3. Repeat to fixpoint (checkerboard collapse).
+4. **llama.cpp apply guard** (not Rust): apply proposals only when the target is
+   `GGML_BACKEND_DEVICE_TYPE_NPU` or shares a buft with the node’s prior backend;
+   refuse Vulkan/GPU sandwiches that left non-Vulkan buffers inside Vulkan splits
+   (`ggml_vk_build_graph` SIGSEGV on pp128). Then re-sync view ops to `view_src`.
 
 Does **not** invent NPU claims: feasibility comes from the scheduler’s
-`supports_op` packing. Weights / `INPUT` stay pinned.
+`supports_op` packing. Weights / `INPUT` stay pinned. Rust leaves `VIEW` rows
+unchanged so the host can honor the view_src invariant.
 
 ## C ABI
 

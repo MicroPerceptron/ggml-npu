@@ -105,6 +105,11 @@ pub fn coalesce_regions(
         }
     }
 
+    // Views stay untouched here. The llama.cpp hook (1) applies only safe
+    // targets (NPU / same buft — not Vulkan sandwiches) and (2) re-syncs view
+    // ops to view_src. Nearest-neighbor view painting broke weight views and
+    // still SIGSEGV'd in ggml_vk_build_graph on pp128.
+
     // Edge-cost stub site: future weighted cuts can score handoff bytes here
     // without changing the C ABI (see docs/sched-region-coalesce.md).
     let _edge_cost_stub = 0usize;
@@ -221,15 +226,29 @@ mod tests {
         let both = 0b11;
         let mut nodes = [
             node(0, both, 0),
-            node(1, both, FLAG_VIEW), // ignored
+            node(1, both, FLAG_VIEW), // ignored for island scan; left for host sync
             node(1, both, 0),
             node(0, both, 0),
         ];
-        // Non-view sequence: 0, 1, 0 → absorb middle
+        // Non-view sequence: 0, 1, 0 → absorb middle; view row unchanged here
         assert_eq!(coalesce_regions(&mut nodes, 2, 4), 1);
         assert_eq!(nodes[0].backend_id, 0);
+        assert_eq!(nodes[1].backend_id, 1);
         assert_eq!(nodes[2].backend_id, 0);
         assert_eq!(nodes[3].backend_id, 0);
+    }
+
+    #[test]
+    fn leaves_sandwiched_views_for_host_view_src_sync() {
+        // Host reapplies view backends from view_src after guarded apply.
+        let both = 0b11;
+        let mut nodes = [
+            node(0, both, 0),
+            node(1, both, FLAG_VIEW),
+            node(0, both, 0),
+        ];
+        assert_eq!(coalesce_regions(&mut nodes, 2, 4), 0);
+        assert_eq!(nodes[1].backend_id, 1);
     }
 
     #[test]
