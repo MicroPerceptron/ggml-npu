@@ -6,9 +6,9 @@
 //! feasible on the surrounding backend (via the caller-supplied mask).
 //!
 //! With cut-cost mode (`OPT_WEIGHTED_CUT_COST` / v2 ABI), absorbs are gated by
-//! heuristic handoff cost and NPU preservation (#48): never dissolve an NPU
-//! island into Vulkan/CPU, prefer growing onto NPU, boost max-island across
-//! heavy NPU boundaries.
+//! heuristic handoff cost and NPU-aware anti-unitary policy (#48): grow onto
+//! existing NPU neighbors (including asymmetric edges), preserve fat NPU
+//! islands, dissolve thin unitaries, boost max-island across NPU boundaries.
 //!
 //! Profitability / claim policy stays in `offload_op` / `policy::should_pull`.
 //! This only widens homogeneous splits the scheduler already painted.
@@ -17,8 +17,9 @@ use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
 
 use super::cut_cost::{
-    decide_absorb, effective_max_island, total_cut_cost, AbsorbDecision, BackendKind,
-    OPT_WEIGHTED_CUT_COST,
+    decide_absorb, effective_max_island, note_absorb_outcome, npu_absorb_target,
+    reset_cut_cost_stats, snapshot_cut_cost_stats, total_cut_cost, AbsorbDecision, BackendKind,
+    CutCostStats, OPT_WEIGHTED_CUT_COST,
 };
 
 /// Skip this node in interval scans (view / reshape glue that does not cut).
@@ -54,6 +55,8 @@ pub struct SchedCutCostNode {
 
 const PROC_NAME: &[u8] = b"ggml_backend_sched_region_coalesce";
 const PROC_NAME_V2: &[u8] = b"ggml_backend_sched_region_coalesce_v2";
+const PROC_NAME_STATS: &[u8] = b"ggml_backend_sched_cut_cost_stats";
+const PROC_NAME_STATS_RESET: &[u8] = b"ggml_backend_sched_cut_cost_stats_reset";
 
 /// Pure analysis (v1): mutate `nodes[..]` backend ids; return how many were recolored.
 pub fn coalesce_regions(
@@ -94,6 +97,9 @@ pub fn coalesce_regions_weighted(
         return 0;
     }
     let max_island = max_island.max(1);
+    if weighted {
+        reset_cut_cost_stats();
+    }
 
     // Compact non-view indices — interval algebra over execution order.
     let mut ops: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -112,71 +118,35 @@ pub fn coalesce_regions_weighted(
     while changed && guard < ops.len().saturating_add(1) {
         changed = false;
         guard += 1;
-        let mut run_start = 0usize;
-        while run_start < ops.len() {
-            let bid = nodes[ops[run_start]].backend_id;
-            let mut run_end = run_start + 1;
-            while run_end < ops.len() && nodes[ops[run_end]].backend_id == bid {
-                run_end += 1;
-            }
-            let run_len = run_end - run_start;
 
-            if run_start > 0 && run_end < ops.len() {
-                let left = nodes[ops[run_start - 1]].backend_id;
-                let right = nodes[ops[run_end]].backend_id;
-                if left == right && left != bid && left >= 0 {
-                    let left_edge_nb = nodes[ops[run_start]].nbytes;
-                    let right_edge_nb = nodes[ops[run_end]].nbytes;
-                    let eff_max = effective_max_island(
-                        max_island,
-                        left,
-                        kinds,
-                        left_edge_nb,
-                        right_edge_nb,
-                        weighted,
-                    );
-                    if run_len <= eff_max {
-                        let left_u = left as u32;
-                        if left_u < 32 {
-                            let bit = 1u32 << left_u;
-                            let mut ok = true;
-                            let mut island_bytes = 0u64;
-                            for &op_i in &ops[run_start..run_end] {
-                                let n = &nodes[op_i];
-                                if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
-                                    ok = false;
-                                    break;
-                                }
-                                island_bytes =
-                                    island_bytes.saturating_add(n.nbytes as u64);
-                            }
-                            if ok {
-                                let decision = decide_absorb(
-                                    bid,
-                                    left,
-                                    kinds,
-                                    island_bytes,
-                                    run_len,
-                                    left_edge_nb,
-                                    right_edge_nb,
-                                    weighted,
-                                );
-                                if decision == AbsorbDecision::Absorb {
-                                    for &op_i in &ops[run_start..run_end] {
-                                        if nodes[op_i].backend_id != left {
-                                            nodes[op_i].backend_id = left;
-                                            reassigned += 1;
-                                        }
-                                    }
-                                    changed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        // Pass A (weighted): grow existing NPU regions — sandwich + asymmetric
+        // absorb toward an NPU neighbor. Never invent NPU when neither side is NPU.
+        if weighted {
+            if try_absorb_pass(
+                nodes,
+                &ops,
+                kinds,
+                max_island,
+                weighted,
+                AbsorbMode::IntoNpu,
+                &mut reassigned,
+            ) {
+                changed = true;
+                continue;
             }
-            run_start = run_end;
+        }
+
+        // Pass B: classic same-backend sandwich (incl. dissolve thin NPU, fat preserve).
+        if try_absorb_pass(
+            nodes,
+            &ops,
+            kinds,
+            max_island,
+            weighted,
+            AbsorbMode::Sandwich,
+            &mut reassigned,
+        ) {
+            changed = true;
         }
     }
 
@@ -187,6 +157,136 @@ pub fn coalesce_regions_weighted(
 
     let _ = total_cut_cost_of_nodes(nodes, &ops, kinds); // keep scoring path warm / testable
     reassigned
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AbsorbMode {
+    /// Prefer absorbing islands onto an existing NPU neighbor (anti-unitary).
+    IntoNpu,
+    /// Classic left==right sandwich absorb.
+    Sandwich,
+}
+
+fn try_absorb_pass(
+    nodes: &mut [SchedCutCostNode],
+    ops: &[usize],
+    kinds: &[BackendKind],
+    max_island: usize,
+    weighted: bool,
+    mode: AbsorbMode,
+    reassigned: &mut usize,
+) -> bool {
+    let mut run_start = 0usize;
+    while run_start < ops.len() {
+        let bid = nodes[ops[run_start]].backend_id;
+        let mut run_end = run_start + 1;
+        while run_end < ops.len() && nodes[ops[run_end]].backend_id == bid {
+            run_end += 1;
+        }
+        let run_len = run_end - run_start;
+
+        if run_start > 0 && run_end < ops.len() {
+            let left = nodes[ops[run_start - 1]].backend_id;
+            let right = nodes[ops[run_end]].backend_id;
+            if left >= 0 && right >= 0 && left != bid {
+                let target = match mode {
+                    AbsorbMode::Sandwich => {
+                        if left == right {
+                            Some(left)
+                        } else {
+                            None
+                        }
+                    }
+                    AbsorbMode::IntoNpu => {
+                        // NPU sandwiches grow here first; non-NPU sandwiches /
+                        // thin-NPU dissolve stay in Pass B (fat preserve).
+                        if left == right && kind_at_npu(kinds, left) {
+                            Some(left)
+                        } else if left != right {
+                            npu_absorb_target(left, right, kinds, weighted)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(target) = target {
+                    // IntoNpu mode: only when target is NPU (and island is not already).
+                    if mode == AbsorbMode::IntoNpu {
+                        if !kind_at_npu(kinds, target) || kind_at_npu(kinds, bid) {
+                            run_start = run_end;
+                            continue;
+                        }
+                    }
+
+                    let left_edge_nb = nodes[ops[run_start]].nbytes;
+                    let right_edge_nb = nodes[ops[run_end]].nbytes;
+                    let eff_max = effective_max_island(
+                        max_island,
+                        target,
+                        kinds,
+                        left_edge_nb,
+                        right_edge_nb,
+                        weighted,
+                    );
+                    if run_len <= eff_max {
+                        let target_u = target as u32;
+                        if target_u < 32 {
+                            let bit = 1u32 << target_u;
+                            let mut ok = true;
+                            let mut island_bytes = 0u64;
+                            for &op_i in &ops[run_start..run_end] {
+                                let n = &nodes[op_i];
+                                if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
+                                    ok = false;
+                                    break;
+                                }
+                                island_bytes = island_bytes.saturating_add(n.nbytes as u64);
+                            }
+                            if ok {
+                                let decision = decide_absorb(
+                                    bid,
+                                    target,
+                                    kinds,
+                                    island_bytes,
+                                    run_len,
+                                    left_edge_nb,
+                                    right_edge_nb,
+                                    weighted,
+                                );
+                                if decision == AbsorbDecision::Absorb {
+                                    let mut flipped = 0usize;
+                                    for &op_i in &ops[run_start..run_end] {
+                                        if nodes[op_i].backend_id != target {
+                                            nodes[op_i].backend_id = target;
+                                            flipped += 1;
+                                        }
+                                    }
+                                    if flipped > 0 {
+                                        note_absorb_outcome(
+                                            decision, bid, target, kinds, flipped,
+                                        );
+                                        *reassigned += flipped;
+                                        return true;
+                                    }
+                                } else {
+                                    note_absorb_outcome(decision, bid, target, kinds, 0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        run_start = run_end;
+    }
+    false
+}
+
+#[inline]
+fn kind_at_npu(kinds: &[BackendKind], backend_id: i32) -> bool {
+    let u = backend_id as usize;
+    u < kinds.len() && kinds[u].is_npu()
 }
 
 /// Attribution: sum cut costs over non-view ops after coloring.
@@ -292,6 +392,23 @@ pub unsafe extern "C" fn ggml_backend_sched_region_coalesce_v2(
     coalesce_regions_weighted(slice, n_b, max_island as usize, &kinds, weighted) as c_int
 }
 
+/// Snapshot cut-cost absorb/dissolve counters (POD out-param).
+#[no_mangle]
+pub unsafe extern "C" fn ggml_backend_sched_cut_cost_stats(out: *mut CutCostStats) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out = snapshot_cut_cost_stats();
+    }
+}
+
+/// Reset cut-cost absorb/dissolve counters.
+#[no_mangle]
+pub unsafe extern "C" fn ggml_backend_sched_cut_cost_stats_reset() {
+    reset_cut_cost_stats();
+}
+
 pub(crate) unsafe fn proc_address(name: *const c_char) -> *mut c_void {
     if name.is_null() {
         return ptr::null_mut();
@@ -301,6 +418,10 @@ pub(crate) unsafe fn proc_address(name: *const c_char) -> *mut c_void {
         ggml_backend_sched_region_coalesce as *mut c_void
     } else if bytes == PROC_NAME_V2 {
         ggml_backend_sched_region_coalesce_v2 as *mut c_void
+    } else if bytes == PROC_NAME_STATS {
+        ggml_backend_sched_cut_cost_stats as *mut c_void
+    } else if bytes == PROC_NAME_STATS_RESET {
+        ggml_backend_sched_cut_cost_stats_reset as *mut c_void
     } else {
         ptr::null_mut()
     }
@@ -429,19 +550,36 @@ mod tests {
 
     #[test]
     fn weighted_preserves_fat_npu_island_inside_gpu() {
-        // backend 0 = GPU, backend 1 = NPU; multi-op NPU island stays
+        // backend 0 = GPU, backend 1 = NPU; 3-op NPU island stays
         let both = 0b11;
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
         let mut nodes = [
             cut_node(0, both, 0, 4096),
             cut_node(1, both, 0, 8192),
-            cut_node(1, both, 0, 8192), // 2-op NPU island
+            cut_node(1, both, 0, 8192),
+            cut_node(1, both, 0, 8192), // 3-op NPU island
             cut_node(0, both, 0, 4096),
         ];
         let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
         assert_eq!(n, 0);
         assert_eq!(nodes[1].backend_id, 1);
         assert_eq!(nodes[2].backend_id, 1);
+        assert_eq!(nodes[3].backend_id, 1);
+    }
+
+    #[test]
+    fn weighted_dissolves_thin_two_op_npu_into_gpu() {
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 8192),
+            cut_node(1, both, 0, 8192), // thin 2-op NPU
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 2);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
     }
 
     #[test]
@@ -468,6 +606,39 @@ mod tests {
             cut_node(0, both, 0, 4096),
         ];
         let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 1);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn weighted_asymmetric_absorbs_into_npu_neighbor() {
+        // NPU | GPU | CPU — not a sandwich, but grow onto NPU.
+        let all = 0b111;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu, BackendKind::Cpu];
+        let mut nodes = [
+            cut_node(0, all, 0, 4096),
+            cut_node(1, all, 0, 1024),
+            cut_node(2, all, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 3, 4, &kinds, true);
+        assert_eq!(n, 1);
+        assert_eq!(nodes[0].backend_id, 0);
+        assert_eq!(nodes[1].backend_id, 0); // absorbed into NPU
+        assert_eq!(nodes[2].backend_id, 2);
+    }
+
+    #[test]
+    fn weighted_does_not_invent_npu_without_neighbor() {
+        // GPU | CPU | GPU — both GPU, CPU feasible on NPU too, but no NPU neighbor.
+        let gpu_cpu_npu = 0b111; // bits 0,1,2
+        let kinds = [BackendKind::Gpu, BackendKind::Cpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, gpu_cpu_npu, 0, 4096),
+            cut_node(1, gpu_cpu_npu, 0, 1024), // feasible on NPU (bit2) but no NPU neighbor
+            cut_node(0, gpu_cpu_npu, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 3, 4, &kinds, true);
+        // Sandwich absorbs into GPU (0), not invent NPU.
         assert_eq!(n, 1);
         assert!(nodes.iter().all(|x| x.backend_id == 0));
     }
@@ -520,5 +691,19 @@ mod tests {
         let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
         assert!(n >= 5);
         assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn stats_exported_after_weighted_pass() {
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node(1, both, 0, 1024),
+            cut_node(0, both, 0, 4096),
+        ];
+        let _ = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        let s = snapshot_cut_cost_stats();
+        assert!(s.absorbed_into_npu >= 1);
     }
 }
