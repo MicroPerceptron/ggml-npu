@@ -134,6 +134,21 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 ## Verified findings
 
 
+- `FINDING/direct-l0-corpus-parity-harness` — Representative Direct↔L0 corpus gate (six
+  blobs: tiny vector-add + five LFM/coverage cache slices) compares SHA-256 identity,
+  Direct ELF/HPI structural fingerprints (bindings, relocs, loader 1.2.2 / NNRT 11.4.10,
+  resident/placement accounting) to goldens, Direct vs L0 argument byte sizes, and FP32
+  numeric on `vector-add-tiny` (`max_absolute=0`, `max_relative=0`, tol `1e-5`). Lab run
+  passed 6/6 via `benchmarks/run_direct_l0_corpus_parity.sh` / ignored
+  `corpus_direct_level_zero_parity`. Blobs resolved from `GGML_NPU_CORPUS_DIR` (not
+  committed). Does not cover full LFM program set, non-FP32 I/O numerics, or claim-stage
+  import/copy duty cycle.
+  - Scope: Artifact-level parity harness for #63; not locked pp512; not L0 delete acceptance.
+  - Evidence: `docs/direct-l0-corpus-parity.md`, `tests/direct_l0_corpus/manifest.csv`,
+    `src/vendor/ivpu/direct/corpus.rs`, `src/vendor/ivpu/direct/oracle.rs`,
+    `src/vendor/ivpu/graph.rs` (`native_blob_binding_bytes`), issue #63.
+  - Verified: 2026-07-13
+
 - `FINDING/sched-cut-cost-fat-npu-preserve` — On develop tip with PR #51 + llama.cpp#13,
   LFM sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS hybrid, `COALESCE=1`
   `CUT_COST=1` (fat-NPU preserve) vs coalesce-only: pp128 keeps **10** disp, unitary
@@ -807,19 +822,26 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   gates in `docs/retire-level-zero-compat.md` / GitHub #63 are green. Done toward retirement:
   tiny Direct↔L0 KAT; session cancel / device-loss latch / firmware-gated reset (PR #57,
   #56 closed); ELF pad binding cover (PR #62); claim-stage LFM duty-cycle **shape** near L0
-  (tip locked ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** —
-  `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`);
-  hang/in-flight **userspace** mitigation (sliced `BO_WAIT` + `InFlightAbandoned` latch;
-  `CONSTRAINT/ivpu-no-job-abort-ioctl`).
-  - Acceptance (delete blockers): model-corpus Direct↔L0 binding + numeric parity beyond
-    tiny KAT; required Direct op coverage leftovers (#9/#10/#11) without depending on L0;
-    product default-on knobs for claim-stage/coalesce/cut-cost with regression gates.
-    Non-gates: full tok/s gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5),
-    widening Direct `supports_buft`, OpenVINO removal, kernel job-abort ioctl.
-  - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-runtime-foundation.md`,
-    `docs/compiler-migration-plan.md`, `src/vendor/ivpu/direct/health.rs`,
-    `src/vendor/ivpu/direct/oracle.rs`, `src/vendor/ivpu/session.rs`, PRs #57/#62/#64,
-    issues #56/#63, `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`,
+  (tip locked ~**247** tok/s / ~**470** disp vs L0 ~**266** / ~**488** —
+  `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`;
+  prior tip `371b06d` ~205); hang/in-flight **userspace** mitigation (sliced `BO_WAIT` +
+  `InFlightAbandoned` latch; `CONSTRAINT/ivpu-no-job-abort-ioctl`); **corpus parity harness**
+  landed (`docs/direct-l0-corpus-parity.md`, `tests/direct_l0_corpus/manifest.csv`,
+  `benchmarks/run_direct_l0_corpus_parity.sh`) with hermetic structural goldens + lab
+  Direct↔L0 binding/numeric gate on six representative blobs
+  (`FINDING/direct-l0-corpus-parity-harness`).
+  - Acceptance (delete blockers): expand/record corpus Direct↔L0 parity beyond the initial
+    six-blob harness (full agreed LFM set / non-FP32 numeric / import-copy duty cycle);
+    required Direct op coverage leftovers (#9/#10/#11) without depending on L0; product
+    default-on knobs for claim-stage/coalesce/cut-cost with regression gates. Non-gates:
+    full tok/s gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5), widening Direct
+    `supports_buft`, OpenVINO removal, kernel job-abort ioctl.
+  - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-l0-corpus-parity.md`,
+    `docs/direct-runtime-foundation.md`, `docs/compiler-migration-plan.md`,
+    `src/vendor/ivpu/direct/corpus.rs`, `src/vendor/ivpu/direct/oracle.rs`,
+    `src/vendor/ivpu/direct/health.rs`, `src/vendor/ivpu/session.rs`,
+    PRs #57/#59/#62/#64/#67/#68, issues #56/#63,
+    `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`,
     `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`.
 
 - `MILESTONE/neutral-compiler-providers` — Replace compiler-specific frontend coupling with dynamically loaded, versioned, neutral providers, starting with Intel and later adding AMD and Qualcomm adapters behind the same semantic request/artifact envelope.

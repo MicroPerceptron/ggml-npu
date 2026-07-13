@@ -104,6 +104,172 @@ pub fn binding_meta_matches(
     Ok(())
 }
 
+/// Structural Direct ELF / HPI fingerprint used for corpus goldens (no device required).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuralFingerprint {
+    pub inputs: u32,
+    pub outputs: u32,
+    pub input_bytes: alloc::vec::Vec<u64>,
+    pub output_bytes: alloc::vec::Vec<u64>,
+    pub input_allocation_bytes: alloc::vec::Vec<u64>,
+    pub output_allocation_bytes: alloc::vec::Vec<u64>,
+    pub sections: u16,
+    pub symbols: u64,
+    pub relocations: u64,
+    pub resident_bytes: u64,
+    pub placements: u32,
+    pub placement_bytes: u64,
+    pub link_operations: u64,
+    pub jit_operations: u64,
+    pub loader_major: u32,
+    pub loader_minor: u32,
+    pub loader_patch: u32,
+    pub nnrt_major: u32,
+    pub nnrt_minor: u32,
+    pub nnrt_patch: u32,
+    pub cmx_slice_bytes: u32,
+    pub slices: u8,
+    pub barriers: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructuralMismatch {
+    Inputs,
+    Outputs,
+    InputBytes { index: usize },
+    OutputBytes { index: usize },
+    InputAllocationBytes { index: usize },
+    OutputAllocationBytes { index: usize },
+    Sections,
+    Symbols,
+    Relocations,
+    ResidentBytes,
+    Placements,
+    PlacementBytes,
+    LinkOperations,
+    JitOperations,
+    LoaderVersion,
+    NnrtVersion,
+    CmxSliceBytes,
+    Slices,
+    Barriers,
+}
+
+impl StructuralFingerprint {
+    pub fn binding_meta(&self) -> BindingMeta<'_> {
+        BindingMeta {
+            inputs: self.inputs,
+            outputs: self.outputs,
+            input_bytes: &self.input_bytes,
+            output_bytes: &self.output_bytes,
+        }
+    }
+}
+
+pub fn structural_matches(
+    actual: &StructuralFingerprint,
+    expected: &StructuralFingerprint,
+) -> Result<(), StructuralMismatch> {
+    if actual.inputs != expected.inputs || actual.input_bytes.len() != expected.input_bytes.len() {
+        return Err(StructuralMismatch::Inputs);
+    }
+    if actual.outputs != expected.outputs
+        || actual.output_bytes.len() != expected.output_bytes.len()
+    {
+        return Err(StructuralMismatch::Outputs);
+    }
+    for (index, (a, e)) in actual
+        .input_bytes
+        .iter()
+        .zip(expected.input_bytes.iter())
+        .enumerate()
+    {
+        if a != e {
+            return Err(StructuralMismatch::InputBytes { index });
+        }
+    }
+    for (index, (a, e)) in actual
+        .output_bytes
+        .iter()
+        .zip(expected.output_bytes.iter())
+        .enumerate()
+    {
+        if a != e {
+            return Err(StructuralMismatch::OutputBytes { index });
+        }
+    }
+    for (index, (a, e)) in actual
+        .input_allocation_bytes
+        .iter()
+        .zip(expected.input_allocation_bytes.iter())
+        .enumerate()
+    {
+        if a != e {
+            return Err(StructuralMismatch::InputAllocationBytes { index });
+        }
+    }
+    for (index, (a, e)) in actual
+        .output_allocation_bytes
+        .iter()
+        .zip(expected.output_allocation_bytes.iter())
+        .enumerate()
+    {
+        if a != e {
+            return Err(StructuralMismatch::OutputAllocationBytes { index });
+        }
+    }
+    if actual.sections != expected.sections {
+        return Err(StructuralMismatch::Sections);
+    }
+    if actual.symbols != expected.symbols {
+        return Err(StructuralMismatch::Symbols);
+    }
+    if actual.relocations != expected.relocations {
+        return Err(StructuralMismatch::Relocations);
+    }
+    if actual.resident_bytes != expected.resident_bytes {
+        return Err(StructuralMismatch::ResidentBytes);
+    }
+    if actual.placements != expected.placements {
+        return Err(StructuralMismatch::Placements);
+    }
+    if actual.placement_bytes != expected.placement_bytes {
+        return Err(StructuralMismatch::PlacementBytes);
+    }
+    if actual.link_operations != expected.link_operations {
+        return Err(StructuralMismatch::LinkOperations);
+    }
+    if actual.jit_operations != expected.jit_operations {
+        return Err(StructuralMismatch::JitOperations);
+    }
+    if (
+        actual.loader_major,
+        actual.loader_minor,
+        actual.loader_patch,
+    ) != (
+        expected.loader_major,
+        expected.loader_minor,
+        expected.loader_patch,
+    ) {
+        return Err(StructuralMismatch::LoaderVersion);
+    }
+    if (actual.nnrt_major, actual.nnrt_minor, actual.nnrt_patch)
+        != (expected.nnrt_major, expected.nnrt_minor, expected.nnrt_patch)
+    {
+        return Err(StructuralMismatch::NnrtVersion);
+    }
+    if actual.cmx_slice_bytes != expected.cmx_slice_bytes {
+        return Err(StructuralMismatch::CmxSliceBytes);
+    }
+    if actual.slices != expected.slices {
+        return Err(StructuralMismatch::Slices);
+    }
+    if actual.barriers != expected.barriers {
+        return Err(StructuralMismatch::Barriers);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +338,42 @@ mod tests {
                 }
             ),
             Err(BindingMetaMismatch::OutputCount)
+        );
+    }
+
+    #[test]
+    fn structural_fingerprint_detects_relocation_drift() {
+        let base = StructuralFingerprint {
+            inputs: 2,
+            outputs: 1,
+            input_bytes: alloc::vec![128, 128],
+            output_bytes: alloc::vec![128],
+            input_allocation_bytes: alloc::vec![128, 128],
+            output_allocation_bytes: alloc::vec![128],
+            sections: 43,
+            symbols: 33,
+            relocations: 42,
+            resident_bytes: 1_533_728,
+            placements: 17,
+            placement_bytes: 8_096,
+            link_operations: 42,
+            jit_operations: 3,
+            loader_major: 1,
+            loader_minor: 2,
+            loader_patch: 2,
+            nnrt_major: 11,
+            nnrt_minor: 4,
+            nnrt_patch: 10,
+            cmx_slice_bytes: 1_473_536,
+            slices: 4,
+            barriers: 0,
+        };
+        assert_eq!(structural_matches(&base, &base), Ok(()));
+        let mut drifted = base.clone();
+        drifted.relocations = 41;
+        assert_eq!(
+            structural_matches(&drifted, &base),
+            Err(StructuralMismatch::Relocations)
         );
     }
 }
