@@ -9,8 +9,9 @@
 //! two-objective scoring (#48): **latency** (handoff nbytes × backend factor)
 //! and **throughput** (op-class compute weight — MatMul/FA heavy vs glue light).
 //! Anti-unitary policy grows onto existing NPU neighbors (including asymmetric
-//! edges), preserves fat / heavy-compute NPU islands, dissolves thin unitaries,
-//! and modestly boosts max-island across NPU boundaries / light glue.
+//! edges), prefers **fat** NPU neighbors for wider light/medium glue absorbs,
+//! preserves fat / heavy-compute NPU islands (all-light needs ≥4 ops), dissolves
+//! thin unitaries / barely-3 light scraps, and never invents claims.
 //!
 //! Profitability / claim policy stays in `offload_op` / `policy::should_pull`.
 //! This only widens homogeneous splits the scheduler already painted.
@@ -194,6 +195,8 @@ fn try_absorb_pass(
             let left = nodes[ops[run_start - 1]].backend_id;
             let right = nodes[ops[run_end]].backend_id;
             if left >= 0 && right >= 0 && left != bid {
+                let left_edge_nb = nodes[ops[run_start]].nbytes;
+                let right_edge_nb = nodes[ops[run_end]].nbytes;
                 let target = match mode {
                     AbsorbMode::Sandwich => {
                         if left == right {
@@ -208,7 +211,14 @@ fn try_absorb_pass(
                         if left == right && kind_at_npu(kinds, left) {
                             Some(left)
                         } else if left != right {
-                            npu_absorb_target(left, right, kinds, weighted)
+                            npu_absorb_target(
+                                left,
+                                right,
+                                kinds,
+                                weighted,
+                                left_edge_nb,
+                                right_edge_nb,
+                            )
                         } else {
                             None
                         }
@@ -224,8 +234,6 @@ fn try_absorb_pass(
                         }
                     }
 
-                    let left_edge_nb = nodes[ops[run_start]].nbytes;
-                    let right_edge_nb = nodes[ops[run_end]].nbytes;
                     let target_u = target as u32;
                     if target_u >= 32 || run_len > max_island.saturating_mul(3).saturating_add(12)
                     {
@@ -249,6 +257,11 @@ fn try_absorb_pass(
                     }
                     if ok {
                         let compute = IslandCompute::from_nodes(compute_pairs);
+                        let npu_neighbor_ops = if kind_at_npu(kinds, target) {
+                            neighbor_npu_run_len(nodes, ops, run_start, run_end, target)
+                        } else {
+                            0
+                        };
                         let eff_max = effective_max_island(
                             max_island,
                             target,
@@ -257,6 +270,7 @@ fn try_absorb_pass(
                             right_edge_nb,
                             weighted,
                             compute,
+                            npu_neighbor_ops,
                         );
                         if run_len <= eff_max {
                             let decision = decide_absorb(
@@ -296,6 +310,29 @@ fn try_absorb_pass(
         run_start = run_end;
     }
     false
+}
+
+/// Length of the contiguous non-view run of `target` abutting the island.
+fn neighbor_npu_run_len(
+    nodes: &[SchedCutCostNode],
+    ops: &[usize],
+    island_start: usize,
+    island_end: usize,
+    target: i32,
+) -> usize {
+    let mut left_len = 0usize;
+    let mut i = island_start;
+    while i > 0 && nodes[ops[i - 1]].backend_id == target {
+        left_len += 1;
+        i -= 1;
+    }
+    let mut right_len = 0usize;
+    let mut j = island_end;
+    while j < ops.len() && nodes[ops[j]].backend_id == target {
+        right_len += 1;
+        j += 1;
+    }
+    left_len.max(right_len)
 }
 
 #[inline]
@@ -776,5 +813,66 @@ mod tests {
         assert!(nodes.iter().all(|x| x.backend_id == 0));
         let s = snapshot_cut_cost_stats();
         assert!(s.light_glue_into_npu >= 2);
+    }
+
+    #[test]
+    fn weighted_dissolves_three_op_all_light_npu() {
+        use crate::ffi::GGML_OP_ADD;
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 3);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn weighted_fat_neighbor_absorbs_longer_light_island() {
+        use crate::ffi::GGML_OP_ADD;
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let mut nodes = [
+            cut_node(0, both, 0, 8192),
+            cut_node(0, both, 0, 8192),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node(0, both, 0, 8192),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert!(n >= 6);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+    }
+
+    #[test]
+    fn weighted_unitary_neighbor_refuses_seven_light_ops() {
+        use crate::ffi::GGML_OP_ADD;
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        // Unitary abutments: eff_max=6; a single 7-op island cannot be absorbed whole.
+        // Fixpoint may still nibble if partial runs appear — assert residual foreign ops remain.
+        let mut nodes = [
+            cut_node(0, both, 0, 8192),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node(0, both, 0, 8192),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert!(n < 7, "absorbed {n}, expected conservative unitary cap");
+        assert!(nodes.iter().any(|x| x.backend_id == 1));
     }
 }

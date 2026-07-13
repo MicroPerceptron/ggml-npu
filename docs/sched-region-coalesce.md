@@ -70,14 +70,17 @@ When `GGML_SCHED_CUT_COST=1`, the v2 provider additionally:
    **existing** NPU neighbor (classic sandwich **or** asymmetric
    `NPU|foreign|other`), then run classic same-backend sandwiches. Never paints
    a new NPU island when neither neighbor is NPU.
-4. **Preserve fat / heavy NPU islands** (≥3 ops or ≥64 KiB, **or** a heavy-class
-   op ≥16 KiB) instead of dissolving them into Vulkan/CPU; thin light unitaries
-   and small 2-op scraps may still dissolve so buft-safe coalesce duty-cycle
+4. **Preserve fat / heavy NPU islands** (≥3 ops or ≥64 KiB for mixed/heavy, **≥4
+   ops** or ≥64 KiB for all-light, **or** a heavy-class op ≥16 KiB) instead of
+   dissolving them into Vulkan/CPU; thin light unitaries, small 2-op scraps, and
+   barely-3 all-light islands may still dissolve so buft-safe coalesce duty-cycle
    wins are not undone (blanket preserve-all-NPU rejected — it revived ~412
    pp16 disp).
-5. Boosts effective `max_island` across NPU growth edges (+2 default; +3 for
-   all-light glue with ≥4 KiB edge; up to 2–3× on ≥256 KiB / ≥1 MiB boundaries).
-   Flat 2× light boosts were rejected (pp16 ~412 disp).
+5. Boosts effective `max_island` across NPU growth edges: up to 2–3× on
+   ≥256 KiB / ≥1 MiB boundaries; **fat-neighbor** preferential growth (+4
+   all-light / +3 medium glue when the abutting NPU run already has ≥2 ops);
+   unitary NPU neighbors stay at +2. Flat 2× light boosts were rejected
+   (pp16 ~412 disp).
 6. Uses `core::simd` (`portable-simd` feature) to batch nbytes×factor products
    when attributing total cut cost along a coloring.
 7. Cheap process counters (absorb-into-NPU / dissolve-NPU / preserve-fat /

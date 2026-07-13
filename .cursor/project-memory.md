@@ -53,21 +53,25 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   elementwise/layout **light**). **Anti-unitary grow-first**: absorb feasible
   foreign islands onto an *existing* NPU neighbor (classic sandwich or asymmetric
   `NPU|foreign|other`), never invent NPU when neither neighbor is NPU; then classic
-  sandwiches. Preserve **fat** NPU islands (≥3 ops or ≥64 KiB) **or** heavy-class
-  ≥16 KiB; dissolve thin light unitaries / 2-op scraps; +2 default / +3 all-light
-  glue (≥4 KiB edge) / 2–3× heavy `max_island` on NPU growth edges. Process counters
-  via `ggml_backend_sched_cut_cost_stats[_reset]` (incl. light-glue / heavy-preserve).
+  sandwiches. **Fat-neighbor preferential growth**: wider light (+4) / medium (+3)
+  `max_island` only when the abutting NPU run already has ≥2 ops; unitary NPU
+  neighbors stay at +2. Preserve **fat** NPU islands (≥3 ops or ≥64 KiB for
+  mixed/heavy; **≥4 ops** or ≥64 KiB for all-light) **or** heavy-class ≥16 KiB;
+  dissolve thin light unitaries / 2-op scraps / barely-3 all-light; 2–3× heavy
+  `max_island` on large edges. Process counters via
+  `ggml_backend_sched_cut_cost_stats[_reset]` (incl. light-glue / heavy-preserve).
   `core::simd` batches nbytes×factor under `portable-simd`. llama.cpp stays thin
   packing + buft-safe apply + optional stats dump (llama.cpp PR #13 / #16). Does not
   invent NPU claims or change MoE `is_opt_in_one` / Argsort unclaim; does not widen
   Direct `supports_buft`.
   - Rationale: Length-only coalesce can dissolve feasible NPU sandwiches into Vulkan;
-    cut costs + selective absorb-into-NPU + compute weights move toward fat NPU_HOST
-    islands under Direct’s honest buft contract without recreating preserve-all ~412
-    pp16 disp or PR #22 failure.
+    cut costs + selective absorb-into-NPU + compute weights + fat-neighbor growth move
+    toward fat NPU_HOST islands under Direct’s honest buft contract without recreating
+    preserve-all ~412 pp16 disp or PR #22 failure.
   - Evidence: `docs/sched-region-coalesce.md`, `src/sched/cut_cost.rs`,
     `src/sched/region_coalesce.rs`, PR #51, PR #66, llama.cpp#16, issue #48,
-    `FINDING/sched-anti-unitary-npu-absorb`, `FINDING/sched-cut-cost-compute-weight`.
+    `FINDING/sched-anti-unitary-npu-absorb`, `FINDING/sched-cut-cost-compute-weight`,
+    branch `feat/sched-fat-neighbor-absorb`.
   - Verified: 2026-07-13
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
