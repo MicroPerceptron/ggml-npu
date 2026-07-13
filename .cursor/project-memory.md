@@ -267,14 +267,23 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `src/policy.rs`, `benchmarks/results/_run_targeted_smoke.sh`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/` (pre-fix abort), `benchmarks/results/develop-0a804c7-targeted-pp16-sharing-on/` (post-fix exit 0; zero Argsort/Sigmoid/SumRows claims), issues #5/#11, PR #38.
   - Verified: 2026-07-12
 
-- `FINDING/moe1-argsort-intermediate-id-corruption` — With exact `GGML_NPU_MOE=1` on develop `8ec283e`, NPU claimed fused MoE routing including Argsort; TopK ids stayed device intermediates and were not copied out before host View aliases fed `MUL_MAT_ID` on another backend → exit 134 `GGML_ASSERT(id >= 0 && id < n_expert)`. Sigmoid alone was fine; GetRows/SumRows with host-produced ids were fine. Fix: `env_policy_admits_gated` unclaims Argsort and MatMulId even under `MOE=1` (keep `is_opt_in_one`, never `is_set`); Sigmoid/SumRows remain opt-in. Post-fix pp16 `MOE=1` smoke exit 0 with zero Argsort/MatMulId claims.
-  - Scope: supports_op claim policy for MoE id/expert ops; shim fused Argsort→MatMulId lowering retained.
-  - Evidence: `src/vendor/ivpu/compile.rs`, `docs/coverage-gates.md`, `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-coalesce-moe1-attn-default/` (pre-fix abort), `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-moe1-failclosed/` (post-fix exit 0), issue #11, PR #49 (`4403a82`).
+- `FINDING/moe1-argsort-intermediate-id-corruption` — With exact `GGML_NPU_MOE=1` on develop `8ec283e`, NPU claimed fused MoE routing including Argsort; TopK ids stayed device intermediates and were not copied out before host View aliases fed `MUL_MAT_ID` on another backend → exit 134 `GGML_ASSERT(id >= 0 && id < n_expert)`. Sigmoid alone was fine; GetRows/SumRows with host-produced ids were fine. Interim fix (PR #49): unclaim Argsort and MatMulId under `MOE=1`. Superseded for Argsort by `FINDING/moe-argsort-id-writeback-reclaim` (PR #60); MatMulId remains unclaimed.
+  - Scope: Historical root cause for MOE=1 expert-id abort; claim policy before writeback.
+  - Evidence: `src/vendor/ivpu/compile.rs`, `docs/coverage-gates.md`, `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-coalesce-moe1-attn-default/` (pre-fix abort), `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-moe1-failclosed/` (PR #49 exit 0), issue #11, PR #49 (`4403a82`).
   - Verified: 2026-07-13
 
-- `FINDING/moe-routed-bank-gather-contract` — Under exact `GGML_NPU_MOE=1`, Sigmoid/SumRows are claimable when compile-ready. Argsort and MatMulId stay **supports_op-unclaimed** until model-scale ids/experts are proven (shim may still lower fused Argsort→MatMulId with ids internal). Float f16/bf16 expert-bank packing and packed Q4/Q6/Q8 requant contracts remain for when MatMulId is re-enabled; packed source-native gather stays refused. Output-head-scale dense MatMul stays unclaimed via `expanded_constant_budget` unless `GGML_NPU_ALLOW_GIANT_CONSTANTS`.
+- `FINDING/moe-argsort-id-writeback-reclaim` — Under `GGML_NPU_MOE=1`, Argsort is reclaimable when i32 TopK ids are forced as ggml-visible graph outputs: `capture` and `partition_range` mark Argsort outputs even if View/GetRows consume them in-partition, so copy-out materializes host buffers before foreign `MUL_MAT_ID`. MatMulId stays **supports_op-unclaimed** (Vulkan/host experts). Still exact `is_opt_in_one`. pp16 `MOE=1` t=6 smoke exit 0 with Argsort claimed and MatMulId zero claims.
+  - Scope: MoE id writeback + claim policy; not model-scale MatMulId / packed-bank tok/s.
+  - Evidence: `src/graph.rs`, `src/vendor/ivpu/compile.rs`, `docs/coverage-gates.md`,
+    `benchmarks/results/develop-8fa9bf9-targeted-pp16-sharing-on-moe1-argsort-writeback/`,
+    issue #11, PR #60.
+  - Verified: 2026-07-13
+
+- `FINDING/moe-routed-bank-gather-contract` — Under exact `GGML_NPU_MOE=1`, Sigmoid/SumRows and Argsort (with ggml-visible id writeback) are claimable when compile-ready. MatMulId stays **supports_op-unclaimed** — Vulkan/host owns routed experts until model-scale evidence (shim may still lower fused Argsort→MatMulId with ids internal). Float f16/bf16 expert-bank packing and packed Q4/Q6/Q8 requant contracts remain for when MatMulId is re-enabled; packed source-native gather stays refused. Output-head-scale dense MatMul stays unclaimed via `expanded_constant_budget` unless `GGML_NPU_ALLOW_GIANT_CONSTANTS`.
   - Scope: Claim policy + shim e2e; not a locked LFM full-model routed-expert tok/s proof.
-  - Evidence: `src/ops/ggml_quant.rs`, `src/vendor/ivpu/compile.rs`, `shim/ov_compile.cpp`, `tests/coverage_matrix.csv`, `docs/coverage-gates.md`, issue #11, PR #49.
+  - Evidence: `src/ops/ggml_quant.rs`, `src/vendor/ivpu/compile.rs`, `src/graph.rs`,
+    `shim/ov_compile.cpp`, `tests/coverage_matrix.csv`, `docs/coverage-gates.md`, issue #11,
+    PRs #49/#60.
   - Verified: 2026-07-13
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
@@ -577,17 +586,31 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Reproduce: locked LFM harness per `docs/benchmarking.md` with sharing/fusion enabled as in the remediation environment.
   - Verified: 2026-07-12
 
+- `BENCH/lfm-moe1-argsort-writeback-pp16` — PR #60 tip `8fa9bf9`, LFM Q4_K_M pp16 r=1
+  sharing-on ShortConv=1 `MOE=1` ATTENTION=full FlexiBLAS hybrid, `-t 6` /
+  `OMP_NUM_THREADS=6`, flock + `ALLOW_HIGH_SWAP=1`: **exit 0**; backends BLAS,Vulkan,NPU;
+  Argsort claimed (DEBUG wire hits); MatMulId **0**; Sigmoid claimed; no expert-id assert;
+  soft ~32 tok/s.
+  - Limitation: Soft r=1 only; not locked pp512; not a MatMulId reclaim proof.
+  - Evidence: `benchmarks/results/develop-8fa9bf9-targeted-pp16-sharing-on-moe1-argsort-writeback/`,
+    issue #11, PR #60.
+  - Reproduce: `GGML_NPU_MOE=1 THREADS=6 OMP_NUM_THREADS=6` targeted pp16 with current
+    `libggml_npu.so` after PR #60.
+  - Verified: 2026-07-13
+
 ## Pending milestones
 
-- `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond hermetic/shim + fail-closed
-  Argsort/MatMulId unclaim: prove ggml-visible expert ids and model-scale MatMulId (or keep them
-  on host/Vulkan with documented strategy); Sigmoid/SumRows already opt-in under `MOE=1`. Keep
-  default harness `MOE=0` unclaimed; never reintroduce `is_set` MoE enable.
-  - Acceptance: Documented MoE strategy with passing routed-expert evidence when ids/experts are
-    reclaimed; no silent packed source-native gather; output-head remains explicitly unclaimed or
-    validated; issue #11 acceptance met without requiring full locked pp512 as the first gate.
-  - Evidence: `docs/coverage-gates.md`, `FINDING/moe1-argsort-intermediate-id-corruption`,
-    `FINDING/moe-routed-bank-gather-contract`, issue #11.
+- `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond Argsort writeback reclaim
+  (PR #60): model-scale MatMulId / packed expert banks (or keep Vulkan/host experts as the
+  durable contract with acceptance met); Sigmoid/SumRows + Argsort-with-writeback already
+  opt-in under `MOE=1`. Keep default harness `MOE=0` unclaimed; never reintroduce `is_set`
+  MoE enable; never reclaim Argsort without ggml-visible id writeback.
+  - Acceptance: Documented MoE strategy with passing routed-expert evidence when MatMulId is
+    reclaimed (or explicit permanent Vulkan/host experts); no silent packed source-native
+    gather; output-head remains explicitly unclaimed or validated; issue #11 acceptance met
+    without requiring full locked pp512 as the first gate.
+  - Evidence: `docs/coverage-gates.md`, `FINDING/moe-argsort-id-writeback-reclaim`,
+    `FINDING/moe-routed-bank-gather-contract`, issue #11, PR #60.
 
 - `MILESTONE/capability-contract-complete` — Finish GitHub #8 beyond fail-closed + layout-only
   unclaim: broader mismatch regression tests (tensor-level supports_op vs compile); quant
