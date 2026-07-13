@@ -456,10 +456,13 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
     let bindings = direct + shared + imported + staged;
     let (npu_programs, npu_unitary, npu_program_nodes) =
         crate::metrics::npu_program_attribution();
+    let buft = crate::backend::buft_attribution();
 
     let s = alloc::format!(
         "\n[ggml-npu profile]  dispatches={n}   measured host+device wall={:.3} ms ({:.3} us/disp)\n\
          \x20 npu programs: {npu_programs} total / {npu_unitary} unitary ({:.1}%); avg nodes {:.2}\n\
+         \x20 buft probes: ours_ok={} foreign_host_ok={} foreign_host_refused={} device_refused={} null_refused={}\n\
+         \x20 residency: our_shared={} our_legacy_host={} foreign_host={} foreign_device={} unalloc={} dishonest_npu_host={}\n\
          \x20 stage-in (host->bounce) : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%   {:.2} MB\n\
          \x20 device  (submit+sync)   : {:>9.3} ms  {:>8.3} us/disp  {:>5.1}%\n\
          \x20   |- submit (exec async): {:>9.3} ms  {:>8.3} us/disp  ({:.1}% of device)\n\
@@ -482,6 +485,17 @@ extern "C" fn dump_at_exit(_arg: *mut c_void) {
         } else {
             npu_program_nodes as f64 / npu_programs as f64
         },
+        buft.probe_ours_accepted,
+        buft.probe_foreign_host_accepted,
+        buft.probe_foreign_host_refused,
+        buft.probe_foreign_device_refused,
+        buft.probe_null_refused,
+        buft.res_our_shared,
+        buft.res_our_legacy_host,
+        buft.res_foreign_host,
+        buft.res_foreign_device,
+        buft.res_unallocated,
+        buft.res_dishonest_npu_host,
         ms(ti),
         us_per(ti, n),
         pct(ti, total),

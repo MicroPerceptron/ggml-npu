@@ -1,11 +1,14 @@
 //! Buffer-type and buffer vtables — the **zero-copy** memory model.
 //!
-//! Allocations are NPU-mapped host memory (via the present vendor's `alloc_host`, e.g. Intel's
-//! `zeMemAllocHost`): pinned + mapped into the NPU's address space so a tensor placed here can be
-//! bound directly as a graph argument with no per-dispatch copy. It's still host-visible
-//! (`is_host == true`), so the CPU reads/writes `tensor->data` directly and `set_tensor` (the
-//! one-time weight upload at model load) is a plain memcpy into NPU memory. A weight offloaded to
-//! us therefore costs one copy at load and **zero copies per token**.
+//! Allocations are NPU-mapped host memory branded `NPU_HOST`: pinned + host-visible
+//! (`is_host == true`) so the CPU can `set_tensor` / read `tensor->data`, and bindable as graph
+//! args without per-dispatch copy when the runtime can import them.
+//!
+//! **Honest residency:** under Direct IVPU the only valid backing is a
+//! [`SharedAllocationOwner`](crate::interop::SharedAllocationOwner) from
+//! `alloc_shared_backend`. Falling back to bare `alloc_host` would still be named `NPU_HOST` but
+//! would not be importable — that lie forced staging (#6, PR #22). Level Zero may still use
+//! `alloc_host` because it can bind foreign host pointers.
 
 use alloc::boxed::Box;
 use core::ffi::{c_char, c_void};
@@ -213,7 +216,7 @@ unsafe extern "C" fn buffer_clear(buffer: ggml_backend_buffer_t, value: u8) {
     }
 }
 
-pub(super) unsafe fn context(buffer: ggml_backend_buffer_t) -> Option<&'static BufferContext> {
+pub(in crate::backend) unsafe fn context(buffer: ggml_backend_buffer_t) -> Option<&'static BufferContext> {
     if buffer.is_null() {
         return None;
     }

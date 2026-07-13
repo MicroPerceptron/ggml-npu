@@ -40,6 +40,7 @@ impl Operand {
     /// Describe a ggml tensor as an operand: data pointer, element count, element type, and
     /// whether it's in our (NPU-mapped) buffer. Caller must ensure `t` is non-null.
     pub unsafe fn from_tensor(t: *const ggml_tensor) -> Operand {
+        crate::backend::record_tensor_residency(t);
         let d = &*t;
         Operand {
             ptr: d.data,

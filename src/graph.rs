@@ -317,6 +317,7 @@ fn has_name_prefix(t: &ggml_tensor, prefix: &[u8]) -> bool {
 }
 
 unsafe fn describe(t: *const ggml_tensor, role: TensorRole) -> TensorDesc {
+    crate::backend::record_tensor_residency(t);
     let x = &*t;
     TensorDesc {
         dtype: x.type_,

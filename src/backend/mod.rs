@@ -6,10 +6,16 @@
 //! lifetime. Init is a lock-free CAS (no global lock); the loader calls
 //! `ggml_backend_init` once, so the race is a formality we nonetheless handle correctly.
 
+mod buft;
 mod buffer;
 #[cfg(ggml_has_external_memory)]
 mod external;
 mod shell;
+
+pub(crate) use buft::{
+    buft_attribution, classify_tensor, direct_narrow_buft_contract, record_tensor_residency,
+    supports_buft_attributed, TensorResidency, BuftAttribution,
+};
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
@@ -112,23 +118,23 @@ fn device() -> *mut ggml_backend_device {
     unsafe { &mut (*get_or_init()).device }
 }
 
-fn buffer_type() -> *mut ggml_backend_buffer_type {
+pub(in crate::backend) fn buffer_type() -> *mut ggml_backend_buffer_type {
     unsafe { &mut (*get_or_init()).buft }
 }
 
-/// Whether `tensor` lives in **our** buffer type — i.e. its `data` is NPU-mapped memory
-/// (shared-backend allocation under Direct IVPU; Level Zero may use `alloc_host`) that can be
-/// bound as a graph argument with **no copy**. False for foreign buffers (a CPU-produced
-/// activation, a weight the model kept on CPU), which the vendor must stage through a bounce
-/// buffer. O(1): a pointer compare against our singleton buffer-type. Since our buffer type
-/// only ever hands out NPU memory (it fails the allocation otherwise), "our buft" ⟺
-/// "NPU-mapped", so this is exact.
+/// Whether `tensor` is honestly bindable without a payload copy on the active runtime.
+///
+/// - **Direct:** requires our buft **and** a `SharedAllocationOwner` (importable). Bare
+///   `alloc_host` under the `NPU_HOST` name is refused at alloc time and is not "owned".
+/// - **Level Zero:** our buft is enough (LZ can bind host pointers from `alloc_host` fallback).
 pub(crate) unsafe fn owns_tensor(tensor: *const ggml_tensor) -> bool {
-    if tensor.is_null() {
-        return false;
+    match classify_tensor(tensor) {
+        TensorResidency::OurShared => true,
+        TensorResidency::OurLegacyHost => !direct_narrow_buft_contract(),
+        TensorResidency::Unallocated
+        | TensorResidency::ForeignHost
+        | TensorResidency::ForeignDevice => false,
     }
-    let buf = (*tensor).buffer;
-    !buf.is_null() && (*buf).buft == buffer_type()
 }
 
 pub(crate) unsafe fn shared_view(
