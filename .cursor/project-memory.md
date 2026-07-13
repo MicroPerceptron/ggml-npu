@@ -621,6 +621,41 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `libggml_npu.so` after PR #60.
   - Verified: 2026-07-13
 
+- `BENCH/lfm-tip-5c1acb3-coa-cut-claim-matrix` — Merged ggml-npu `5c1acb3` + llama.cpp
+  `a95d49e3c`, LFM Q4_K_M targeted r=1 sharing-on ShortConv=1 MoE=0 ATTENTION=full
+  FlexiBLAS+Vulkan+Direct, `-t 6` / `OMP_NUM_THREADS=6`, flock + `ALLOW_HIGH_SWAP=1`,
+  `backend_git_head` from loaded `.so` BUILD.txt. All eight short cells exit 0:
+  pp16 coa1/cut0/cs0 **108**/55.6%/1.85/82.7%/~33; coa0/cs1 **482**/32.4%/2.29/100%/~19;
+  coa1/cut1/cs1 **394**/39.6%/2.43/96%/~22; coa1/cut1/cs0 **348**/32.2%/2.61/95.7%/~24.
+  pp128 coa1/cut0/cs0 **10**/60%/3.20/93.8%/~40; coa0/cs1 **516**/30.6%/2.41/100%/~65;
+  coa1/cut1/cs1 **428**/27.1%/2.59/99.8%/~89; coa1/cut1/cs0 **20**/40%/3.20/96.8%/~44.
+  Pre-fix locked pp512 r=3 coa1+cut1+cs1 warmup failed (`res = -3` /
+  `BindingMismatch`); see `FINDING/claim-stage-elf-pad-binding-mismatch`.
+  - Limitation: Soft r=1 only for greens; pre-fix pp512 not baseline-eligible.
+  - Evidence: `benchmarks/results/develop-5c1acb3-targeted-pp{16,128}-sharing-on-coa*-cut*-cs*/`,
+    `benchmarks/results/develop-5c1acb3-pp512-fullperf-locked-sharing-on-coa1-cut1-cs1-t6/`,
+    issues #5/#6.
+  - Reproduce: `THREADS=6` ± `GGML_SCHED_REGION_COALESCE` / `CUT_COST` / `NPU_CLAIM_STAGE`
+    via `_run_targeted_smoke.sh`; pp512 via `_run_pp512_fullperf.sh` with coa1 cut1 claim1.
+  - Verified: 2026-07-13
+
+- `FINDING/claim-stage-elf-pad-binding-mismatch` — With `GGML_SCHED_NPU_CLAIM_STAGE=1`,
+  Direct shared-import of exact-sized NPU_HOST tensors aborted pp512 warmup as
+  `PrepareError::BindingMismatch` → `GGML_STATUS_FAILED` (`res = -3`) on the fused
+  MatMul+Swiglu subgraph (`M=512`). OpenVINO ELF `allocation_bytes` can pad past
+  logical `nbytes`; `offset + allocation_bytes` then overruns the owner (observed
+  logical 14680064 vs alloc 14705872 near the end of a 60686336-byte shared buffer).
+  Trigger is **claim-stage**, not coalesce/cut-cost: pp512 r=1 passes with cs0
+  (coa1 cut0/cut1) and fails with cs1 (coa0 or coa1). Fix: stage-copy into a fresh
+  BO when the shared view cannot cover the padded section (keep no-copy when it can);
+  unit tests lock the cover predicate.
+  - Scope: Direct prepare path; llama.cpp claim-stage host unchanged.
+  - Evidence: `src/vendor/ivpu/direct/prepare.rs`,
+    `benchmarks/results/develop-5c1acb3-targeted-pp512-coa*-bisect/`,
+    `benchmarks/results/develop-5c1acb3-targeted-pp512-coa1-cut1-cs1-warmup-fix/`
+    (exit 0, 470 disp), issues #5/#6.
+  - Verified: 2026-07-13
+
 ## Pending milestones
 
 - `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond Argsort writeback reclaim
