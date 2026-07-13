@@ -30,6 +30,11 @@ host buft. Direct keeps that probe **false** and instead opts into:
    `backend_from_buffer` can keep subsequent affinity honestly (`our_shared` ↑).
 3. `supports_buft` stays narrow — foreign probes still increment `foreign_host_refused`.
 
+**Recommended with cut-cost:** pair claim-stage with `GGML_SCHED_REGION_COALESCE=1` and
+`GGML_SCHED_CUT_COST=1` (or one-shot `GGML_NPU_SCHED=auto` when Direct + NPU are loaded).
+See [`sched-region-coalesce.md`](sched-region-coalesce.md). Claim+stage under
+coalesce-only (no cut-cost) can re-absorb NPU seeds into Vulkan.
+
 This is safe vs PR #22 because we never advertise an unsupported buft as supported; staging
 is explicit in the scheduler copy path.
 
