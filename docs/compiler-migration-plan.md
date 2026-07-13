@@ -291,7 +291,10 @@ used to claim that Hexagon-MLIR artifacts are loadable.
 7. **Direct-submission qualification.** Run the same artifact corpus through Level Zero and direct
    DRM. Gate: binding metadata, relocations, HPI/firmware versions, resident accounting,
    import/copy behavior, synchronization and fault recovery all pass; runtime choice does not alter
-   compiler cache identity except where target requirements differ.
+   compiler cache identity except where target requirements differ. Concrete done vs remaining
+   delete gates (and claim-stage duty-cycle evidence vs L0) live in
+   [`docs/retire-level-zero-compat.md`](retire-level-zero-compat.md) and GitHub #63
+   (`MILESTONE/retire-level-zero-compat`). **Do not remove Level Zero until those hard gates pass.**
 8. **Remove OpenVINO.** Delete `shim/ov_compile.cpp`, `shim/CMakeLists.txt`, `shim/build.sh`, the
    `GGML_NPU_OVC` loader and all `ggml_npu_ov_*` symbols only when every prior gate passes and:
    - all enabled Intel graph paths use the new provider, with explicit fallback on rejection;
