@@ -702,11 +702,23 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
     `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22, PR #52, llama.cpp#15.
 
-- `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact. One locked LFM L0 pp512 baseline now exists (`BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`); that is evidence for parity comparison only — **not** acceptance to delete L0. Landed session hardening (#56): cooperative cancel admission, command-BO job-status classification, latched device-loss with firmware-gated reset (`direct::health`), context-open firmware negotiate, loader/NNRT mismatch reject tests, and hermetic differential-oracle hooks (`direct::oracle`).
-  - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven. Remaining for delete: model-corpus Direct↔L0 parity beyond tiny KAT; kernel in-flight abort/hang-reset; broader Direct op coverage; production-scale import/copy (#6).
-  - Evidence: `docs/direct-runtime-foundation.md`, `docs/compiler-migration-plan.md`,
-    `src/vendor/ivpu/direct/health.rs`, `src/vendor/ivpu/direct/oracle.rs`,
-    `src/vendor/ivpu/session.rs`, issue #56,
+- `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and
+  differential oracle until Direct is sole Intel runtime; **do not delete L0** until hard
+  gates in `docs/retire-level-zero-compat.md` / GitHub #63 are green. Done toward retirement:
+  tiny Direct↔L0 KAT; session cancel / device-loss latch / firmware-gated reset (PR #57,
+  #56 closed); ELF pad binding cover (PR #62); claim-stage LFM duty-cycle **shape** near L0
+  (tip locked ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** —
+  `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`).
+  - Acceptance (delete blockers): model-corpus Direct↔L0 binding + numeric parity beyond
+    tiny KAT; in-flight hang abort beyond cooperative cancel/post-fault reset; required
+    Direct op coverage leftovers (#9/#10/#11) without depending on L0; product default-on
+    knobs for claim-stage/coalesce/cut-cost with regression gates. Non-gates: full tok/s
+    gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5), widening Direct
+    `supports_buft`, OpenVINO removal.
+  - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-runtime-foundation.md`,
+    `docs/compiler-migration-plan.md`, `src/vendor/ivpu/direct/health.rs`,
+    `src/vendor/ivpu/direct/oracle.rs`, `src/vendor/ivpu/session.rs`, PRs #57/#62/#64,
+    issues #56/#63, `BENCH/lfm-pp512-371b06d-coa1-cut1-cs1`,
     `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`.
 
 - `MILESTONE/neutral-compiler-providers` — Replace compiler-specific frontend coupling with dynamically loaded, versioned, neutral providers, starting with Intel and later adding AMD and Qualcomm adapters behind the same semantic request/artifact envelope.
