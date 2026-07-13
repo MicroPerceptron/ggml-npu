@@ -17,7 +17,7 @@ qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/6
 | Session cancel admission + device-loss latch + firmware-gated reset | **Done** (PR #57 merged; #56) | Cooperative cancel; job-status `SUCCESS`/`ABORTED`/fault; latched device-loss; reset drops resident programs. Hermetic `direct::health` / `direct::oracle` |
 | Claim-stage duty cycle near L0 (LFM shape) | **Done (parity of shape)** | Claim+stage + pad fix: locked Direct ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`). Gap remains; shape is L0-class |
 | ELF pad / binding cover under claim-stage | **Done** | PR #62: stage when ELF `allocation_bytes` pad exceeds shared view (`FINDING/claim-stage-elf-pad-binding-mismatch`) |
-| Model-corpus Direct↔L0 binding + numeric parity | **Required** | Same artifact/model corpus: binding metadata, relocations, HPI/firmware pins, resident accounting, import/copy, output tolerances — not tiny-only |
+| Model-corpus Direct↔L0 binding + numeric parity | **Harness landed** | Manifest + hermetic goldens + lab script: [`docs/direct-l0-corpus-parity.md`](direct-l0-corpus-parity.md). Structural Direct↔golden + L0 binding probe on 6 representative blobs; FP32 numeric on tiny vector-add. **Not** full LFM coverage — gate remains open until lab evidence is recorded on #63 |
 | In-flight / hang abort after partial execution | **Required** | Kernel hang-reset and abort of in-flight work beyond cooperative cancel + post-fault reset (post-#57 leftover) |
 | Required Direct op coverage leftovers | **Required** | ShortConv / RoPE / FA / MoE paths still tracked on #9 / #10 / #11; Direct must not depend on L0 for those gates |
 | Default-on knobs productization | **Required** | `GGML_SCHED_NPU_CLAIM_STAGE`, coalesce, cut-cost (and related) remain opt-in; product default path must not need a secret matrix to match L0-class duty cycle |
@@ -58,8 +58,11 @@ and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean
 
 ## Still required (delete blockers)
 
-1. **Corpus parity** — differential Direct vs L0 on the real LFM (and agreed) artifact
-   set: bindings, numerics, resident bytes, sync. Tiny KAT alone is insufficient.
+1. **Corpus parity** — differential Direct vs L0 on a representative LFM/OV artifact
+   corpus beyond tiny KAT. Harness: [`docs/direct-l0-corpus-parity.md`](direct-l0-corpus-parity.md)
+   (`tests/direct_l0_corpus/manifest.csv`, `benchmarks/run_direct_l0_corpus_parity.sh`).
+   Still required: expand beyond the initial six blobs / record green lab evidence on #63;
+   non-FP32 numeric; production-scale import/copy.
 2. **Hang / in-flight abort** — prove recovery when firmware/driver hangs mid-job, not
    only cooperative cancel before admit and post-classified fault reset.
 3. **Coverage leftovers** — finish or explicitly keep-unclaimed the #9/#10/#11 surfaces

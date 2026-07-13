@@ -1,0 +1,12 @@
+# Direct ↔ Level Zero model-corpus manifest (#63).
+# Byte lists use `|` separators. Blobs are not committed; resolve via GGML_NPU_CORPUS_DIR,
+# ~/.cache/ggml-npu/, or benchmarks/results/lfm-pp512-cache/ (lab).
+# mode=numeric_fp32: lab gate also executes Direct vs L0 and compares FP32 outputs.
+# mode=structural: binding/HPI/relocation/resident goldens only (hermetic when blob present).
+id,artifact,bytes,sha256,family,mode,notes,inputs,outputs,input_bytes,output_bytes,input_allocation_bytes,output_allocation_bytes,sections,symbols,relocations,resident_bytes,placements,placement_bytes,link_operations,jit_operations,loader_major,loader_minor,loader_patch,nnrt_major,nnrt_minor,nnrt_patch,cmx_slice_bytes,slices,barriers
+vector-add-tiny,ir2-8c91da4914adc7d5-n1.blob,45192,91d2ee3b403e10fb7fa864d1e8eb2ada9b6c8a6fcdea281d3c3e95d088a371a0,bring-up,numeric_fp32,bounded-vector-add-KAT,2,1,128|128,128,128|128,128,43,33,42,1533728,17,8096,42,3,1,2,2,11,4,10,1473536,4,0
+lfm-n1-small,ir2-d152331ee29c46c3-n1.blob,28801,de5b8e457def95d32bfce4e87447d29f08afdf73fcc21eaccfd2f2e3de13da8b,LFM,structural,lfm-cache-n1-slice,1,1,2048,2048,2048,2048,25,17,10,1480188,6,2860,10,2,1,2,2,11,4,10,1473536,4,0
+lfm-shortconv-e2e,ir2-shortconv-e2e-v1.blob,57473,1b7f7a245675c7a437d07e6ce8945e2487280d8798b01a6ae35de574162e3ddb,LFM,structural,shortconv-e2e-coverage-artifact,1,1,32,16,32,16,66,45,103,1560260,30,24004,103,2,1,2,2,11,4,10,1473536,4,0
+lfm-batched-get-rows,ir2-batched-get-rows-e2e-v1.blob,69768,63a3e4112fe8c5fbdec4b8ad512ce459bfec9a14684f842fdfa188be837d6147,LFM,structural,batched-get-rows-e2e,2,1,32|16,16,32|16,16,57,37,144,1508104,21,25636,144,3,1,2,2,11,4,10,1473536,4,0
+lfm-n3-slice,ir2-2fc11a4f22b54cfc-n3.blob,69782,48ce3499731163ea42429537945a25cb3cab41d9a6f8bcd8f4e618c9ce1c8026,LFM,structural,lfm-cache-n3-multi-io,3,2,16384|4|16384,16384|16384,16384|4|16384,16384|16384,52,37,62,1654668,19,19192,62,7,1,2,2,11,4,10,1473536,4,0
+lfm-n8-slice,ir2-1ee5f0b4434437e8-n8.blob,114838,4604f6725d87b5cf1878328da7e1e7330c2a52d38353f1a6912321669b2d6fdd,LFM,structural,lfm-cache-n8-multi-io,3,2,24576|16384|16384,24576|16384,24576|16384|16384,24576|16384,64,40,223,1745344,22,72752,223,7,1,2,2,11,4,10,1473536,4,0

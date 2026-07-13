@@ -194,9 +194,10 @@ or admission depend on transient pressure after a graph has been claimed.
   hang recovery and in-flight abort ioctls remain unproven. Level Zero cleanup proven.
 - Numerical parity: **direct vector-add output matched Level Zero bit-for-bit for all 32 FP32
   elements across both submissions**. Hermetic differential-oracle hooks
-  (`direct::oracle::{compare_f32,binding_meta_matches}`) are available for Direct↔oracle checks
-  without hardware. Direct ShortConv/RoPE/FlashAttention/MoE remain unproven; Level Zero focused
-  gates are proven.
+  (`direct::oracle::{compare_f32,binding_meta_matches,structural_matches}`) plus a
+  representative corpus harness (`docs/direct-l0-corpus-parity.md`) cover binding/HPI goldens
+  and lab Direct↔L0 probes beyond the tiny KAT. Direct ShortConv/RoPE/FlashAttention/MoE remain
+  unproven; Level Zero focused gates are proven.
 - Existing tiny Intel artifact execution: **direct proven** for
   `ir2-8c91da4914adc7d5-n1.blob` (45,192 bytes, 43 sections, 33 symbols, 42 relocations,
   17 allocated sections totaling 8,096 logical bytes and 69,632 page-aligned BO bytes). Metadata

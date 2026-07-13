@@ -38,6 +38,99 @@ pub(super) fn run_native_blob(
     fixture.copy_output(output)
 }
 
+/// Query Level Zero graph argument byte sizes without executing (FP32/compatible widths only).
+pub(super) fn native_blob_binding_bytes(
+    dev: &ze::Device,
+    blob: &[u8],
+) -> Result<(Vec<u64>, Vec<u64>), i32> {
+    let l = ze::lib().ok_or(-1)?;
+    // SAFETY: Level Zero handles are initialized before use and destroyed before return.
+    unsafe {
+        let mut table: *mut c_void = ptr::null_mut();
+        chk((l.get_ext_fn_addr)(
+            dev.driver,
+            c"ZE_extension_graph".as_ptr(),
+            &mut table,
+        ))?;
+        let graph_table = table.cast::<ze_graph_dditable_ext_t>();
+        if graph_table.is_null() {
+            return Err(-2);
+        }
+        let pfn_create = (*graph_table).pfnCreate.ok_or(-3)?;
+        let pfn_props = (*graph_table).pfnGetProperties.ok_or(-3)?;
+        let pfn_arg = (*graph_table).pfnGetArgumentProperties.ok_or(-3)?;
+        let pfn_destroy = (*graph_table).pfnDestroy.ok_or(-3)?;
+
+        let mut context_desc: ze_context_desc_t = mem::zeroed();
+        context_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
+        let mut context = ptr::null_mut();
+        chk((l.context_create)(dev.driver, &context_desc, &mut context))?;
+        let mut graph = ptr::null_mut();
+        let graph_desc = ze_graph_desc_t {
+            stype: ZE_STRUCTURE_TYPE_GRAPH_DESC,
+            pNext: ptr::null_mut(),
+            format: ZE_GRAPH_FORMAT_NATIVE,
+            inputSize: blob.len(),
+            pInput: blob.as_ptr(),
+            pBuildFlags: ptr::null(),
+        };
+        let create = pfn_create(context, dev.handle, &graph_desc, &mut graph);
+        if create != ZE_RESULT_SUCCESS {
+            (l.context_destroy)(context);
+            return Err(create as i32);
+        }
+        let mut properties: ze_graph_properties_t = mem::zeroed();
+        properties.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES;
+        let props = pfn_props(graph, &mut properties);
+        if props != ZE_RESULT_SUCCESS {
+            pfn_destroy(graph);
+            (l.context_destroy)(context);
+            return Err(props as i32);
+        }
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for argument in 0..properties.numGraphArgs {
+            let mut argument_properties: ze_graph_argument_properties_t = mem::zeroed();
+            argument_properties.stype = ZE_STRUCTURE_TYPE_GRAPH_ARGUMENT_PROPERTIES;
+            let arg = pfn_arg(graph, argument, &mut argument_properties);
+            if arg != ZE_RESULT_SUCCESS {
+                pfn_destroy(graph);
+                (l.context_destroy)(context);
+                return Err(arg as i32);
+            }
+            let elements = argument_properties
+                .dims
+                .iter()
+                .copied()
+                .filter(|dimension| *dimension != 0)
+                .try_fold(1usize, |product, dimension| {
+                    product.checked_mul(dimension as usize).ok_or(-4)
+                })?;
+            let element_bytes = match argument_properties.devicePrecision {
+                ZE_GRAPH_ARGUMENT_PRECISION_FP32
+                | ZE_GRAPH_ARGUMENT_PRECISION_INT32
+                | ZE_GRAPH_ARGUMENT_PRECISION_UINT32 => 4usize,
+                ZE_GRAPH_ARGUMENT_PRECISION_FP16 => 2,
+                ZE_GRAPH_ARGUMENT_PRECISION_INT64 | ZE_GRAPH_ARGUMENT_PRECISION_UINT64 => 8,
+                _ => {
+                    pfn_destroy(graph);
+                    (l.context_destroy)(context);
+                    return Err(-4);
+                }
+            };
+            let bytes = (elements.checked_mul(element_bytes).ok_or(-4)?) as u64;
+            if argument_properties.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
+                inputs.push(bytes);
+            } else {
+                outputs.push(bytes);
+            }
+        }
+        pfn_destroy(graph);
+        (l.context_destroy)(context);
+        Ok((inputs, outputs))
+    }
+}
+
 /// Reusable Level Zero fixture used by the one-shot self-test and guarded hardware benchmark.
 pub(super) struct PersistentNativeGraph {
     l: &'static ze::ZeLib,

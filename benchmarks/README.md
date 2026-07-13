@@ -4,6 +4,10 @@ Full LFM pp512 / multi-sample locked llama-bench is expensive — do not run it 
 tests, Criterion microbenches, and short profiles; see
 [`docs/benchmarking.md`](../docs/benchmarking.md) and `.cursor/rules/benchmark-invocation.mdc`.
 
+For Direct ↔ Level Zero artifact parity (bindings + numerics, not tok/s), prefer
+[`docs/direct-l0-corpus-parity.md`](../docs/direct-l0-corpus-parity.md) and
+`./benchmarks/run_direct_l0_corpus_parity.sh` (lab; `THREADS=6` documented default) over pp512.
+
 `run_lfm_baseline.sh` captures repeatable native CPU, BLAS, Vulkan, and opt-in NPU baselines for an LFM GGUF.
 Each run creates a timestamped directory containing:
 

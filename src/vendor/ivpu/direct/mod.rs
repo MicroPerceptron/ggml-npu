@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod budget;
+pub mod corpus;
 pub mod elf;
 mod firmware;
 pub mod health;
