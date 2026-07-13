@@ -96,15 +96,13 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `ADR/direct-npu-host-residency` — Direct IVPU `supports_buft` accepts only our `NPU_HOST` buft;
   `buft_alloc_buffer` fails closed without `SharedAllocationOwner`; `owns_tensor` requires a shared
-  owner (not buft-pointer equality alone). Level Zero keeps broad host `supports_buft` and may use
-  `alloc_host`. Profile attribution (`src/backend/buft.rs`) counts foreign-host refusals vs L0 and
-  tensor residency classes. Selective foreign-host allowlisting stays gated off until hermetic
-  import proofs exist; MoE `is_opt_in_one` is untouched.
-  - Rationale: L0’s broad host contract inflated NPU affinity while Direct cannot import foreign
-    host pointers; re-widening recreates owned-but-unimportable staging (#6). Honest residency keeps
-    scheduler affinity aligned with bindable storage.
-  - Evidence: `docs/direct-buft-residency.md`, `src/backend/buft.rs`, `src/backend/shell.rs`,
-    `src/backend/buffer.rs`, `FINDING/direct-host-buft-forced-staging`, issue #6, PR #22.
+  owner. Duty cycle grows via llama.cpp `GGML_SCHED_NPU_CLAIM_STAGE=1` (default off): claim with
+  `supports_op`, stage foreign inputs into NPU_HOST — never widen foreign `supports_buft`. Selective
+  allowlist stays empty/gated (`GGML_NPU_IMPORT_FOREIGN_HOST=1` insufficient alone). MoE untouched.
+  - Rationale: L0’s broad host contract inflated affinity while Direct cannot import foreign host
+    pointers; claim+stage restores L0-shaped seeding without PR #22’s lie.
+  - Evidence: `docs/direct-buft-residency.md`, `src/backend/buft.rs`, companion llama.cpp#15,
+    issue #6, PR #22, PR #52.
   - Verified: 2026-07-13
 
 ## Verified findings
@@ -168,6 +166,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
     `docs/direct-buft-residency.md`, `benchmarks/results/remediation-pp512-on-stable-locked/`,
     GitHub issue #6, PR #22.
+  - Verified: 2026-07-13
+
+- `FINDING/direct-buft-claim-stage-duty-cycle` — `GGML_SCHED_NPU_CLAIM_STAGE=1` (llama.cpp#15)
+  seeds NPU from host-weight ops without widening Direct `supports_buft`. LFM pp16 r=1 Direct:
+  coalesce=0 claim=0→1 raises disp **412→482** and `our_shared` **2242→2514** (`dishonest_npu_host=0`);
+  coalesce=1 alone regresses 108→94 (re-absorb into Vulkan); coalesce=1+cut-cost raises **348→394**.
+  - Scope: Targeted r=1; not locked pp512; cut-cost measured on anti-unitary binary.
+  - Evidence: `docs/direct-buft-residency.md`, `BENCH/lfm-claim-stage-pp16-targeted`, PR #52,
+    llama.cpp#15, issues #5/#6.
   - Verified: 2026-07-13
 
 - `FINDING/offload-skipped-ffn-glue` — `offload_op` historically pulled only `MUL_MAT` / `SSM_CONV` (plus opt-in ShortConv candidates). FFN glue claimed via `supports_op`/`claims_glue` stayed on foreign buffers unless already placed, so matmul anchors and their silu/mul/residual often split into unitary NPU programs. Policy now dependency-pulls claimed FFN glue and layout under an FFN fusible ancestor, refuses non-claimable runtime-weight `MUL_MAT` pulls, and aligns `FORCE_GRAPH` fusible ancestry depth with `supports_region` (12).
@@ -352,6 +359,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 ## Benchmark baselines
 
 
+- `BENCH/lfm-claim-stage-pp16-targeted` — Claim+stage smokes with llama.cpp#15; LFM Q4_K_M pp16
+  r=1 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS, flock + `ALLOW_HIGH_SWAP=1`,
+  `GGML_NPU_PROFILE=1`: coalesce=0 claim=0 — 412/27.2%/2242 our_shared; claim=1 —
+  **482**/32.4%/**2514**, dishonest=0. coalesce=1+cut=1 claim=0 — 348/32.2%; claim=1 —
+  **394**/39.6% (anti-unitary .so).
+  - Limitation: Soft r=1; not locked pp512; coalesce-only+claim regresses NPU disp.
+  - Evidence: `benchmarks/results/develop-7870cf7-targeted-pp16-sharing-on-coa0-cs*/`,
+    `docs/direct-buft-residency.md`, llama.cpp#15, PR #52.
+  - Reproduce: `GGML_SCHED_NPU_CLAIM_STAGE=1` ± `GGML_SCHED_REGION_COALESCE` / `CUT_COST`
+    with `_run_targeted_smoke.sh` PROMPT_TOKENS=16.
+  - Verified: 2026-07-13
+
 - `BENCH/lfm-post-coverage-8ec283e-targeted` — Develop `8ec283e` (post #45/#46/#47) LFM Q4_K_M
   targeted r=1 sharing-on ShortConv=1 coalesce=1, llama.cpp `9e777bc77` (PR#11 guard), direct-ivpu:
   (1) ATTENTION unset pp16: 400 disp, 28.0% unitary, 100% no-copy, soft 26.1 tok/s;
@@ -423,11 +442,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Measurable drop in handoff bytes and/or splits on short attribution/profile vs coalesce-only; higher NPU duty cycle without inventing unsupported claims; Rust-first in `src/sched/` with thin `get_proc_address` POD export; attribution counters for cut cost / handoff / split shape. Full locked pp512 only when explicitly warranted.
   - Evidence: GitHub issue #48, `src/sched/region_coalesce.rs`, `src/sched/mod.rs`, `ADR/sched-region-coalesce-rust-first`, `docs/sched-region-coalesce.md`, issue #5.
 
-- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks. Buft probe/residency profile lines (`ADR/direct-npu-host-residency`, `docs/direct-buft-residency.md`) land next for short-attribution measurement of L0 `foreign_host` acceptance vs Direct refusal; selective allowlist remains gated off.
-  - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice).
+- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks. PR #52 + llama.cpp#15 add residency attribution and claim+stage (`GGML_SCHED_NPU_CLAIM_STAGE=1`) for L0-shaped duty cycle under coalesce=0 / cut-cost; selective allowlist remains gated off.
+  - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice). Material reduction of `foreign_host_refused` → staged only via proven importable allowlist, never blind widen.
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`,
     `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
-    `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22.
+    `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22, PR #52, llama.cpp#15.
 
 - `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact.
   - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven.
