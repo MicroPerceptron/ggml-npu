@@ -42,8 +42,10 @@ It does **not** run full LFM pp512 and does not require NPU hardware.
 4. Add a matrix row with honest `gate` + proof tags **in the same change**.
 5. Prefer a hermetic `contract:` / `test:` proof first; add `script:` or `issue:#…` for shim/HW
    follow-ups (#9–#11). ShortConv gather/write (#9): hermetic proofs cover connected
-   gather→SSM_CONV→SetRows partitioning and FeasibilityLimit adjacent peels when Intel refuses
-   SSM_CONV+SET_ROWS fusion; shim script remains the numerical gate.
+   gather→SSM_CONV→SetRows **and** LFM-shaped gather→CPY(`cache_r`)→SSM_CONV partitioning, plus
+   FeasibilityLimit adjacent peels when Intel refuses SSM_CONV+state-write fusion (SetRows or
+   CPY); never host-realize those stateful edges as `layout_glue_host`. LFM recurrent writes use
+   `ggml_cpy` into a view of `cache_r*` (not SetRows). Shim script remains the numerical gate.
 6. Re-run `./tests/run_claim_coverage_check.sh`.
 
 ## Full local coverage gate

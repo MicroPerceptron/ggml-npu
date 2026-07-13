@@ -807,7 +807,8 @@ mod tests {
     }
 
     /// Models Intel OpenVINO: unitary ShortConv state ops (and gather+conv) lower, but a single
-    /// program that fuses `SSM_CONV` with `SET_ROWS` is rejected (#9).
+    /// program that fuses `SSM_CONV` with a state write (`SET_ROWS` or LFM `CPY` into cache) is
+    /// rejected (#9).
     struct ShortConvAdjacentVendor {
         ran: core::sync::atomic::AtomicUsize,
     }
@@ -818,6 +819,17 @@ mod tests {
             .iter()
             .filter_map(GraphIr::wire_op)
             .collect()
+    }
+
+    fn has_state_write(ops: &[WireOp], graph: &GraphIr) -> bool {
+        ops.iter().any(|op| *op == WireOp::SetRows)
+            || graph.nodes.iter().any(|node| {
+                GraphIr::wire_op(node) == Some(WireOp::Copy)
+                    && graph
+                        .values
+                        .get(node.output as usize)
+                        .is_some_and(|v| v.role == TensorRole::MutableState)
+            })
     }
 
     impl Vendor for ShortConvAdjacentVendor {
@@ -842,9 +854,8 @@ mod tests {
             }
             let ops = wire_ops(graph);
             let has_ssm = ops.iter().any(|op| *op == WireOp::SsmConv);
-            let has_set = ops.iter().any(|op| *op == WireOp::SetRows);
-            if has_ssm && has_set {
-                return LoweringSupport::Unsupported("ssm_setrows_fusion_rejected");
+            if has_ssm && has_state_write(&ops, graph) {
+                return LoweringSupport::Unsupported("ssm_state_write_fusion_rejected");
             }
             if graph.has_lowerable_compute() {
                 LoweringSupport::Supported
@@ -859,9 +870,8 @@ mod tests {
             );
             let ops = wire_ops(graph);
             assert!(
-                !(ops.iter().any(|op| *op == WireOp::SsmConv)
-                    && ops.iter().any(|op| *op == WireOp::SetRows)),
-                "vendor must not be asked to run fused SSM_CONV+SET_ROWS"
+                !(ops.iter().any(|op| *op == WireOp::SsmConv) && has_state_write(&ops, graph)),
+                "vendor must not be asked to run fused SSM_CONV+state-write"
             );
             self.ran
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1024,5 +1034,105 @@ mod tests {
             graph.nodes.len(),
         )
         .is_none());
+    }
+
+    fn lfm_shortconv_cpy_state_write_graph() -> GraphIr {
+        // Minimal LFM-shaped DAG: CPY into MutableState then SSM_CONV on the shared window.
+        let cpy_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_CPY,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![1, 0],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("Copy must decode");
+        let ssm_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_SSM_CONV,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![1, 3],
+            output: 4,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SsmConv must decode");
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(2),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 8, 8, 8],
+            role,
+            data,
+            owned: role == TensorRole::MutableState,
+            shared: None,
+        };
+        GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::MutableState, 1),  // cache base (cpy dst)
+                tensor(TensorRole::Intermediate, 2),  // window / new_conv src
+                tensor(TensorRole::MutableState, 3),  // cpy output (state write)
+                tensor(TensorRole::Constant, 4),      // conv kernel
+                tensor(TensorRole::Intermediate, 5),  // ssm out
+            ],
+            nodes: alloc::vec![
+                Node {
+                    op: crate::ffi::GGML_OP_CPY,
+                    spec: Ok(cpy_spec),
+                    inputs: alloc::vec![1, 0],
+                    output: 2,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: crate::ffi::GGML_OP_SSM_CONV,
+                    spec: Ok(ssm_spec),
+                    inputs: alloc::vec![1, 3],
+                    output: 4,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+            ],
+            inputs: alloc::vec![0, 1, 3],
+            outputs: alloc::vec![2, 4],
+        }
+    }
+
+    #[test]
+    fn lfm_shortconv_cpy_state_write_peels_adjacent_npu_not_host_glue() {
+        // LFM writes recurrent state with CPY (not SetRows). Connected CPY(state)+SSM_CONV must
+        // peel to FeasibilityLimit adjacent NPU programs when fusion is refused — never
+        // layout_glue_host (#9).
+        let graph = lfm_shortconv_cpy_state_write_graph();
+        assert!(!graph.is_layout_only());
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 1, "connected LFM CPY+SSM_CONV must stay one region");
+
+        let vendor = ShortConvAdjacentVendor {
+            ran: core::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            !vendor.graph_support(&graph).is_supported(),
+            "fused CPY(state)+SSM_CONV must be refused"
+        );
+        let parts = feasible_partitions(&graph, &vendor).expect("must peel adjacent programs");
+        assert!(parts.len() >= 2, "expected adjacent peels, got {}", parts.len());
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.reason != PartitionReason::LayoutGlueHost),
+            "LFM ShortConv state CPY must not be scheduled as layout_glue_host"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.reason == PartitionReason::FeasibilityLimit),
+            "adjacent peels must be feasibility_limit"
+        );
+        assert!(run_partitions(&vendor, &graph));
+        assert_eq!(
+            vendor.ran.load(core::sync::atomic::Ordering::Relaxed),
+            parts.len()
+        );
     }
 }
