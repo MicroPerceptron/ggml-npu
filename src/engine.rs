@@ -805,4 +805,224 @@ mod tests {
         assert!(!run_partitions(&vendor, &graph));
         assert_eq!(vendor.ran.load(core::sync::atomic::Ordering::Relaxed), 0);
     }
+
+    /// Models Intel OpenVINO: unitary ShortConv state ops (and gather+conv) lower, but a single
+    /// program that fuses `SSM_CONV` with `SET_ROWS` is rejected (#9).
+    struct ShortConvAdjacentVendor {
+        ran: core::sync::atomic::AtomicUsize,
+    }
+
+    fn wire_ops(graph: &GraphIr) -> alloc::vec::Vec<WireOp> {
+        graph
+            .nodes
+            .iter()
+            .filter_map(GraphIr::wire_op)
+            .collect()
+    }
+
+    impl Vendor for ShortConvAdjacentVendor {
+        fn name(&self) -> &'static str {
+            "shortconv-adjacent"
+        }
+        fn probe(&self) -> Vec<DeviceInfo> {
+            Vec::new()
+        }
+        fn can_lower(&self, _op: Op, _inputs: &[Operand]) -> bool {
+            true
+        }
+        fn run(&self, _op: Op, _inputs: &[Operand], _output: &Operand) -> bool {
+            true
+        }
+        fn run_subgraph(&self, _sg: &crate::ops::subgraph::Subgraph) -> bool {
+            true
+        }
+        fn graph_support(&self, graph: &GraphIr) -> LoweringSupport {
+            if graph.is_layout_only() {
+                return LoweringSupport::Unsupported("layout_only_unclaimed");
+            }
+            let ops = wire_ops(graph);
+            let has_ssm = ops.iter().any(|op| *op == WireOp::SsmConv);
+            let has_set = ops.iter().any(|op| *op == WireOp::SetRows);
+            if has_ssm && has_set {
+                return LoweringSupport::Unsupported("ssm_setrows_fusion_rejected");
+            }
+            if graph.has_lowerable_compute() {
+                LoweringSupport::Supported
+            } else {
+                LoweringSupport::Unsupported("empty_or_unknown")
+            }
+        }
+        fn run_graph(&self, graph: &GraphIr) -> bool {
+            assert!(
+                !graph.is_layout_only(),
+                "stateful ShortConv must not host-realize as layout glue"
+            );
+            let ops = wire_ops(graph);
+            assert!(
+                !(ops.iter().any(|op| *op == WireOp::SsmConv)
+                    && ops.iter().any(|op| *op == WireOp::SetRows)),
+                "vendor must not be asked to run fused SSM_CONV+SET_ROWS"
+            );
+            self.ran
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        unsafe fn alloc_host(&self, _size: usize) -> *mut c_void {
+            core::ptr::null_mut()
+        }
+        unsafe fn free_host(&self, _ptr: *mut c_void, _size: usize) {}
+    }
+
+    fn shortconv_gather_conv_write_graph() -> GraphIr {
+        // Same connected DAG as graph::connected_shortconv_gather_conv_write_stays_one_region.
+        let get_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_GET_ROWS,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("GetRows must decode");
+        let ssm_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_SSM_CONV,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![2, 3],
+            output: 4,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SsmConv must decode");
+        let set_spec = OpRegistry::decode_node(&Node {
+            op: crate::ffi::GGML_OP_SET_ROWS,
+            spec: Err(crate::graph::OpReject::UnsupportedOp),
+            inputs: alloc::vec![4, 5, 0],
+            output: 6,
+            op_params: [0; OP_PARAM_BYTES],
+        })
+        .expect("SetRows must decode");
+        let tensor = |role, data| TensorDesc {
+            dtype: crate::ffi::GGML_TYPE_F32,
+            dims: [
+                Dim::Static(4),
+                Dim::Static(2),
+                Dim::Static(1),
+                Dim::Static(1),
+            ],
+            strides: [4, 8, 8, 8],
+            role,
+            data,
+            owned: role == TensorRole::MutableState,
+            shared: None,
+        };
+        GraphIr {
+            generation: 1,
+            values: alloc::vec![
+                tensor(TensorRole::MutableState, 1),
+                tensor(TensorRole::RuntimeInput, 2),
+                tensor(TensorRole::Intermediate, 3),
+                tensor(TensorRole::Constant, 4),
+                tensor(TensorRole::Intermediate, 5),
+                tensor(TensorRole::RuntimeInput, 6),
+                tensor(TensorRole::MutableState, 7),
+            ],
+            nodes: alloc::vec![
+                Node {
+                    op: crate::ffi::GGML_OP_GET_ROWS,
+                    spec: Ok(get_spec),
+                    inputs: alloc::vec![0, 1],
+                    output: 2,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: crate::ffi::GGML_OP_SSM_CONV,
+                    spec: Ok(ssm_spec),
+                    inputs: alloc::vec![2, 3],
+                    output: 4,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+                Node {
+                    op: crate::ffi::GGML_OP_SET_ROWS,
+                    spec: Ok(set_spec),
+                    inputs: alloc::vec![4, 5, 0],
+                    output: 6,
+                    op_params: [0; OP_PARAM_BYTES],
+                },
+            ],
+            inputs: alloc::vec![0, 1, 3, 5],
+            outputs: alloc::vec![6],
+        }
+    }
+
+    #[test]
+    fn shortconv_gather_conv_write_splits_to_adjacent_npu_not_host_glue() {
+        // Connected gather→SSM_CONV→SetRows is one semantic region, but Intel rejects fusing
+        // SSM_CONV+SET_ROWS. Engine must peel FeasibilityLimit adjacent NPU programs — never
+        // host-realize stateful edges as layout_glue_host, and never soft-succeed (#9).
+        let graph = shortconv_gather_conv_write_graph();
+        assert!(!graph.is_layout_only());
+        assert!(graph.has_lowerable_compute());
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(regions.len(), 1, "connected ShortConv state must stay one region");
+        assert_eq!(regions[0].reason, PartitionReason::WholeGraph);
+
+        let vendor = ShortConvAdjacentVendor {
+            ran: core::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            !vendor.graph_support(&graph).is_supported(),
+            "whole fused gather/conv/write must be refused by the Intel-shaped vendor"
+        );
+        let parts = feasible_partitions(&graph, &vendor).expect("must peel adjacent programs");
+        assert!(
+            parts.len() >= 2,
+            "expected adjacent FeasibilityLimit programs, got {}",
+            parts.len()
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.reason != PartitionReason::LayoutGlueHost),
+            "stateful ShortConv must not be scheduled as layout_glue_host"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.reason == PartitionReason::FeasibilityLimit),
+            "adjacent peels must be feasibility_limit"
+        );
+        assert!(
+            parts.iter().all(|p| p.graph.has_lowerable_compute()),
+            "every peeled program must remain lowerable compute"
+        );
+        assert!(run_partitions(&vendor, &graph));
+        assert_eq!(
+            vendor.ran.load(core::sync::atomic::Ordering::Relaxed),
+            parts.len(),
+            "each adjacent ShortConv program must actually run on the vendor"
+        );
+    }
+
+    #[test]
+    fn shortconv_stateful_region_is_never_classified_layout_only() {
+        // Host-realize is only for layout metadata beside compute. GetRows/SsmConv/SetRows are
+        // lowerable compute / stateful — claiming them then host-realizing would be soft fallback.
+        let graph = shortconv_gather_conv_write_graph();
+        assert!(!graph.is_layout_only());
+        for node in &graph.nodes {
+            assert!(
+                !GraphIr::node_is_layout_metadata(node),
+                "ShortConv state edge must not look like layout metadata"
+            );
+        }
+        assert!(layout_glue_partition(
+            &graph,
+            &ExecutionPartition {
+                graph: graph.clone(),
+                reason: PartitionReason::WholeGraph,
+                start: 0,
+            },
+            0,
+            graph.nodes.len(),
+        )
+        .is_none());
+    }
 }
