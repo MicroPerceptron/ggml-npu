@@ -485,8 +485,12 @@ impl BufferObject<'_> {
         }
     }
 
-    /// Wait for this BO to become idle. This is meaningful for a command BO only after a future
-    /// validated submission; the wrapper itself is stable UAPI and uses an absolute deadline.
+    /// Wait for this BO to become idle. Meaningful for a command BO after submit.
+    ///
+    /// Stable UAPI: absolute monotonic `timeout_ns`. Prefer session `wait_command_bo` /
+    /// [`health::wait_in_flight`] for hang/cancel-observable sliced waits — a single long
+    /// `BO_WAIT` cannot observe cooperative cancel until it returns, and IVPU has no job-abort
+    /// ioctl.
     pub fn wait_idle(&self, deadline: Deadline) -> Result<u32, RuntimeError> {
         let timeout_ns = match deadline {
             Deadline::Infinite => i64::MAX,

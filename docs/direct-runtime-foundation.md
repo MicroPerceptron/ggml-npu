@@ -120,8 +120,10 @@ GGML_NPU_TEST_ARTIFACT=./artifacts/bounded-vector-add.blob \
 6. **Completion and recovery.** Absolute monotonic deadlines, command-BO wait, success-status
    decoding, and deterministic normal cleanup are proven. Cooperative cancel admission,
    aborted-job vs fault classification, latched device-loss, and firmware-gated reset recovery of
-   the Direct session are software-proven (`src/vendor/ivpu/direct/health.rs`). Kernel in-flight
-   abort and hang-reset after partial execution remain open.
+   the Direct session are software-proven (`src/vendor/ivpu/direct/health.rs`). Hang/cancel-
+   observable sliced `BO_WAIT` after submit and fail-closed `InFlightAbandoned` abandon are also
+   software-proven. Kernel in-flight **job abort** / hang-reset ioctls do not exist on current
+   IVPU UAPI and remain a firmware residual (`CONSTRAINT/ivpu-no-job-abort-ioctl`).
 7. **Redistributable artifact.** The local cached tiny vector-add artifact is proven, but its source,
    toolchain identity, and redistribution status must be recorded before it can be a portable CI
    fixture. A separately versioned tiny matmul remains useful for broader primitive coverage.
@@ -185,13 +187,15 @@ or admission depend on transient pressure after a graph has been claimed.
 - Submit: **direct proven for two serial submissions of one tiny artifact in one explicit queue**;
   Level Zero proven.
 - Wait/events: **direct command-BO completion and success status proven**; general event objects
-  remain unsupported. Cooperative cancel admission, aborted-job classification, and latched
-  device-loss with explicit firmware-gated reset are software-proven (`direct::health`). Level Zero
-  proven for broader event objects.
+  remain unsupported. Cooperative cancel admission, aborted-job classification, latched
+  device-loss with explicit firmware-gated reset, and hang/cancel-observable sliced waits with
+  `InFlightAbandoned` abandon are software-proven (`direct::health`). Level Zero proven for
+  broader event objects.
 - Cleanup/recovery: **direct deterministic cleanup proven on successful execution and injected
   allocation/device failures**; latched device-loss refuses further dispatch until
-  `try_reset_after_fault` re-validates firmware pins and drops resident programs. Kernel-driven
-  hang recovery and in-flight abort ioctls remain unproven. Level Zero cleanup proven.
+  `try_reset_after_fault` re-validates firmware pins and drops resident programs. Userspace hang
+  detection abandons wait and latches loss; **kernel job-abort / hang-reset ioctls are absent**
+  from IVPU UAPI (firmware residual). Level Zero cleanup proven.
 - Numerical parity: **direct vector-add output matched Level Zero bit-for-bit for all 32 FP32
   elements across both submissions**. Hermetic differential-oracle hooks
   (`direct::oracle::{compare_f32,binding_meta_matches,structural_matches}`) plus a
@@ -209,6 +213,6 @@ or admission depend on transient pressure after a graph has been claimed.
   28,479,488-byte ceiling. The observed direct output exactly matched the Level Zero oracle
   (`max_absolute = 0`, `max_relative = 0`, tolerance `1e-5`).
 - General artifact caching, asynchronous events, and broader numerical operation coverage remain
-  unsupported. Session-level cancel/device-loss/reset and hermetic differential-oracle hooks are
-  landed; kernel abort and model-corpus Direct↔L0 parity remain required before retiring
-  `level-zero-compat`.
+  unsupported. Session-level cancel/device-loss/reset, hang/cancel-observable sliced waits, and
+  hermetic differential-oracle hooks are landed; model-corpus Direct↔L0 parity remain required
+  before retiring `level-zero-compat`. Kernel job abort remains a documented firmware residual.

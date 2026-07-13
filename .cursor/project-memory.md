@@ -241,6 +241,19 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `docs/direct-runtime-foundation.md`, ignored hardware test `vendor::ivpu::direct::tests::tiny_known_answer_direct_submission`.
   - Verified: 2026-07-11
 
+- `FINDING/direct-hang-userspace-abandon` — Beyond #57 cooperative cancel (pre-admit) and
+  post-classified fault reset, Direct dispatch waits use sliced absolute `BO_WAIT`
+  (`health::wait_in_flight`, 50 ms default slices, 2 s overall). Cancel observed while a
+  command BO is busy abandons the wait and latches `FaultReason::InFlightAbandoned`
+  (fail-closed; further admit refused until firmware-gated reset). Overall hang deadline
+  still latches `DeadlineExpired`. Hermetic tests cover slice success, cancel abandon,
+  hang deadline, and pre-wait cancel. Does **not** stop firmware — see
+  `CONSTRAINT/ivpu-no-job-abort-ioctl`.
+  - Scope: Direct session/runtime wait/cancel/fault paths only; no sched/claim/MoE.
+  - Evidence: `src/vendor/ivpu/direct/health.rs`, `src/vendor/ivpu/session.rs`,
+    `docs/retire-level-zero-compat.md`, `docs/direct-runtime-foundation.md`, issue #63.
+  - Verified: 2026-07-13
+
 - `FINDING/compiler-source-pins` — The inspected compiler sources are pinned to Intel `30d2bb87b3044d4b8304009876299c560d224adb`, AMD `af5a158e7c97cee5b375c372e76269910b159553`, and Qualcomm `9b4b8fcea2b93c801b5de784ee750ca9350d504f`; recursive submodule initialization is required for supported compiler builds.
   - Evidence: `.gitmodules`, `docs/compiler-migration-plan.md`, submodule metadata.
   - Verified: 2026-07-12
@@ -417,6 +430,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 - `CONSTRAINT/direct-ivpu-release-pins` — Direct IVPU depends on Linux stable accel UAPI plus separately versioned Intel firmware and ELF-loader ABIs. Firmware/loader versions must remain release-pinned and mismatches must be rejected.
   - Evidence: `docs/direct-runtime-foundation.md`, `src/vendor/ivpu/direct/`.
   - Verified: 2026-07-12
+
+- `CONSTRAINT/ivpu-no-job-abort-ioctl` — Linux `intel_vpu` UAPI exposes `DRM_IOCTL_IVPU_BO_WAIT`
+  (absolute monotonic timeout + job status) but **no** job-abort / hang-reset ioctl. Userspace
+  cannot preempt or kill an in-flight command BO; after submit, cancel/hang handling is limited to
+  sliced wait observation, abandoning the wait, latching device-loss, and requiring
+  firmware-gated reset. Do not invent a fake abort path or block L0 retirement on that missing UAPI.
+  - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-runtime-foundation.md`,
+    `src/vendor/ivpu/direct/uapi.rs`, `src/vendor/ivpu/direct/health.rs`, installed
+    `ivpu_accel.h` (`DRM_IVPU_BO_WAIT` only).
+  - Verified: 2026-07-13
 
 ## Rejected alternatives
 
@@ -801,21 +824,23 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   #56 closed); ELF pad binding cover (PR #62); claim-stage LFM duty-cycle **shape** near L0
   (tip locked ~**247** tok/s / ~**470** disp vs L0 ~**266** / ~**488** —
   `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`;
-  prior tip `371b06d` ~205); **corpus parity harness** landed
-  (`docs/direct-l0-corpus-parity.md`, `tests/direct_l0_corpus/manifest.csv`,
+  prior tip `371b06d` ~205); hang/in-flight **userspace** mitigation (sliced `BO_WAIT` +
+  `InFlightAbandoned` latch; `CONSTRAINT/ivpu-no-job-abort-ioctl`); **corpus parity harness**
+  landed (`docs/direct-l0-corpus-parity.md`, `tests/direct_l0_corpus/manifest.csv`,
   `benchmarks/run_direct_l0_corpus_parity.sh`) with hermetic structural goldens + lab
   Direct↔L0 binding/numeric gate on six representative blobs
   (`FINDING/direct-l0-corpus-parity-harness`).
   - Acceptance (delete blockers): expand/record corpus Direct↔L0 parity beyond the initial
     six-blob harness (full agreed LFM set / non-FP32 numeric / import-copy duty cycle);
-    in-flight hang abort beyond cooperative cancel/post-fault reset; required Direct op
-    coverage leftovers (#9/#10/#11) without depending on L0; product default-on knobs for
-    claim-stage/coalesce/cut-cost with regression gates. Non-gates: full tok/s gap to Vulkan
-    (#4), anti-unitary cut-cost finish (#48/#5), widening Direct `supports_buft`, OpenVINO
-    removal.
+    required Direct op coverage leftovers (#9/#10/#11) without depending on L0; product
+    default-on knobs for claim-stage/coalesce/cut-cost with regression gates. Non-gates:
+    full tok/s gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5), widening Direct
+    `supports_buft`, OpenVINO removal, kernel job-abort ioctl.
   - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-l0-corpus-parity.md`,
-    `docs/direct-runtime-foundation.md`, `src/vendor/ivpu/direct/corpus.rs`,
-    `src/vendor/ivpu/direct/oracle.rs`, PRs #57/#59/#62/#64, issues #56/#63,
+    `docs/direct-runtime-foundation.md`, `docs/compiler-migration-plan.md`,
+    `src/vendor/ivpu/direct/corpus.rs`, `src/vendor/ivpu/direct/oracle.rs`,
+    `src/vendor/ivpu/direct/health.rs`, `src/vendor/ivpu/session.rs`,
+    PRs #57/#59/#62/#64/#67/#68, issues #56/#63,
     `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`,
     `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`.
 
