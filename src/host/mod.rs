@@ -157,8 +157,13 @@ pub(crate) trait ConfigService {
     /// Presence alone is not enough — harnesses and docs use `VAR=0` to mean off
     /// (`GGML_NPU_MOE=0` in targeted smokes). Matching `is_set` would falsely enable.
     fn is_opt_in_one(&self, name: &CStr) -> bool {
+        self.is_exact(name, b"1")
+    }
+
+    /// Exact-value opt-in (e.g. `GGML_NPU_ATTENTION=full`). Presence or any other value stays off.
+    fn is_exact(&self, name: &CStr, expected: &[u8]) -> bool {
         self.value(name)
-            .is_some_and(|value| value.to_bytes() == b"1")
+            .is_some_and(|value| value.to_bytes() == expected)
     }
 }
 

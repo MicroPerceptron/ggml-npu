@@ -73,3 +73,22 @@ PR #32/#35). Contract:
 
 Agent rule: `.cursor/rules/npu-claim-fallback.mdc`. ADR: `ADR/capability-contract-fail-closed` in
 `.cursor/project-memory.md`.
+
+## Attention gates (`GGML_NPU_ATTENTION`)
+
+Issue [#10](https://github.com/MicroPerceptron/ggml-npu/issues/10). Exact value `full` opts into the
+attention core; `=1`, presence-only, or unset keeps SoftMax / FlashAttention / runtime-weight
+matmuls unclaimed (fail-closed; no vanity claim). Prefill RoPE (modes 0|2), Permute, and KV-cache
+continuity pulls do **not** require this gate (PR #39).
+
+| Surface | Default | `ATTENTION=full` | Supported variants |
+| --- | --- | --- | --- |
+| SoftMax | unclaim | capability + fusible pull under an anchor | `max_bias == 0`; arity 1–2 (optional mask); scale in `op_params[0]` |
+| FlashAttention | unclaim | capability + anchor pull | `max_bias == 0` and `logit_softcap == 0`; arity 3–4; GQA when query heads divisible by KV heads |
+| Runtime-weight MatMul (KQ/KQV) | unclaim + no `offload_op` pull | capability + work-floor pull | same MatMul lowering as const-weight; weight is a non-`NONE` producer |
+| Const-weight MatMul / RoPE / KV SetRows | claimable without `full` | unchanged | see prefill QKV row / ShortConv docs |
+
+Shim numerical proofs for SoftMax and FlashAttention live in `tests/graph_ir_shortconv_check.c`
+(gate=`shim`). Hermetic contract tests cover decode variants and the env gate without NPU hardware.
+Do not cite tok/s movement from enabling `ATTENTION=full` without a measured attribution run.
+
