@@ -4,26 +4,33 @@ Prefill-oriented prototype: widen **same-backend feasible intervals** before
 `ggml_backend_sched` cuts the graph on backend color changes. Inspired by
 axiom/kore bit-row set algebra for DAG intervals — **not** a Q1 tensor port.
 
+Weighted **cut-cost** mode (GitHub #48) prices handoff edges and prefers fat
+NPU regions without inventing claims.
+
 ## Division of responsibility
 
 | Layer | Owns |
 |-------|------|
-| **Rust (`src/sched/region_coalesce.rs`)** | Interval / island analysis, recolor decisions, unit tests |
-| **llama.cpp scheduler hook** | Pack POD rows (`backend_id`, `feasible_mask`, flags), resolve `ggml_backend_sched_region_coalesce` via `get_proc_address`, apply results; env gate |
+| **Rust (`src/sched/`)** | Interval / island analysis, cut-cost scoring, recolor decisions, unit tests |
+| **llama.cpp scheduler hook** | Pack POD rows, resolve `ggml_backend_sched_region_coalesce[_v2]` via `get_proc_address`, apply results behind buft-safe guards; env gates |
 | **ggml-npu `offload_op` / policy** | Profitability and claim honesty — unchanged |
 
 Default behavior is unchanged when the env flag is off **or** no provider is
-loaded.
+loaded. Algorithm stays in Rust (cdylib/`rlib`) so deps and `core::simd` are
+free of llama.cpp/ggml C++ ABI constraints; only thin POD crosses the boundary.
 
-## Flag
+## Flags
 
 - `GGML_SCHED_REGION_COALESCE=1` — enable pass (scheduler must resolve the Rust
   ABI from a loaded backend registry, typically `libggml_npu.so`).
 - `GGML_SCHED_REGION_COALESCE=2` — enable + verbose flip / reassignment dump.
 - `GGML_SCHED_REGION_COALESCE_MAX_ISLAND` — max foreign run length to absorb
   (default `4`).
+- `GGML_SCHED_CUT_COST=1` — use **v2** ABI with nbytes + backend kinds; enable
+  weighted / NPU-preserving absorb gates (`OPT_WEIGHTED`). Requires coalesce ≥1.
+  Falls back to v1 if the v2 symbol is missing.
 
-## Algorithm (v0)
+## Algorithm (v0 / length-only)
 
 After llama.cpp assignment passes 1–4, for non-view nodes in topo order:
 
@@ -46,9 +53,26 @@ Does **not** invent NPU claims: feasibility comes from the scheduler’s
 `supports_op` packing. Weights / `INPUT` stay pinned. Rust leaves `VIEW` rows
 unchanged so the host can honor the view_src invariant.
 
+## Cut-cost mode (v1 / #48 MVP)
+
+When `GGML_SCHED_CUT_COST=1`, the v2 provider additionally:
+
+1. Scores sandwich edges as `nbytes × handoff_factor(from_kind, to_kind)`
+   (heuristic table; NPU↔GPU highest).
+2. **Preserve fat NPU islands** (multi-op or ≥64 KiB) instead of dissolving them
+   into Vulkan/CPU; tiny unitary NPU sandwiches may still dissolve so buft-safe
+   coalesce duty-cycle wins are not undone.
+3. Always absorbs feasible foreign islands **onto** NPU.
+4. Boosts effective `max_island` across heavy (≥256 KiB / ≥1 MiB) NPU
+   boundaries so fat prefill glue can merge.
+5. Uses `core::simd` (`portable-simd` feature) to batch nbytes×factor products
+   when attributing total cut cost along a coloring.
+
+MoE fail-closed policy is untouched (`is_opt_in_one`; Argsort/MatMulId unclaim).
+
 ## C ABI
 
-Symbol (exported from the NPU registry):
+### v1
 
 ```c
 #define GGML_SCHED_REGION_COALESCE_FLAG_VIEW   (1u << 0)
@@ -69,17 +93,41 @@ typedef int (*ggml_backend_sched_region_coalesce_t)(
 
 Proc name: `ggml_backend_sched_region_coalesce`.
 
+### v2 (cut-cost)
+
+```c
+#define GGML_SCHED_CUT_COST_OPT_WEIGHTED (1u << 0)
+
+struct ggml_sched_cut_cost_node {
+    int32_t  backend_id;
+    uint32_t feasible_mask;
+    uint32_t flags;
+    uint32_t nbytes;
+};
+
+typedef int (*ggml_backend_sched_region_coalesce_v2_t)(
+    struct ggml_sched_cut_cost_node * nodes,
+    int n_nodes,
+    int n_backends,
+    int max_island,
+    const uint8_t * backend_kinds, /* ggml_backend_dev_type per backend */
+    uint32_t options);
+```
+
+Proc name: `ggml_backend_sched_region_coalesce_v2`.
+
 LTO / same-process dynamic load is assumed to keep FFI cost negligible vs split
 overhead.
 
-## Future (stubs)
+## Future
 
-- Edge-cost weighting: handoff bytes × backend hop instead of island length alone.
-- Full bit-row reachability for non-linear “maximal feasible regions.”
+- Full bit-row reachability for non-linear maximal feasible regions.
+- Calibrated handoff factors from short attribution (not a live BW oracle).
 - Layer-windowed analysis for multi-thousand-node prefill graphs.
+- Explicit cut-cost / handoff-byte counters in profile dumps.
 
 ## Tests
 
 ```bash
-cargo test -p ggml-npu sched::region_coalesce
+cargo test -p ggml-npu sched::
 ```
