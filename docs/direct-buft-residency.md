@@ -21,17 +21,31 @@ unimportable” staging path (`FINDING/direct-host-buft-forced-staging`).
 ## Duty-cycle fix: claim + explicit stage (not supports_buft)
 
 NPU is a spillover tier (no `-ngl` weight ownership). L0 faked affinity by accepting every
-host buft. Direct keeps that probe **false** and instead:
+host buft. Direct keeps that probe **false** and instead opts into:
 
-1. **`GGML_SCHED_NPU_CLAIM_STAGE`** (llama.cpp; default on, `=0` disables) lets
-   `offload_op` pull profitable ops whose weights/inputs live on foreign bufts
-   (cause `1.npu`). Split creation copies unsupported inputs into the NPU buffer type.
+1. **`GGML_SCHED_NPU_CLAIM_STAGE=1`** (llama.cpp; **default off**) lets `supports_op`
+   pull host-weight ops onto NPU before the CPU→GPU offload loop (cause `1.npu`). Split
+   creation copies unsupported inputs into the NPU buffer type.
 2. Those copies and gallocr temps land on real **`SharedAllocationOwner` `NPU_HOST`**, so
    `backend_from_buffer` can keep subsequent affinity honestly (`our_shared` ↑).
 3. `supports_buft` stays narrow — foreign probes still increment `foreign_host_refused`.
 
 This is safe vs PR #22 because we never advertise an unsupported buft as supported; staging
 is explicit in the scheduler copy path.
+
+### Measured (pp16 r=1, Direct, FlexiBLAS)
+
+| Config | disp | unitary% | our_shared | notes |
+| --- | ---: | ---: | ---: | --- |
+| coalesce=1 claim=0 (e563d09) | 108 | 55.6 | 438 | coalesce-only baseline |
+| coalesce=0 claim=0 | 412 | 27.2 | 2242 | coalesce-off unitary class |
+| coalesce=0 claim=1 | **482** | 32.4 | **2514** | L0-shaped (~488); `dishonest=0` |
+| coalesce=1 claim=1 | 94 | 66.0 | 350 | coalesce re-absorbs NPU→Vulkan |
+| coalesce=1 cut=1 claim=0 | 348 | 32.2 | — | cut-cost fat-preserve |
+| coalesce=1 cut=1 claim=1 | **394** | 39.6 | — | claim+stage + fat-preserve |
+
+Use claim+stage with **coalesce=0** or **cut-cost fat-preserve**; do not expect a win from
+claim+stage under coalesce-only.
 
 ## Attribution
 
