@@ -436,6 +436,17 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     let Ok(spec) = OpRegistry::decode_tensor(node) else {
         return false;
     };
+    // GGML_NPU_SCHED=auto: decode/M=1 is a Direct dispatch floor — prefer unclaim so
+    // Vulkan/host run gen. Prefill-sized batches keep the existing pull policy; llama.cpp
+    // also suspends auto-applied claim/cut/coalesce on decode graphs. FORCE_GRAPH below
+    // still wins for deliberate NPU decode experiments (#5/#4).
+    if crate::sched::auto::auto_decode_prefer_unclaim(node)
+        && !crate::host::builtin()
+            .config()
+            .is_set(c"GGML_NPU_FORCE_GRAPH")
+    {
+        return false;
+    }
     if crate::host::builtin()
         .config()
         .is_set(c"GGML_NPU_LFM_SHORTCONV")
