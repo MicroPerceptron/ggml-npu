@@ -30,14 +30,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   absorption / uneconomic-cut heuristics) lives in `no_std` Rust
   (`src/sched/region_coalesce.rs`) and is exported as
   `ggml_backend_sched_region_coalesce` via registry `get_proc_address`. The llama.cpp
-  scheduler only packs POD rows and applies results behind
-  `GGML_SCHED_REGION_COALESCE` (default off). Claim profitability stays in `offload_op` /
-  policy; the pass must not invent NPU claims.
+  scheduler packs POD rows and applies results behind `GGML_SCHED_REGION_COALESCE`
+  (default off), applying only NPU/same-buft targets and re-syncing views to
+  `view_src` (Vulkan-sandwich absorbs are refused). Claim profitability stays in
+  `offload_op` / policy; the pass must not invent NPU claims; Rust leaves `VIEW` rows
+  untouched for the host sync.
   - Rationale: Safety and bitset/interval analysis belong in Rust; LTO/same-process load
     mitigates FFI cost vs split overhead. Avoids growing opaque C++ scheduler logic.
+    Host apply guards prevent Vulkan buffer inconsistency (pp128 SEGV).
   - Evidence: `docs/sched-region-coalesce.md`, `src/sched/region_coalesce.rs`,
-    `src/backend/shell.rs`, PR #41; companion llama.cpp thin hook PR MicroPerceptron/llama.cpp#10.
-  - Verified: 2026-07-12
+    `src/backend/shell.rs`, PR #41/#44; companion llama.cpp hook PRs
+    MicroPerceptron/llama.cpp#10/#11.
+  - Verified: 2026-07-13
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
   - Rationale: Amortize compile cost without double-keeping uncompressed blobs in the vendor session cache.
@@ -90,6 +94,21 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Verified findings
+
+
+- `FINDING/sched-region-coalesce-pp128-vulkan-segv` — Unguarded `GGML_SCHED_REGION_COALESCE=1`
+  island absorb into Vulkan left incompatible buffers inside Vulkan splits; LFM pp128
+  SIGSEGV in `ggml_vk_build_graph` (pp16 survived). Fix: llama.cpp apply only NPU/same-buft
+  + `view_src` sync (PR MicroPerceptron/llama.cpp#11); Rust leaves views untouched and
+  documents the contract (ggml-npu PR #44). Nearest-neighbor view paint rejected (broke
+  weight views, still crashed).
+  - Scope: Prefill coalesce enablement safety; not a claim that Vulkan-sandwich absorbs are
+    restored or that pp16 66-disp coalesce wins return under the NPU-only guard.
+  - Evidence: `docs/sched-region-coalesce.md`, `src/sched/region_coalesce.rs`,
+    `benchmarks/results/develop-ab3eceb-targeted-pp128-sharing-on-coalesce/`,
+    `benchmarks/results/fix-coalesce-view-pp128-sharing-on-coalesce/`, GitHub #5, PRs #44 /
+    llama.cpp#11.
+  - Verified: 2026-07-13
 
 - `FINDING/direct-ivpu-tiny-execution` — Lunar Lake device `0x643e` revision 4 executed the same 45,192-byte vector-add artifact twice through direct IVPU. All 32 FP32 outputs were bit-identical to the Level Zero oracle; waits were bounded and successful cleanup restored the observed FD and device-memory baselines.
   - Scope: Tiny known-answer artifact only; general operation coverage, cancellation, and reset recovery remain unproven.
@@ -194,6 +213,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Rejected alternatives
 
+
+- `REJECTED/sched-coalesce-nearest-view-paint` — Do not paint coalesce `VIEW` rows to the nearest
+  preceding non-view backend in Rust. That broke weight views (buffers often unset at pin time)
+  and still SIGSEGV’d on pp128; host must sync views to `view_src` after guarded apply.
+  - Rationale: ggml invariant is view↔view_src backend identity, not split-neighbor color.
+  - Evidence: `FINDING/sched-region-coalesce-pp128-vulkan-segv`, `docs/sched-region-coalesce.md`,
+    PR #44 / llama.cpp#11.
+  - Verified: 2026-07-13
+
 - `REJECTED/sched-coalesce-core-in-ggml-backend-cpp` — Do not implement bitmat/interval
   same-backend region coalesce inside llama.cpp `ggml-backend.cpp`. Keep a thin C hook
   only; algorithm stays in ggml-npu Rust.
@@ -244,6 +272,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Benchmark baselines
 
+
+- `BENCH/lfm-pp128-coalesce-guarded-fix` — After ggml-npu PR #44 + llama.cpp PR #11, LFM Q4_K_M
+  pp128 r=1 sharing-on ShortConv=1 MoE=0 `GGML_SCHED_REGION_COALESCE=1`: exit 0, 12 NPU
+  dispatches, 50% unitary, avg nodes 3.00, soft ~83.2 tok/s (no SEGV). Matches coalesce-off
+  dispatch shape on this prompt; prior unguarded coalesce crashed.
+  - Limitation: Soft r=1 only; not locked pp512; NPU-only apply does not restore pp16’s prior
+    66-disp Vulkan-absorb win.
+  - Evidence: `benchmarks/results/fix-coalesce-view-pp128-sharing-on-coalesce/`, GitHub #5.
+  - Verified: 2026-07-13
+
 - `BENCH/lfm-pp512-direct-ivpu-aace217` — LFM2.5 8B.A1B Q4_K Medium pp512 on Lunar Lake, OpenVINO native-artifact compilation plus direct-IVPU submission, full attention placement, flash attention on, direct MoE disabled, scheduler fallback allowed, 8 threads and 3 repetitions: `8.292 ± 0.147 tok/s`, `61.758 ± 1.097 s`; 632 direct dispatches, 6.21 GiB peak RSS, and 3.19 GiB NPU high-water usage.
   - Limitation: All 2,976 bindings bounced, so this is an execution proof/baseline, not zero-copy performance.
   - Evidence: `benchmarks/results/20260712T043711Z-npu/summary.txt`, `benchmarks/results/20260712T043711Z-npu/stderr.txt`.
@@ -275,7 +313,7 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse. Next: short attribution for NPU dispatch/bytes vs `BENCH/lfm-pp512-develop-5db8513-post-unclaim`; safe async overlap only after per-submission completion objects.
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse. PR #44 + llama.cpp#11 guard coalesce apply (`FINDING/sched-region-coalesce-pp128-vulkan-segv`). Next: buffer-safe Vulkan-sandwich absorbs (restore pp16 66-disp class wins); short attribution vs `BENCH/lfm-pp512-develop-5db8513-post-unclaim`; safe async overlap only after per-submission completion objects.
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, **or** (post-unclaim) a clearly larger proven NPU duty cycle (dispatches/bytes/avg nodes) vs `5db8513` 24 / 0.09 GiB without soft-success; attribution hooks and tok/s movement toward Vulkan under the locked harness.
   - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, `src/sched/region_coalesce.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39, PR #41.
 
