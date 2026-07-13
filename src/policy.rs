@@ -76,20 +76,45 @@ unsafe fn has_shortconv_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
             .any(|src| has_shortconv_ancestor(src, depth - 1))
 }
 
+/// True when `t` or its immediate view chain names LFM recurrent state (`cache_r*`).
+///
+/// LFM writes ShortConv state with `ggml_cpy` into a view of `cache_r_lN` (see
+/// `models/lfm2.cpp`). The CPY node is itself a view whose name is often
+/// `"… (copy of …)"` without `cache_r`, while `view_src` still points at the cache
+/// tensor — so name-only checks miss the write edge (#9).
+unsafe fn tensor_or_view_names_cache_r(t: *const ggml_tensor) -> bool {
+    let mut cur = t;
+    // Bound the chain: view_src graphs are shallow (cpy → view_1d → cache).
+    for _ in 0..4 {
+        if cur.is_null() {
+            return false;
+        }
+        if name_contains(cur, b"cache_r") {
+            return true;
+        }
+        let next = (*cur).view_src as *const ggml_tensor;
+        if next.is_null() || core::ptr::eq(next, cur) {
+            return false;
+        }
+        cur = next;
+    }
+    false
+}
+
 /// LFM ShortConv recurrent cache is `cache_r_lN` (see llama.cpp `pattern_r_cache`). Attention KV
 /// uses `cache_k` / `cache_v` and must stay out of this opt-in pull path (#9 / #10).
 unsafe fn touches_shortconv_state(t: *const ggml_tensor) -> bool {
     if t.is_null() {
         return false;
     }
-    if name_contains(t, b"cache_r") {
+    if tensor_or_view_names_cache_r(t) {
         return true;
     }
     (*t).src
         .iter()
         .copied()
         .filter(|src| !src.is_null())
-        .any(|src| name_contains(src, b"cache_r"))
+        .any(|src| tensor_or_view_names_cache_r(src))
 }
 
 fn is_shortconv_state_op(op: ggml_op) -> bool {
@@ -115,6 +140,9 @@ fn shortconv_should_pull(placement: PlacementClass, op: ggml_op) -> bool {
     match placement {
         // Stateful SET_ROWS / SSM_CONV are first-class ShortConv state edges; other Stateful
         // ops stay gated so attention-side state does not ride this opt-in.
+        // Fusible GET_ROWS / CPY and other shortconv-neighbourhood glue use `_ => true` once
+        // `is_shortconv_candidate` has already scoped to `.conv.` / `cache_r*` (LFM writes
+        // recurrent state via CPY into a view of `cache_r*`, not SetRows — #9).
         PlacementClass::Stateful => is_shortconv_state_op(op),
         _ => true,
     }

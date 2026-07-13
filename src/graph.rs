@@ -350,7 +350,9 @@ fn traits_for(wire: WireOp) -> OpTraits {
         // RoPE is QKV-adjacent position encoding (LFM NEOX mode 2 / normal mode 0); gating it
         // with SoftMax/FA forced prefill QKV-proj islands onto CPU/GPU (#10). Permute is layout
         // metadata like Reshape/View — fused-only via placement, not an attention-core gate.
-        // SetRows is mutable-state scatter (ShortConv / KV cache), not SoftMax/FA (#9/#10).
+        // SetRows is mutable-state scatter (KV cache / generic). LFM ShortConv recurrent writes
+        // use CPY into a view of `cache_r*` (not SetRows); those are stateful via MutableState
+        // tensor role at capture time, not this WireOp trait (#9).
         attention: matches!(wire, WireOp::SoftMax | WireOp::FlashAttention),
         moe: matches!(
             wire,
@@ -1497,6 +1499,78 @@ mod tests {
         let regions = graph.execution_regions(PartitionPolicy::default());
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].graph.nodes.len(), 3);
+        assert_eq!(regions[0].reason, PartitionReason::WholeGraph);
+    }
+
+    #[test]
+    fn connected_lfm_shortconv_cpy_state_write_stays_one_region() {
+        // LFM ShortConv (`models/lfm2.cpp`): gather state → concat/window → CPY into cache_r
+        // view → SSM_CONV on the window. CPY is the recurrent write (not SetRows). Connected
+        // mutable effects must stay one region; Intel may still refuse fusing SSM_CONV with the
+        // state CPY — engine peels FeasibilityLimit adjacent programs (#9).
+        let mut state_in = value(TensorRole::MutableState, 1, Dim::Static(4));
+        state_in.owned = true;
+        let values = vec![
+            state_in,                                           // 0 cache_r base
+            value(TensorRole::RuntimeInput, 2, Dim::Static(2)), // 1 gather indices
+            value(TensorRole::Intermediate, 3, Dim::Static(4)), // 2 gathered rows
+            value(TensorRole::RuntimeInput, 4, Dim::Static(4)), // 3 new window columns
+            value(TensorRole::Intermediate, 5, Dim::Static(8)), // 4 concat window
+            value(TensorRole::Intermediate, 6, Dim::Static(4)), // 5 new_conv view src
+            value(TensorRole::MutableState, 7, Dim::Static(4)), // 6 CPY into cache view
+            value(TensorRole::Constant, 8, Dim::Static(3)),     // 7 conv kernel
+            value(TensorRole::Intermediate, 9, Dim::Static(2)), // 8 SSM_CONV out
+        ];
+        let get_rows = Node {
+            op: GGML_OP_GET_ROWS,
+            spec: decode_spec(GGML_OP_GET_ROWS, 0, 0.0, 0, 2),
+            inputs: vec![0, 1],
+            output: 2,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let concat = Node {
+            op: GGML_OP_CONCAT,
+            spec: decode_spec(GGML_OP_CONCAT, 0, 0.0, 0, 2),
+            inputs: vec![2, 3],
+            output: 4,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        // View of the trailing window columns that become the new recurrent state.
+        let new_conv = Node {
+            op: GGML_OP_VIEW,
+            spec: decode_spec(GGML_OP_VIEW, 0, 0.0, 0, 1),
+            inputs: vec![4],
+            output: 5,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let cpy = Node {
+            op: GGML_OP_CPY,
+            spec: decode_spec(GGML_OP_CPY, 0, 0.0, 0, 2),
+            inputs: vec![5, 0],
+            output: 6,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let ssm = Node {
+            op: GGML_OP_SSM_CONV,
+            spec: decode_spec(GGML_OP_SSM_CONV, 0, 0.0, 0, 2),
+            inputs: vec![4, 7],
+            output: 8,
+            op_params: [0; OP_PARAM_BYTES],
+        };
+        let graph = GraphIr {
+            generation: 1,
+            values,
+            nodes: vec![get_rows, concat, new_conv, cpy, ssm],
+            inputs: vec![0, 1, 3, 7],
+            outputs: vec![6, 8],
+        };
+        let regions = graph.execution_regions(PartitionPolicy::default());
+        assert_eq!(
+            regions.len(),
+            1,
+            "LFM gather→CPY(cache_r)→SSM_CONV must stay one connected region"
+        );
+        assert_eq!(regions[0].graph.nodes.len(), 5);
         assert_eq!(regions[0].reason, PartitionReason::WholeGraph);
     }
 
