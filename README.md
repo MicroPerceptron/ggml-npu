@@ -114,11 +114,11 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
   the default keeps the attention core on GPU while allowing constant-weight/QKV projections,
   RoPE (normal/NEOX), and KV-cache SetRows needed for contiguous prefill QKV regions. Exact
   `full` only — `=1` / presence is not enough. See `docs/coverage-gates.md`.
-- `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path
-  (Argsort/Sigmoid/SumRows/MatMulId). `GGML_NPU_MOE=0` or unset keeps MoE routing **unclaimed**
-  (presence of `=0` must not enable). Packed expert banks use canonical requant fallback; float
-  f16/bf16 banks gather directly. Output-head-scale MatMuls stay unclaimed under the expanded
-  constant budget (prefer GPU) unless `GGML_NPU_ALLOW_GIANT_CONSTANTS` is set — see
+- `GGML_NPU_MOE=1` opts into experimental MoE glue (Sigmoid/SumRows). Argsort expert ids and
+  MatMulId stay **unclaimed** until model-scale evidence — host/Vulkan must produce ids and run
+  routed experts. `GGML_NPU_MOE=0` or unset keeps MoE routing **unclaimed** (presence of `=0`
+  must not enable). Output-head-scale MatMuls stay unclaimed under the expanded constant budget
+  (prefer GPU) unless `GGML_NPU_ALLOW_GIANT_CONSTANTS` is set — see
   [`docs/coverage-gates.md`](docs/coverage-gates.md) (#11).
 - `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
 - `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
