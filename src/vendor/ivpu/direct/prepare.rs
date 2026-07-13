@@ -416,6 +416,59 @@ fn create_hpi<'device>(
     Ok((bo, info.bytes))
 }
 
+/// Whether a host shared view can back an ELF binding section without overrun.
+///
+/// OpenVINO often pads `allocation_bytes` past the logical tensor size. Claim+stage
+/// NPU_HOST tensors are typically sized to exact `nbytes`, so the padded section may
+/// not fit past `view.offset` even when the logical bytes match — that must stage-copy
+/// into a fresh BO rather than abort as `BindingMismatch` (pp512 MatMul+Swiglu).
+fn shared_view_covers_requirement(
+    view: &SharedAllocationView,
+    requirement: &BindingRequirement,
+) -> bool {
+    let requested = requirement.allocation_bytes.max(1) as usize;
+    let logical = requirement.bytes as usize;
+    view.bytes >= logical
+        && view
+            .offset
+            .checked_add(requested)
+            .is_some_and(|end| end <= view.allocation_bytes)
+}
+
+fn allocate_binding_bo<'device>(
+    device: &'device IvpuDevice,
+    requirement: &BindingRequirement,
+    timings: &mut PreparationTimings,
+    measure: bool,
+) -> Result<(Rc<BufferObject<'device>>, BindingBacking), PrepareError> {
+    let requested_bytes = requirement.allocation_bytes.max(1);
+    let started = if measure {
+        super::super::profile::now_ns()
+    } else {
+        0
+    };
+    let (bo, backing) = match LinuxIvpuSharedAllocation::allocate(
+        requested_bytes,
+        requirement.alignment.min(rustix::param::page_size() as u64),
+    )
+    .and_then(|allocation| device.import_shared(allocation))
+    {
+        Ok(bo) => (bo, BindingBacking::ImportedShared),
+        Err(_) => (
+            device
+                .create_bo(requested_bytes, DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
+                .map_err(PrepareError::Runtime)?,
+            BindingBacking::IvpuGem,
+        ),
+    };
+    if measure {
+        timings.binding_allocate_ns = timings
+            .binding_allocate_ns
+            .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+    }
+    Ok((Rc::new(bo), backing))
+}
+
 fn create_bindings<'device>(
     device: &'device IvpuDevice,
     requirements: &[BindingRequirement],
@@ -478,89 +531,97 @@ fn create_bindings<'device>(
             output_index += 1;
             (None, view)
         };
-        let requested_bytes = requirement.allocation_bytes.max(1);
-        let (bo, backing, allocation_offset, direct, is_new) = if let Some(view) = shared_view {
-            let owner =
-                DirectSharedBuffer::from_token(view.token).ok_or(PrepareError::BindingMismatch)?;
-            if owner.identity() != view.identity
-                || owner.ownership() != crate::interop::AllocationOwnership::Backend
-                || view.bytes < requirement.bytes as usize
-                || view
-                    .offset
-                    .checked_add(requested_bytes as usize)
-                    .is_none_or(|end| end > view.allocation_bytes)
+        let (bo, backing, allocation_offset, direct, is_new) = match shared_view {
+            Some(view)
+                if DirectSharedBuffer::from_token(view.token).is_some_and(|owner| {
+                    owner.identity() == view.identity
+                        && owner.ownership() == crate::interop::AllocationOwnership::Backend
+                        && shared_view_covers_requirement(&view, requirement)
+                }) =>
             {
-                return Err(PrepareError::BindingMismatch);
-            }
-            if let Some((_, existing)) = imported
-                .iter()
-                .find(|(identity, _)| *identity == view.identity)
-            {
-                (
-                    existing.clone(),
-                    BindingBacking::ImportedShared,
-                    view.offset as u64,
-                    true,
-                    false,
-                )
-            } else {
-                let started = if measure {
-                    super::super::profile::now_ns()
+                let owner = DirectSharedBuffer::from_token(view.token)
+                    .ok_or(PrepareError::BindingMismatch)?;
+                if let Some((_, existing)) = imported
+                    .iter()
+                    .find(|(identity, _)| *identity == view.identity)
+                {
+                    (
+                        existing.clone(),
+                        BindingBacking::ImportedShared,
+                        view.offset as u64,
+                        true,
+                        false,
+                    )
                 } else {
-                    0
-                };
-                let imported_bo = Rc::new(
-                    device
-                        .import_shared_unretained(
-                            owner
-                                .duplicate_allocation()
-                                .map_err(PrepareError::Runtime)?,
-                        )
-                        .map_err(|_| PrepareError::BindingMismatch)?,
-                );
-                if measure {
-                    timings.binding_import_ns = timings
-                        .binding_import_ns
-                        .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+                    let started = if measure {
+                        super::super::profile::now_ns()
+                    } else {
+                        0
+                    };
+                    match owner
+                        .duplicate_allocation()
+                        .map_err(PrepareError::Runtime)
+                        .and_then(|allocation| {
+                            device
+                                .import_shared_unretained(allocation)
+                                .map_err(PrepareError::Runtime)
+                        }) {
+                        Ok(imported_bo) => {
+                            if measure {
+                                timings.binding_import_ns = timings
+                                    .binding_import_ns
+                                    .saturating_add(
+                                        super::super::profile::now_ns().saturating_sub(started),
+                                    );
+                            }
+                            let imported_bo = Rc::new(imported_bo);
+                            imported
+                                .try_reserve(1)
+                                .map_err(|_| PrepareError::Allocation)?;
+                            imported.push((view.identity, imported_bo.clone()));
+                            (
+                                imported_bo,
+                                BindingBacking::ImportedShared,
+                                view.offset as u64,
+                                true,
+                                true,
+                            )
+                        }
+                        Err(_) => {
+                            super::super::profile::note(&alloc::format!(
+                                "[npu direct] shared import failed; staging section={} class={:?} logical={} alloc={}\n",
+                                requirement.section,
+                                requirement.class,
+                                requirement.bytes,
+                                requirement.allocation_bytes,
+                            ));
+                            let (bo, backing) =
+                                allocate_binding_bo(device, requirement, &mut timings, measure)?;
+                            (bo, backing, 0, false, true)
+                        }
+                    }
                 }
-                imported
-                    .try_reserve(1)
-                    .map_err(|_| PrepareError::Allocation)?;
-                imported.push((view.identity, imported_bo.clone()));
-                (
-                    imported_bo,
-                    BindingBacking::ImportedShared,
-                    view.offset as u64,
-                    true,
-                    true,
-                )
             }
-        } else {
-            let started = if measure {
-                super::super::profile::now_ns()
-            } else {
-                0
-            };
-            let (bo, backing) = match LinuxIvpuSharedAllocation::allocate(
-                requested_bytes,
-                requirement.alignment.min(rustix::param::page_size() as u64),
-            )
-            .and_then(|allocation| device.import_shared(allocation))
-            {
-                Ok(bo) => (bo, BindingBacking::ImportedShared),
-                Err(_) => (
-                    device
-                        .create_bo(requested_bytes, DRM_IVPU_BO_MAPPABLE | DRM_IVPU_BO_DMA_MEM)
-                        .map_err(PrepareError::Runtime)?,
-                    BindingBacking::IvpuGem,
-                ),
-            };
-            if measure {
-                timings.binding_allocate_ns = timings
-                    .binding_allocate_ns
-                    .saturating_add(super::super::profile::now_ns().saturating_sub(started));
+            Some(view) => {
+                super::super::profile::note(&alloc::format!(
+                    "[npu direct] shared view cannot cover padded binding; staging section={} class={:?} view_bytes={} view_off={} view_alloc={} logical={} alloc={}\n",
+                    requirement.section,
+                    requirement.class,
+                    view.bytes,
+                    view.offset,
+                    view.allocation_bytes,
+                    requirement.bytes,
+                    requirement.allocation_bytes,
+                ));
+                let (bo, backing) =
+                    allocate_binding_bo(device, requirement, &mut timings, measure)?;
+                (bo, backing, 0, false, true)
             }
-            (Rc::new(bo), backing, 0, false, true)
+            None => {
+                let (bo, backing) =
+                    allocate_binding_bo(device, requirement, &mut timings, measure)?;
+                (bo, backing, 0, false, true)
+            }
         };
         let info = bo.info().map_err(PrepareError::Runtime)?;
         let device_address = info
@@ -606,7 +667,13 @@ fn create_bindings<'device>(
             backing,
             allocation_offset,
             direct,
-            host_address: shared_view.map(|view| view.address),
+            // Only point at the ggml tensor when the BO is that shared import; staged
+            // fallbacks must use the BO mapping path (see write_inputs / copy_output).
+            host_address: if direct {
+                shared_view.map(|view| view.address)
+            } else {
+                None
+            },
         });
     }
     Ok((buffers, placements, total, timings))
@@ -1088,5 +1155,62 @@ mod tests {
         );
         assert!(prepared.total_accounted_bytes <= 64 * 1024 * 1024);
         assert!(prepared.outputs_are_zero().unwrap());
+    }
+
+    #[test]
+    fn shared_view_accepts_exact_logical_when_pad_fits_in_owner() {
+        let requirement = BindingRequirement {
+            section: 1,
+            class: DeviceMemoryClass::Input,
+            bytes: 100,
+            allocation_bytes: 128,
+            alignment: 64,
+        };
+        let view = SharedAllocationView {
+            identity: crate::interop::AllocationIdentity {
+                provider: 1,
+                object: 1,
+                generation: 1,
+            },
+            token: crate::interop::AllocationToken {
+                provider: 1,
+                owner: core::ptr::NonNull::dangling(),
+            },
+            allocation_bytes: 256,
+            offset: 0,
+            bytes: 100,
+            alignment: 64,
+            address: core::ptr::NonNull::dangling(),
+        };
+        assert!(shared_view_covers_requirement(&view, &requirement));
+    }
+
+    #[test]
+    fn shared_view_rejects_when_elf_pad_overruns_owner() {
+        let requirement = BindingRequirement {
+            section: 1,
+            class: DeviceMemoryClass::Input,
+            bytes: 100,
+            allocation_bytes: 128,
+            alignment: 64,
+        };
+        // Exact-sized claim+stage tensor: logical fits, padded section does not.
+        let view = SharedAllocationView {
+            identity: crate::interop::AllocationIdentity {
+                provider: 1,
+                object: 1,
+                generation: 1,
+            },
+            token: crate::interop::AllocationToken {
+                provider: 1,
+                owner: core::ptr::NonNull::dangling(),
+            },
+            allocation_bytes: 100,
+            offset: 0,
+            bytes: 100,
+            alignment: 64,
+            address: core::ptr::NonNull::dangling(),
+        };
+        assert!(!shared_view_covers_requirement(&view, &requirement));
     }
 }
