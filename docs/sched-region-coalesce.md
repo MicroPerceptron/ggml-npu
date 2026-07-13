@@ -33,10 +33,14 @@ After llama.cpp assignment passes 1–4, for non-view nodes in topo order:
    island node has `feasible_mask` bit `B` set and is not `PINNED`, recolor the
    island to `B`.
 3. Repeat to fixpoint (checkerboard collapse).
-4. **llama.cpp apply guard** (not Rust): apply proposals only when the target is
-   `GGML_BACKEND_DEVICE_TYPE_NPU` or shares a buft with the node’s prior backend;
-   refuse Vulkan/GPU sandwiches that left non-Vulkan buffers inside Vulkan splits
-   (`ggml_vk_build_graph` SIGSEGV on pp128). Then re-sync view ops to `view_src`.
+4. **llama.cpp apply guard** (not Rust): always apply when the target is
+   `GGML_BACKEND_DEVICE_TYPE_NPU` or shares a preferred buft with the node’s
+   prior backend. Other targets (Vulkan sandwiches) apply only when every
+   **already-committed** buffer that would live on the destination after this
+   apply is supported by that backend (`ggml_backend_supports_buft`); unallocated
+   temps are safe (gallocr assigns the target buft). Refusing incompatible
+   committed buffers avoids `ggml_vk_build_graph` SIGSEGV on pp128 while restoring
+   buffer-safe island absorbs. Then re-sync view ops to `view_src`.
 
 Does **not** invent NPU claims: feasibility comes from the scheduler’s
 `supports_op` packing. Weights / `INPUT` stay pinned. Rust leaves `VIEW` rows
