@@ -360,6 +360,22 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `tests/coverage_matrix.csv`, `tests/graph_ir_shortconv_check.c`, GitHub #10.
   - Verified: 2026-07-13
 
+
+- `FINDING/attention-full-thin-fa-not-duty-cycle` — On develop `8ec283e` LFM sharing-on ShortConv=1
+  MoE=0 `-fa on` coalesce (NPU-only-guard era), `ATTENTION=full` vs unset: SoftMax unused; NPU
+  claims **12** `FlashAttention`(+Reshape) programs on pp16 (disp 400→**412**, unitary 28.0%→27.2%,
+  avg nodes 2.44→2.43); shared tensor MiB **flat** 25.92; direct resident ELF 391→**486** MiB.
+  pp128 identical (12/50%/3.00/13.75 MiB). So the gated surface runs, but as thin FA islands that
+  raise dispatch/ELF without growing shared NPU tensor duty cycle. Root blockers: (1) Metadata
+  View/Permute stay `supports_op`-unclaimed (PR #35) so FA does not fuse with QKV; (2) under
+  buft-safe coalesce/cut-cost, thin FA may re-absorb into Vulkan. Follow-on policy pull for
+  claimable SoftMax/FA Scale/Mul neighborhood is `feat/attention-core-duty-cycle` (`9b041bc`).
+  - Scope: Artifact re-analysis + policy contract; live tip remeasure blocked when `/dev/accel`
+    nodes absent. Not locked pp512.
+  - Evidence: `benchmarks/results/develop-8ec283e-targeted-pp{16,128}-sharing-on-coalesce-attn-{default,full}/`,
+    `docs/coverage-gates.md`, `src/policy.rs`, issue #10, PR #46.
+  - Verified: 2026-07-13
+
 - `FINDING/direct-warm-binding-reuse` — Direct resident programs historically keyed the full shared-binding identity into one cache entry, so weightless/glue programs re-staged ELF+HPI+command for every distinct IO set. PR #25 caches artifacts ≤512 KiB by program semantic key (L0 `SG_GRAPHS` analogue), retains a pre-JIT section snapshot, and re-JITs IO bindings in place; larger baked-weight programs keep the binding-set key to avoid host double-keep of weight blobs.
   - Scope: Direct session resident cache / prepare path only; not a measured handoff_begin or tok/s delta until short attribution or locked harness evidence. Device/host async overlap remains intentionally synchronous.
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, `src/vendor/ivpu/direct/load.rs`, GitHub issue #5, PR #25.

@@ -283,6 +283,54 @@ unsafe fn is_attention_side_name(t: *const ggml_tensor) -> bool {
         || name_contains(t, b"kqv")
 }
 
+/// SoftMax / FlashAttention / runtime-weight MatMul producers under `ATTENTION=full`.
+/// Used to pull attention-core fusible glue (Scale, …) so KQ→SoftMax / FA neighborhoods do not
+/// sandwich through CPU between claimed anchors (#10).
+unsafe fn has_attention_core_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            let core = match (*src).op {
+                GGML_OP_SOFT_MAX | GGML_OP_FLASH_ATTN_EXT => true,
+                GGML_OP_MUL_MAT => !crate::ops::subgraph::is_const_weight_matmul(src),
+                _ => false,
+            };
+            core || has_attention_core_ancestor(src, depth - 1)
+        })
+}
+
+/// Fusible (non-Metadata) ops that may extend SoftMax/FA/runtime-KQ islands under `ATTENTION=full`.
+/// Metadata stays supports_op-unclaimed (PR #35); only claimable fusibles are pulled here.
+fn attention_core_neighborhood_should_pull(op: ggml_op) -> bool {
+    matches!(
+        op,
+        GGML_OP_SCALE
+            | GGML_OP_MUL
+            | GGML_OP_ADD
+            | GGML_OP_CPY
+            | GGML_OP_RMS_NORM
+            | GGML_OP_GET_ROWS
+            | GGML_OP_CLAMP
+            | GGML_OP_DIV
+    )
+}
+
+unsafe fn is_attention_core_neighborhood_candidate(t: *const ggml_tensor) -> bool {
+    if t.is_null() || !attention_full() || !attention_core_neighborhood_should_pull((*t).op) {
+        return false;
+    }
+    // Prefer DAG ancestry (SoftMax/FA/runtime KQ). Fall back to attention-side names under a
+    // claimable QKV/RoPE span so pre-FA Scale/glue between projections and the core can join.
+    has_attention_core_ancestor(t, 12)
+        || (is_attention_side_name(t)
+            && (has_claimable_matmul_ancestor(t, 12) || has_rope_ancestor(t, 12)))
+}
+
 /// Dependency-aware fusible/metadata pull: FFN glue, FFN-span layout, or ShortConv/static prefill
 /// span glue (not attention-side orphans that become unitary NPU islands).
 fn fusible_neighborhood_should_pull(
@@ -305,11 +353,18 @@ unsafe fn should_pull_fusible_neighborhood(node: *const ggml_tensor, spec: OpSpe
             || touches_shortconv_state(node)
             || (output_elements(&*node) >= env_u64(c"GGML_NPU_MIN_REGION_ELEMENTS", 32_768)
                 && has_static_prefill_span_ancestor(node, 12)));
+    // Under ATTENTION=full, attention-side fusibles that sit on the SoftMax/FA/KQ core may extend
+    // that island. Default still refuses attention-side orphans (unitary risk).
+    let attention_core_span = attention_full()
+        && matches!(spec.placement, PlacementClass::FusibleOnly)
+        && (has_attention_core_ancestor(node, 12)
+            || (is_attention_side_name(node)
+                && (has_claimable_matmul_ancestor(node, 12) || has_rope_ancestor(node, 12))));
     fusible_neighborhood_should_pull(
         spec.placement,
         crate::ops::subgraph::claims_glue(node),
         has_ffn_fusible_ancestor(node, 12),
-        static_prefill_span,
+        static_prefill_span || attention_core_span,
     )
 }
 
@@ -403,6 +458,12 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
             PlacementClass::FusibleOnly => has_anchor_ancestor(node, 12),
             _ => false,
         };
+    }
+    // SoftMax/FA Scale+glue neighborhood (#10): without this, attention-side Scale/Mul stay on
+    // CPU between claimed KQ/FA anchors (NPU|CPU|NPU sandwiches) and ATTENTION=full only adds
+    // thin unitary cores without growing fused NPU work.
+    if is_attention_core_neighborhood_candidate(node) {
+        return true;
     }
     if crate::host::builtin()
         .config()
@@ -566,6 +627,20 @@ mod tests {
         })
         .expect("MatMul");
         assert!(!attention_core_should_pull(matmul));
+    }
+
+    #[test]
+    fn attention_core_neighborhood_pulls_scale_not_metadata() {
+        // Scale/Mul may extend SoftMax/FA islands; layout Metadata stays off this path (#10).
+        assert!(attention_core_neighborhood_should_pull(GGML_OP_SCALE));
+        assert!(attention_core_neighborhood_should_pull(GGML_OP_MUL));
+        assert!(attention_core_neighborhood_should_pull(GGML_OP_ADD));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_RESHAPE));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_VIEW));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_PERMUTE));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_SOFT_MAX));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_FLASH_ATTN_EXT));
+        assert!(!attention_core_neighborhood_should_pull(GGML_OP_MUL_MAT));
     }
 
     #[test]
