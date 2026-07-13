@@ -6,9 +6,11 @@
 //! feasible on the surrounding backend (via the caller-supplied mask).
 //!
 //! With cut-cost mode (`OPT_WEIGHTED_CUT_COST` / v2 ABI), absorbs are gated by
-//! heuristic handoff cost and NPU-aware anti-unitary policy (#48): grow onto
-//! existing NPU neighbors (including asymmetric edges), preserve fat NPU
-//! islands, dissolve thin unitaries, boost max-island across NPU boundaries.
+//! two-objective scoring (#48): **latency** (handoff nbytes × backend factor)
+//! and **throughput** (op-class compute weight — MatMul/FA heavy vs glue light).
+//! Anti-unitary policy grows onto existing NPU neighbors (including asymmetric
+//! edges), preserves fat / heavy-compute NPU islands, dissolves thin unitaries,
+//! and modestly boosts max-island across NPU boundaries / light glue.
 //!
 //! Profitability / claim policy stays in `offload_op` / `policy::should_pull`.
 //! This only widens homogeneous splits the scheduler already painted.
@@ -19,7 +21,7 @@ use core::ptr;
 use super::cut_cost::{
     decide_absorb, effective_max_island, note_absorb_outcome, npu_absorb_target,
     reset_cut_cost_stats, snapshot_cut_cost_stats, total_cut_cost, AbsorbDecision, BackendKind,
-    CutCostStats, OPT_WEIGHTED_CUT_COST,
+    CutCostStats, IslandCompute, OPT_COMPUTE_WEIGHT, OPT_WEIGHTED_CUT_COST,
 };
 
 /// Skip this node in interval scans (view / reshape glue that does not cut).
@@ -51,6 +53,8 @@ pub struct SchedCutCostNode {
     pub flags: u32,
     /// `ggml_nbytes(node)` capped to `u32::MAX` (0 ⇒ unknown / unweighted fallback).
     pub nbytes: u32,
+    /// `ggml_op` ordinal; 0 ⇒ unknown → medium compute weight.
+    pub op: u32,
 }
 
 const PROC_NAME: &[u8] = b"ggml_backend_sched_region_coalesce";
@@ -71,6 +75,7 @@ pub fn coalesce_regions(
             feasible_mask: n.feasible_mask,
             flags: n.flags,
             nbytes: 0,
+            op: 0,
         })
         .collect();
     // Unknown kinds ⇒ cut-cost gate off; classic island absorb.
@@ -221,57 +226,67 @@ fn try_absorb_pass(
 
                     let left_edge_nb = nodes[ops[run_start]].nbytes;
                     let right_edge_nb = nodes[ops[run_end]].nbytes;
-                    let eff_max = effective_max_island(
-                        max_island,
-                        target,
-                        kinds,
-                        left_edge_nb,
-                        right_edge_nb,
-                        weighted,
-                    );
-                    if run_len <= eff_max {
-                        let target_u = target as u32;
-                        if target_u < 32 {
-                            let bit = 1u32 << target_u;
-                            let mut ok = true;
-                            let mut island_bytes = 0u64;
-                            for &op_i in &ops[run_start..run_end] {
-                                let n = &nodes[op_i];
-                                if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
-                                    ok = false;
-                                    break;
-                                }
-                                island_bytes = island_bytes.saturating_add(n.nbytes as u64);
-                            }
-                            if ok {
-                                let decision = decide_absorb(
-                                    bid,
-                                    target,
-                                    kinds,
-                                    island_bytes,
-                                    run_len,
-                                    left_edge_nb,
-                                    right_edge_nb,
-                                    weighted,
-                                );
-                                if decision == AbsorbDecision::Absorb {
-                                    let mut flipped = 0usize;
-                                    for &op_i in &ops[run_start..run_end] {
-                                        if nodes[op_i].backend_id != target {
-                                            nodes[op_i].backend_id = target;
-                                            flipped += 1;
-                                        }
+                    let target_u = target as u32;
+                    if target_u >= 32 || run_len > max_island.saturating_mul(3).saturating_add(12)
+                    {
+                        // Hard ceiling: even heavy-edge boost never exceeds this.
+                        run_start = run_end;
+                        continue;
+                    }
+                    let bit = 1u32 << target_u;
+                    let mut ok = true;
+                    let mut island_bytes = 0u64;
+                    let mut compute_pairs: alloc::vec::Vec<(u32, u32)> =
+                        alloc::vec::Vec::with_capacity(run_len);
+                    for &op_i in &ops[run_start..run_end] {
+                        let n = &nodes[op_i];
+                        if n.flags & FLAG_PINNED != 0 || n.feasible_mask & bit == 0 {
+                            ok = false;
+                            break;
+                        }
+                        island_bytes = island_bytes.saturating_add(n.nbytes as u64);
+                        compute_pairs.push((n.nbytes, n.op));
+                    }
+                    if ok {
+                        let compute = IslandCompute::from_nodes(compute_pairs);
+                        let eff_max = effective_max_island(
+                            max_island,
+                            target,
+                            kinds,
+                            left_edge_nb,
+                            right_edge_nb,
+                            weighted,
+                            compute,
+                        );
+                        if run_len <= eff_max {
+                            let decision = decide_absorb(
+                                bid,
+                                target,
+                                kinds,
+                                island_bytes,
+                                run_len,
+                                left_edge_nb,
+                                right_edge_nb,
+                                weighted,
+                                compute,
+                            );
+                            if decision == AbsorbDecision::Absorb {
+                                let mut flipped = 0usize;
+                                for &op_i in &ops[run_start..run_end] {
+                                    if nodes[op_i].backend_id != target {
+                                        nodes[op_i].backend_id = target;
+                                        flipped += 1;
                                     }
-                                    if flipped > 0 {
-                                        note_absorb_outcome(
-                                            decision, bid, target, kinds, flipped,
-                                        );
-                                        *reassigned += flipped;
-                                        return true;
-                                    }
-                                } else {
-                                    note_absorb_outcome(decision, bid, target, kinds, 0);
                                 }
+                                if flipped > 0 {
+                                    note_absorb_outcome(
+                                        decision, bid, target, kinds, flipped, compute,
+                                    );
+                                    *reassigned += flipped;
+                                    return true;
+                                }
+                            } else {
+                                note_absorb_outcome(decision, bid, target, kinds, 0, compute);
                             }
                         }
                     }
@@ -360,7 +375,8 @@ pub unsafe extern "C" fn ggml_backend_sched_region_coalesce(
 /// C ABI entry: `ggml_backend_sched_region_coalesce_v2` (nbytes + kinds + options).
 ///
 /// `backend_kinds` length must be `n_backends` (`ggml_backend_dev_type` ordinals).
-/// `options` bit0 = [`OPT_WEIGHTED_CUT_COST`].
+/// `options` bit0 = [`OPT_WEIGHTED_CUT_COST`]; bit1 = [`OPT_COMPUTE_WEIGHT`]
+/// (informational — compute weights apply whenever weighted and `op` is packed).
 #[no_mangle]
 pub unsafe extern "C" fn ggml_backend_sched_region_coalesce_v2(
     nodes: *mut SchedCutCostNode,
@@ -389,6 +405,8 @@ pub unsafe extern "C" fn ggml_backend_sched_region_coalesce_v2(
         kinds.push(BackendKind::from_u8(k));
     }
     let weighted = options & OPT_WEIGHTED_CUT_COST != 0;
+    // OPT_COMPUTE_WEIGHT is advisory: scoring uses packed `op` whenever present.
+    let _ = options & OPT_COMPUTE_WEIGHT;
     coalesce_regions_weighted(slice, n_b, max_island as usize, &kinds, weighted) as c_int
 }
 
@@ -446,6 +464,23 @@ mod tests {
             feasible_mask: feasible,
             flags,
             nbytes,
+            op: 0,
+        }
+    }
+
+    fn cut_node_op(
+        backend: i32,
+        feasible: u32,
+        flags: u32,
+        nbytes: u32,
+        op: u32,
+    ) -> SchedCutCostNode {
+        SchedCutCostNode {
+            backend_id: backend,
+            feasible_mask: feasible,
+            flags,
+            nbytes,
+            op,
         }
     }
 
@@ -705,5 +740,41 @@ mod tests {
         let _ = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
         let s = snapshot_cut_cost_stats();
         assert!(s.absorbed_into_npu >= 1);
+    }
+
+    #[test]
+    fn weighted_preserves_heavy_matmul_unitary() {
+        use crate::ffi::GGML_OP_MUL_MAT;
+        let both = 0b11;
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let mut nodes = [
+            cut_node(0, both, 0, 4096),
+            // 32 KiB MatMul unitary — below fat 64 KiB floor, heavy-compute preserve.
+            cut_node_op(1, both, 0, 32 * 1024, GGML_OP_MUL_MAT as u32),
+            cut_node(0, both, 0, 4096),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 0);
+        assert_eq!(nodes[1].backend_id, 1);
+        let s = snapshot_cut_cost_stats();
+        assert!(s.heavy_compute_preserved >= 1 || s.preserved_fat_npu >= 1);
+    }
+
+    #[test]
+    fn weighted_absorbs_light_glue_with_op_class() {
+        use crate::ffi::GGML_OP_ADD;
+        let both = 0b11;
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let mut nodes = [
+            cut_node(0, both, 0, 8192),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node_op(1, both, 0, 1024, GGML_OP_ADD as u32),
+            cut_node(0, both, 0, 8192),
+        ];
+        let n = coalesce_regions_weighted(&mut nodes, 2, 4, &kinds, true);
+        assert_eq!(n, 2);
+        assert!(nodes.iter().all(|x| x.backend_id == 0));
+        let s = snapshot_cut_cost_stats();
+        assert!(s.light_glue_into_npu >= 2);
     }
 }
