@@ -21,8 +21,38 @@ Default behavior is unchanged when the env flag is off **or** no provider is
 loaded. Algorithm stays in Rust (cdylib/`rlib`) so deps and `core::simd` are
 free of llama.cpp/ggml C++ ABI constraints; only thin POD crosses the boundary.
 
+## Recommended production combo (Direct)
+
+For Direct IVPU hybrid (narrow `supports_buft`) the measured duty-cycle trio is:
+
+```bash
+export GGML_SCHED_REGION_COALESCE=1
+export GGML_SCHED_CUT_COST=1
+export GGML_SCHED_NPU_CLAIM_STAGE=1
+```
+
+Tip locked LFM pp512 @ `-t 6` with this combo: ~247 tok/s / ~470 NPU disp/pass
+(`BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`). Do **not** enable claim-stage under
+coalesce-only (without cut-cost) — coalesce can re-absorb NPU seeds into Vulkan.
+
+### Master opt-in: `GGML_NPU_SCHED=auto`
+
+One-flag product path (llama.cpp + this crate):
+
+```bash
+export GGML_NPU_SCHED=auto
+```
+
+When set to exact `auto`, the scheduler enables coalesce=1 + cut-cost=1 +
+claim-stage=1 **only if** an NPU backend is present **and** this library reports
+Direct-eligible via `ggml_backend_npu_sched_auto_eligible` (Direct narrow buft;
+Level Zero / non-Direct builds return 0). Explicit `GGML_SCHED_*` overrides
+always win when set. Unset / non-`auto` keeps the historical default-off trio
+(safe; no SEGV / BindingMismatch reintroduction from silent enable).
+
 ## Flags
 
+- `GGML_NPU_SCHED=auto` — master opt-in for the recommended Direct trio (above).
 - `GGML_SCHED_REGION_COALESCE=1` — enable pass (scheduler must resolve the Rust
   ABI from a loaded backend registry, typically `libggml_npu.so`).
 - `GGML_SCHED_REGION_COALESCE=2` — enable + verbose flip / reassignment dump.
@@ -31,6 +61,8 @@ free of llama.cpp/ggml C++ ABI constraints; only thin POD crosses the boundary.
 - `GGML_SCHED_CUT_COST=1` — use **v2** ABI with nbytes + backend kinds; enable
   weighted / NPU-preserving absorb gates (`OPT_WEIGHTED`). Requires coalesce ≥1.
   Falls back to v1 if the v2 symbol is missing.
+- `GGML_SCHED_NPU_CLAIM_STAGE=1` — Direct claim+stage (llama.cpp); seed via
+  `supports_op` and stage foreign inputs into `NPU_HOST`.
 
 ## Algorithm (v0 / length-only)
 
@@ -154,6 +186,15 @@ struct ggml_sched_cut_cost_stats {
 
 Proc names: `ggml_backend_sched_cut_cost_stats`,
 `ggml_backend_sched_cut_cost_stats_reset`.
+
+### Auto eligibility
+
+```c
+typedef int (*ggml_backend_npu_sched_auto_eligible_t)(void);
+```
+
+Proc name: `ggml_backend_npu_sched_auto_eligible`. Returns `1` for Direct narrow
+buft builds, `0` otherwise. Used by llama.cpp when `GGML_NPU_SCHED=auto`.
 
 LTO / same-process dynamic load is assumed to keep FFI cost negligible vs split
 overhead.

@@ -6,6 +6,7 @@ code until every hard gate below is green.**
 
 Related: [`direct-runtime-foundation.md`](direct-runtime-foundation.md),
 [`direct-buft-residency.md`](direct-buft-residency.md),
+[`sched-region-coalesce.md`](sched-region-coalesce.md),
 [`compiler-migration-plan.md`](compiler-migration-plan.md) § Direct-submission
 qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/63).
 
@@ -15,12 +16,12 @@ qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/6
 | --- | --- | --- |
 | Tiny artifact Direct↔L0 numeric KAT | **Done** | Bit-identical 32×FP32 vector-add; `docs/direct-runtime-foundation.md` |
 | Session cancel admission + device-loss latch + firmware-gated reset | **Done** (PR #57 merged; #56) | Cooperative cancel; job-status `SUCCESS`/`ABORTED`/fault; latched device-loss; reset drops resident programs. Hermetic `direct::health` / `direct::oracle` |
-| Claim-stage duty cycle near L0 (LFM shape) | **Done (parity of shape)** | Claim+stage + pad fix: locked Direct ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`). Gap remains; shape is L0-class |
+| Claim-stage duty cycle near L0 (LFM shape) | **Done (parity of shape)** | Claim+stage + pad fix + #59: locked Direct ~**247** tok/s / ~**470** disp vs L0 ~**266** / ~**488** (`BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`; prior tip `371b06d` ~205). Gap remains; shape is L0-class |
 | ELF pad / binding cover under claim-stage | **Done** | PR #62: stage when ELF `allocation_bytes` pad exceeds shared view (`FINDING/claim-stage-elf-pad-binding-mismatch`) |
 | Model-corpus Direct↔L0 binding + numeric parity | **Harness landed** | Manifest + hermetic goldens + lab script: [`docs/direct-l0-corpus-parity.md`](direct-l0-corpus-parity.md). Structural Direct↔golden + L0 binding probe on 6 representative blobs; FP32 numeric on tiny vector-add. **Not** full LFM coverage — gate remains open until lab evidence is recorded on #63 |
 | In-flight / hang abort after partial execution | **Done (userspace)** | Sliced absolute `BO_WAIT` + cancel→`InFlightAbandoned` latch + hang deadline (`direct::health::wait_in_flight`). Hermetic tests. **No** IVPU job-abort ioctl — firmware residual below |
 | Required Direct op coverage leftovers | **Required** | ShortConv / RoPE / FA / MoE paths still tracked on #9 / #10 / #11; Direct must not depend on L0 for those gates |
-| Default-on knobs productization | **Required** | `GGML_SCHED_NPU_CLAIM_STAGE`, coalesce, cut-cost (and related) remain opt-in; product default path must not need a secret matrix to match L0-class duty cycle |
+| Default-on knobs productization | **Partial (opt-in auto)** | Recommended Direct combo documented: coalesce=1 + cut-cost=1 + claim-stage=1 (~247 tok/s tip). Master `GGML_NPU_SCHED=auto` enables that trio when Direct + NPU present; explicit `GGML_SCHED_*` override; default-off when unset. Hard flip to silent default-on deferred until regression gates land |
 
 ## Explicit non-gates (do not block delete on these alone)
 
@@ -69,8 +70,10 @@ Beyond #57 cooperative cancel (pre-admit) and post-classified fault reset:
 
 L0 still uses broad host `supports_buft`. Direct keeps narrow buft and uses
 `GGML_SCHED_NPU_CLAIM_STAGE=1` (+ coalesce/cut-cost as documented) for L0-shaped
-placement. After PR #62, locked tip claim-stage pp512 completes with ~99.3% no-copy
-and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean.
+placement. After PR #62/#59, locked tip claim-stage pp512 completes with ~99.3% no-copy
+and ~470 disp/pass (~247 tok/s) — comparable to L0’s ~488 disp / ~266 tok/s; tok/s still
+below L0 mean. Product path: document the trio or set `GGML_NPU_SCHED=auto` (still opt-in;
+not silent default-on). See [`sched-region-coalesce.md`](sched-region-coalesce.md).
 
 ## Still required (delete blockers)
 
@@ -81,8 +84,9 @@ and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean
    non-FP32 numeric; production-scale import/copy.
 2. **Coverage leftovers** — finish or explicitly keep-unclaimed the #9/#10/#11 surfaces
    so L0 is not the only path that exercises them in CI/harness.
-3. **Product defaults** — decide and land which of claim-stage / coalesce / cut-cost are
-   default-on for Direct production builds, with measured regression gates.
+3. **Product defaults** — `GGML_NPU_SCHED=auto` + documented recommended trio landed as
+   opt-in; remaining gate is whether to flip silent default-on for Direct production
+   builds once regression gates are agreed.
 
 ## Delete procedure (only after hard gates)
 
@@ -100,6 +104,7 @@ and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean
 | Checklist doc | This file |
 | Tracking issue | [#63](https://github.com/MicroPerceptron/ggml-npu/issues/63) |
 | Session health | #57 merged on `develop` (`de626a9`); #56 closed |
-| Hang/in-flight userspace | Sliced wait + `InFlightAbandoned` (this track); kernel abort residual documented |
+| Hang/in-flight userspace | Sliced wait + `InFlightAbandoned` (#67); kernel abort residual documented |
 | Pad/binding claim-stage fix | #62 merged on `develop` |
+| Product sched auto (opt-in) | `GGML_NPU_SCHED=auto` + docs (this track); silent default-on still open |
 | L0 delete | **Not started** — hard gates above still open |

@@ -74,6 +74,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     branch `feat/sched-fat-neighbor-absorb`.
   - Verified: 2026-07-13
 
+- `ADR/sched-npu-auto-defaults` — Product duty-cycle knobs stay **default-off**; recommended
+  Direct combo is coalesce=1 + cut-cost=1 + claim-stage=1 (~247 tok/s tip). Master opt-in
+  `GGML_NPU_SCHED=auto` (exact value) enables that trio in llama.cpp only when an NPU
+  backend is present **and** `ggml_backend_npu_sched_auto_eligible` returns 1 (Direct
+  narrow buft). Explicit `GGML_SCHED_*` overrides always win. Silent default-on deferred
+  until regression gates; does not widen `supports_buft` or delete L0.
+  - Rationale: Users should get L0-class duty cycle without memorizing three flags, without
+    reintroducing SEGV/BindingMismatch from silent enable or coalesce-only+claim.
+  - Evidence: `docs/sched-region-coalesce.md`, `docs/retire-level-zero-compat.md`,
+    `src/sched/auto.rs`, llama.cpp `ggml-backend.cpp` `GGML_NPU_SCHED=auto`, issues #63/#5.
+  - Verified: 2026-07-13
+
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
   - Rationale: Amortize compile cost without double-keeping uncompressed blobs in the vendor session cache.
   - Evidence: `docs/tiered-artifact-cache.md`, `src/artifact_cache.rs`, `src/host/linux/cache.rs`, `src/vendor/ivpu/compile.rs`.
@@ -774,6 +786,37 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `./benchmarks/results/_run_pp512_fullperf.sh`.
   - Verified: 2026-07-13
 
+- `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` — Develop `f662b28` (PR #59 SoftMax/FA fusible
+  pull under `ATTENTION=full`, atop PR #62 claim-stage + #66 compute-weight) locked LFM
+  Q4_K_M pp512 r=3 t=6 sharing-on ShortConv=1 MoE=0 ATTENTION=full FA on
+  FlexiBLAS+Vulkan+Direct, llama.cpp `574cac303`, `COALESCE=1` `CUT_COST=1`
+  `CLAIM_STAGE=1`: **247.134 ± 17.583 tok/s**, 2.078 ± 0.142 s; exit 0;
+  baseline-eligible direct-ivpu; profile **940** disp (~**470**/pass) / 33.6% unitary /
+  avg nodes 2.45 / **99.3%** no-copy / ~0.82 GiB NPU. Vs prior tip `371b06d` ~205 tok/s
+  same 940 disp; vs L0 FlexiBLAS coa1 ~266 / ~488 disp.
+  - Limitation: `ALLOW_HIGH_SWAP=1`; dispatch shape unchanged vs `371b06d`; still below
+    L0 mean.
+  - Evidence: `benchmarks/results/develop-f662b28-pp512-fullperf-locked-sharing-on-coa1-cut1-cs1-t6/`,
+    issues #5/#10/#63, PR #59.
+  - Reproduce: flock + `THREADS=6` `OMP_NUM_THREADS=6` `FLEXIBLAS=OPENBLAS-OPENMP`
+    `GGML_SCHED_REGION_COALESCE=1` `GGML_SCHED_CUT_COST=1` `GGML_SCHED_NPU_CLAIM_STAGE=1`
+    `./benchmarks/results/_run_pp512_fullperf.sh`.
+  - Verified: 2026-07-13
+
+- `FINDING/sched-npu-auto-defaults-smoke` — `GGML_NPU_SCHED=auto` (no explicit
+  `GGML_SCHED_*`) on Direct+NPU reproduces the recommended trio duty-cycle shape:
+  LFM pp16 r=1 t=6 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS —
+  exit 0, **394** disp / 39.6% unitary / avg nodes 2.43 / **96.0%** no-copy (matches
+  prior coa1+cut1+cs1 cell). No BindingMismatch / SEGV. Explicit overrides still win;
+  unset keeps default-off.
+  - Scope: Targeted r=1 smoke only; not locked pp512.
+  - Evidence: `benchmarks/results/develop-f662b28-targeted-pp16-sharing-on-sched-auto/`,
+    `ADR/sched-npu-auto-defaults`, `src/sched/auto.rs`, issues #5/#63.
+  - Reproduce: `THREADS=6` `OMP_NUM_THREADS=6` `FLEXIBLAS=OPENBLAS-OPENMP`
+    `GGML_NPU_SCHED=auto` unset `GGML_SCHED_REGION_COALESCE`/`CUT_COST`/`NPU_CLAIM_STAGE`
+    `./benchmarks/results/_run_targeted_smoke.sh`.
+  - Verified: 2026-07-13
+
 ## Pending milestones
 
 - `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond Argsort writeback reclaim
@@ -825,28 +868,32 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   differential oracle until Direct is sole Intel runtime; **do not delete L0** until hard
   gates in `docs/retire-level-zero-compat.md` / GitHub #63 are green. Done toward retirement:
   tiny Direct↔L0 KAT; session cancel / device-loss latch / firmware-gated reset (PR #57,
-  #56 closed); ELF pad binding cover (PR #62); claim-stage LFM duty-cycle **shape** near L0
-  (tip locked ~**247** tok/s / ~**470** disp vs L0 ~**266** / ~**488** —
-  `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`;
-  prior tip `371b06d` ~205); hang/in-flight **userspace** mitigation (sliced `BO_WAIT` +
-  `InFlightAbandoned` latch; `CONSTRAINT/ivpu-no-job-abort-ioctl`); **corpus parity harness**
+  #56 closed); ELF pad binding cover (PR #62); SoftMax/FA fusible pull (PR #59); claim-stage
+  LFM duty-cycle **shape** near L0 (tip locked ~**247** tok/s / ~**470** disp vs L0 ~**266** /
+  ~**488** — `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1` vs
+  `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`; prior tip `371b06d` ~205);
+  hang/in-flight **userspace** mitigation (sliced `BO_WAIT` + `InFlightAbandoned` latch;
+  `CONSTRAINT/ivpu-no-job-abort-ioctl`); **corpus parity harness**
   landed (`docs/direct-l0-corpus-parity.md`, `tests/direct_l0_corpus/manifest.csv`,
   `benchmarks/run_direct_l0_corpus_parity.sh`) with hermetic structural goldens + lab
   Direct↔L0 binding/numeric gate on six representative blobs
-  (`FINDING/direct-l0-corpus-parity-harness`).
+  (`FINDING/direct-l0-corpus-parity-harness`); product **opt-in** `GGML_NPU_SCHED=auto`
+  (`ADR/sched-npu-auto-defaults`).
   - Acceptance (delete blockers): expand/record corpus Direct↔L0 parity beyond the initial
     six-blob harness (full agreed LFM set / non-FP32 numeric / import-copy duty cycle);
-    required Direct op coverage leftovers (#9/#10/#11) without depending on L0; product
-    default-on knobs for claim-stage/coalesce/cut-cost with regression gates. Non-gates:
-    full tok/s gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5), widening Direct
-    `supports_buft`, OpenVINO removal, kernel job-abort ioctl.
+    required Direct op coverage leftovers (#9/#10/#11) without depending on L0; decide
+    whether to flip silent default-on for the sched trio once regression gates land
+    (#63). Non-gates: full tok/s gap to Vulkan (#4), anti-unitary cut-cost finish (#48/#5),
+    widening Direct `supports_buft`, OpenVINO removal, kernel job-abort ioctl.
   - Evidence: `docs/retire-level-zero-compat.md`, `docs/direct-l0-corpus-parity.md`,
-    `docs/direct-runtime-foundation.md`, `docs/compiler-migration-plan.md`,
-    `src/vendor/ivpu/direct/corpus.rs`, `src/vendor/ivpu/direct/oracle.rs`,
-    `src/vendor/ivpu/direct/health.rs`, `src/vendor/ivpu/session.rs`,
+    `docs/direct-runtime-foundation.md`, `docs/sched-region-coalesce.md`,
+    `docs/compiler-migration-plan.md`, `src/vendor/ivpu/direct/corpus.rs`,
+    `src/vendor/ivpu/direct/oracle.rs`, `src/vendor/ivpu/direct/health.rs`,
+    `src/vendor/ivpu/session.rs`, `src/sched/auto.rs`,
     PRs #57/#59/#62/#64/#67/#68, issues #56/#63,
     `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`,
-    `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`.
+    `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`,
+    `FINDING/sched-npu-auto-defaults-smoke`.
 
 - `MILESTONE/neutral-compiler-providers` — Replace compiler-specific frontend coupling with dynamically loaded, versioned, neutral providers, starting with Intel and later adding AMD and Qualcomm adapters behind the same semantic request/artifact envelope.
   - Acceptance: Capability/compile agreement, stable diagnostics, ownership/error ABI tests, deterministic pinned builds, artifact validation, and target-specific fixture tests pass without linking incompatible LLVM/MLIR libraries into ggml-npu.
