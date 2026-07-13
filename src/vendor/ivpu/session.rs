@@ -503,7 +503,8 @@ fn dispatch(
         return false;
     }
 
-    let prof = profile::enabled() || crate::trace::perf_enabled();
+    let tl = crate::timeline::enabled();
+    let prof = profile::enabled() || crate::trace::perf_enabled() || tl;
     let t0 = if prof { profile::now_ns() } else { 0 };
     if let Err(error) = program.write_inputs(&input_bytes) {
         profile::note(&alloc::format!(
@@ -575,32 +576,47 @@ fn dispatch(
             .sum();
         let imported = program.direct_binding_count() as u64;
         let staged = (inputs.len() + outputs.len()) as u64 - imported;
-        profile::record(
-            t0,
-            t1,
-            tmid,
-            t2,
-            t3,
-            0,
-            0,
-            imported,
-            staged,
-            bytes_in.saturating_add(bytes_out),
-            bytes_in,
-            bytes_out,
-        );
-        crate::trace::perf(
-            "dispatch",
-            &alloc::format!(
-                ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":{},\"copy_out_ns\":{},\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":{bytes_out}",
-                t1.saturating_sub(t0),
-                tmid.saturating_sub(t1),
-                t2.saturating_sub(tmid),
-                t3.saturating_sub(t2),
+        if tl {
+            use crate::timeline_ring::{Domain, Kind};
+            crate::timeline::span(Domain::Npu, Kind::StageIn, t0, t1, bytes_in);
+            crate::timeline::span(Domain::Npu, Kind::Submit, t1, tmid, 0);
+            crate::timeline::span(Domain::Npu, Kind::Wait, tmid, t2, 0);
+            crate::timeline::span(Domain::Npu, Kind::CopyOut, t2, t3, bytes_out);
+            if bytes_in > 0 {
+                crate::timeline::instant(Domain::Npu, Kind::MemLoad, bytes_in);
+            }
+            if bytes_out > 0 {
+                crate::timeline::instant(Domain::Cpu, Kind::MemLoad, bytes_out);
+            }
+        }
+        if profile::enabled() || crate::trace::perf_enabled() {
+            profile::record(
+                t0,
+                t1,
+                tmid,
+                t2,
+                t3,
+                0,
+                0,
                 imported,
                 staged,
-            ),
-        );
+                bytes_in.saturating_add(bytes_out),
+                bytes_in,
+                bytes_out,
+            );
+            crate::trace::perf(
+                "dispatch",
+                &alloc::format!(
+                    ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":{},\"copy_out_ns\":{},\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":{bytes_out}",
+                    t1.saturating_sub(t0),
+                    tmid.saturating_sub(t1),
+                    t2.saturating_sub(tmid),
+                    t3.saturating_sub(t2),
+                    imported,
+                    staged,
+                ),
+            );
+        }
     }
     true
 }

@@ -75,6 +75,8 @@ fn make_description() -> CString {
 }
 
 fn build() -> *mut Handles {
+    // Resolve timeline env before the first host/NPU mark (no-op when unset).
+    crate::timeline::init_from_env();
     // Allocate first for a stable address, then wire the self-referential pointers.
     let hp = Box::into_raw(Box::new(Handles {
         reg: ggml_backend_reg {

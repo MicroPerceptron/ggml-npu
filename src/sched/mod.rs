@@ -15,5 +15,9 @@ pub(crate) unsafe fn proc_address(name: *const core::ffi::c_char) -> *mut core::
     if !sched.is_null() {
         return sched;
     }
-    unsafe { auto::proc_address(name) }
+    let auto = unsafe { auto::proc_address(name) };
+    if !auto.is_null() {
+        return auto;
+    }
+    unsafe { crate::timeline::proc_address(name) }
 }

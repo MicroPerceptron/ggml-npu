@@ -443,7 +443,7 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
     let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
         return false;
     };
-    let prof = profile::enabled();
+    let prof = profile::enabled() || crate::timeline::enabled();
     unsafe {
         let has_bounce = node
             .inputs
@@ -475,7 +475,7 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
         let tmid = if prof { profile::now_ns() } else { 0 };
         if async_enabled() && !has_bounce {
             PENDING.store(true, Ordering::Release);
-            if prof {
+            if profile::enabled() {
                 profile::note("[npu] async queued (device/copy timing deferred to synchronize)\n");
             }
             return true;
@@ -505,20 +505,32 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
                 .filter(|b| b.bounce.is_none())
                 .count() as u64;
             let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
-            profile::record(
-                t0,
-                t1,
-                tmid,
-                t2,
-                t3,
-                owned,
-                0,
-                0,
-                bounced,
-                bytes_in.saturating_add(bytes_out),
-                bytes_in,
-                bytes_out,
-            );
+            if crate::timeline::enabled() {
+                use crate::timeline_ring::{Domain, Kind};
+                crate::timeline::span(Domain::Npu, Kind::StageIn, t0, t1, bytes_in);
+                crate::timeline::span(Domain::Npu, Kind::Submit, t1, tmid, 0);
+                crate::timeline::span(Domain::Npu, Kind::Wait, tmid, t2, 0);
+                crate::timeline::span(Domain::Npu, Kind::CopyOut, t2, t3, bytes_out);
+                if bytes_in > 0 {
+                    crate::timeline::instant(Domain::Npu, Kind::MemLoad, bytes_in);
+                }
+            }
+            if profile::enabled() {
+                profile::record(
+                    t0,
+                    t1,
+                    tmid,
+                    t2,
+                    t3,
+                    owned,
+                    0,
+                    0,
+                    bounced,
+                    bytes_in.saturating_add(bytes_out),
+                    bytes_in,
+                    bytes_out,
+                );
+            }
         }
     }
     true
