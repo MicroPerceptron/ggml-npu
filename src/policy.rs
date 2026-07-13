@@ -104,6 +104,71 @@ fn shortconv_should_pull(placement: PlacementClass, op: ggml_op) -> bool {
     }
 }
 
+/// Attention KV cache tensors are `cache_k*` / `cache_v*` (llama.cpp KV). Distinct from ShortConv
+/// `cache_r*` (#9). Used only to keep SetRows/CPY contiguous with claimable QKV+RoPE (#10).
+unsafe fn touches_attn_kv_cache(t: *const ggml_tensor) -> bool {
+    if t.is_null() {
+        return false;
+    }
+    if name_contains(t, b"cache_k") || name_contains(t, b"cache_v") {
+        return true;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| name_contains(src, b"cache_k") || name_contains(src, b"cache_v"))
+}
+
+unsafe fn has_claimable_matmul_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            crate::ops::subgraph::is_claimable_matmul(src)
+                || has_claimable_matmul_ancestor(src, depth - 1)
+        })
+}
+
+unsafe fn has_rope_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| (*src).op == GGML_OP_ROPE || has_rope_ancestor(src, depth - 1))
+}
+
+/// Prefill QKV continuity pull (#10): RoPE / qk-norm / KV SetRows that sit under constant-weight
+/// QKV projections, without opting into SoftMax/FA (`GGML_NPU_ATTENTION=full`).
+fn qkv_continuity_should_pull(op: ggml_op) -> bool {
+    matches!(
+        op,
+        GGML_OP_ROPE | GGML_OP_RMS_NORM | GGML_OP_SET_ROWS | GGML_OP_GET_ROWS | GGML_OP_CPY
+    )
+}
+
+unsafe fn is_qkv_continuity_candidate(t: *const ggml_tensor) -> bool {
+    if t.is_null() || !qkv_continuity_should_pull((*t).op) {
+        return false;
+    }
+    // SoftMax/FA are never continuity pulls — capability keeps them behind ATTENTION=full.
+    match (*t).op {
+        GGML_OP_ROPE | GGML_OP_RMS_NORM => has_claimable_matmul_ancestor(t, 12),
+        GGML_OP_SET_ROWS | GGML_OP_GET_ROWS | GGML_OP_CPY => {
+            touches_attn_kv_cache(t)
+                && (has_claimable_matmul_ancestor(t, 12) || has_rope_ancestor(t, 12))
+        }
+        _ => false,
+    }
+}
+
 unsafe fn has_anchor_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
     if t.is_null() || depth == 0 {
         return false;
@@ -242,6 +307,12 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
     {
         return true;
     }
+    // Default (no ATTENTION=full): keep prefill QKV-proj regions contiguous by pulling RoPE,
+    // qk-norm, and KV-cache SetRows that sit under claimable projections (#10). SoftMax/FA stay
+    // capability-gated and are never selected here.
+    if is_qkv_continuity_candidate(node) {
+        return true;
+    }
     if crate::host::builtin()
         .config()
         .is_set(c"GGML_NPU_FORCE_GRAPH")
@@ -348,6 +419,18 @@ mod tests {
         assert_eq!(unitary_offload_floor(4_000_000), 16_000_000);
         assert_eq!(unitary_offload_floor(0), 0);
         assert_eq!(unitary_offload_floor(u64::MAX / 2 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn qkv_continuity_pulls_rope_and_kv_writes_not_softmax() {
+        // Pure op allowlist for prefill QKV continuity (#10) — SoftMax/FA never ride this path.
+        assert!(qkv_continuity_should_pull(GGML_OP_ROPE));
+        assert!(qkv_continuity_should_pull(GGML_OP_RMS_NORM));
+        assert!(qkv_continuity_should_pull(GGML_OP_SET_ROWS));
+        assert!(qkv_continuity_should_pull(GGML_OP_CPY));
+        assert!(!qkv_continuity_should_pull(GGML_OP_SOFT_MAX));
+        assert!(!qkv_continuity_should_pull(GGML_OP_FLASH_ATTN_EXT));
+        assert!(!qkv_continuity_should_pull(GGML_OP_MUL_MAT));
     }
 
     #[test]

@@ -11,17 +11,17 @@ Transpose,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assig
 Concat,yes,hermetic,"contract:OpRegistry",fusible layout / packing
 Copy,yes,hermetic,"contract:OpRegistry",fusible copy glue
 SsmConv,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",ShortConv numerical check (#9)
-Rope,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",attention RoPE numerical (#10)
-SoftMax,yes,opt_in_hw,"contract:OpRegistry;issue:#10",attention softmax; full attention env
+Rope,yes,hermetic,"contract:OpRegistry;test:graph::prefill_qkv_rope_and_layout_are_not_attention_gated;test:vendor::ivpu::compile::tests::rope_is_admitted_without_attention_full_while_softmax_stays_gated;script:tests/graph_ir_shortconv_check.c",LFM NEOX/normal RoPE; default claim for QKV continuity (#10)
+SoftMax,yes,opt_in_hw,"contract:OpRegistry;issue:#10;test:vendor::ivpu::compile::tests::rope_is_admitted_without_attention_full_while_softmax_stays_gated",attention softmax; GGML_NPU_ATTENTION=full only
 GetRows,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",gather / MoE bank indexing
 Argsort,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE routing; GGML_NPU_MOE=1
 MatMulId,yes,opt_in_hw,"contract:OpRegistry;test:graph::partition_policy_limits_only_routed_expert_banks;issue:#11",routed experts
 Div,yes,hermetic,"contract:OpRegistry",elementwise
 Scale,yes,hermetic,"contract:OpRegistry",elementwise
 Clamp,yes,hermetic,"contract:OpRegistry",elementwise
-Permute,yes,hermetic,"contract:OpRegistry;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",attention layout metadata; fused-only claim
-FlashAttention,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",GQA FlashAttention numerical (#10)
+Permute,yes,hermetic,"contract:OpRegistry;test:graph::prefill_qkv_rope_and_layout_are_not_attention_gated;test:graph::operation_contract_assigns_explicit_placement_classes;test:vendor::ivpu::compile::tests::layout_only_graphs_are_rejected_while_fused_layout_stays_allowlisted",layout metadata; fused-only; not ATTENTION gate (#10)
+FlashAttention,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c;test:vendor::ivpu::compile::tests::rope_is_admitted_without_attention_full_while_softmax_stays_gated",GQA FlashAttention; GGML_NPU_ATTENTION=full only (#10)
 Swiglu,yes,hermetic,"contract:OpRegistry",GLU / SwiGLU dense block
 Sigmoid,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE gating; GGML_NPU_MOE=1
 SumRows,yes,opt_in_hw,"contract:OpRegistry;issue:#11",MoE reduction; GGML_NPU_MOE=1
-SetRows,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c",mutable state write (#9)
+SetRows,yes,shim,"contract:OpRegistry;script:tests/graph_ir_shortconv_check.c;test:policy::qkv_continuity_pulls_rope_and_kv_writes_not_softmax",ShortConv + KV-cache continuity writes (#9/#10)
