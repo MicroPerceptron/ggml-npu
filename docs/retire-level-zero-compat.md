@@ -18,7 +18,7 @@ qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/6
 | Claim-stage duty cycle near L0 (LFM shape) | **Done (parity of shape)** | Claim+stage + pad fix: locked Direct ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`). Gap remains; shape is L0-class |
 | ELF pad / binding cover under claim-stage | **Done** | PR #62: stage when ELF `allocation_bytes` pad exceeds shared view (`FINDING/claim-stage-elf-pad-binding-mismatch`) |
 | Model-corpus Direct↔L0 binding + numeric parity | **Required** | Same artifact/model corpus: binding metadata, relocations, HPI/firmware pins, resident accounting, import/copy, output tolerances — not tiny-only |
-| In-flight / hang abort after partial execution | **Required** | Kernel hang-reset and abort of in-flight work beyond cooperative cancel + post-fault reset (post-#57 leftover) |
+| In-flight / hang abort after partial execution | **Done (userspace)** | Sliced absolute `BO_WAIT` + cancel→`InFlightAbandoned` latch + hang deadline (`direct::health::wait_in_flight`). Hermetic tests. **No** IVPU job-abort ioctl — firmware residual below |
 | Required Direct op coverage leftovers | **Required** | ShortConv / RoPE / FA / MoE paths still tracked on #9 / #10 / #11; Direct must not depend on L0 for those gates |
 | Default-on knobs productization | **Required** | `GGML_SCHED_NPU_CLAIM_STAGE`, coalesce, cut-cost (and related) remain opt-in; product default path must not need a secret matrix to match L0-class duty cycle |
 
@@ -28,6 +28,10 @@ qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/6
 - Blindly widening Direct `supports_buft` to every host buft (rejected; see
   `docs/direct-buft-residency.md`).
 - Removing OpenVINO shim (`MILESTONE/remove-openvino` is a later, separate milestone).
+- **Kernel/firmware in-flight job abort or hang-reset ioctl** — current `intel_vpu` UAPI
+  exposes only `DRM_IOCTL_IVPU_BO_WAIT` (absolute timeout + job status). Userspace cannot
+  preempt or abort a busy command BO; abandon+device-loss+reset is the fail-closed bound
+  (`CONSTRAINT/ivpu-no-job-abort-ioctl`). Do not block L0 delete on inventing that UAPI.
 
 ## Done detail
 
@@ -49,6 +53,18 @@ sched cut-cost:
 - Hermetic differential-oracle helpers (`compare_f32`, binding-meta parity)
 - Context open / dispatch firmware re-negotiate; HPI loader/NNRT mismatch reject tests
 
+### Hang / in-flight wait (userspace)
+
+Beyond #57 cooperative cancel (pre-admit) and post-classified fault reset:
+
+- Dispatch waits via sliced absolute `BO_WAIT` (`DEFAULT_WAIT_SLICE_NS`) so cancel and hang
+  deadlines are observable while a job is busy
+- Cancel after submit abandons the wait and latches `FaultReason::InFlightAbandoned`
+  (fail-closed; does **not** stop firmware)
+- Overall hang deadline still latches `DeadlineExpired` device-loss
+- Hermetic `wait_in_flight` tests cover slice success, cancel abandon, hang deadline, and
+  pre-wait cancel
+
 ### Duty cycle under honest buft + claim-stage
 
 L0 still uses broad host `supports_buft`. Direct keeps narrow buft and uses
@@ -60,11 +76,9 @@ and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean
 
 1. **Corpus parity** — differential Direct vs L0 on the real LFM (and agreed) artifact
    set: bindings, numerics, resident bytes, sync. Tiny KAT alone is insufficient.
-2. **Hang / in-flight abort** — prove recovery when firmware/driver hangs mid-job, not
-   only cooperative cancel before admit and post-classified fault reset.
-3. **Coverage leftovers** — finish or explicitly keep-unclaimed the #9/#10/#11 surfaces
+2. **Coverage leftovers** — finish or explicitly keep-unclaimed the #9/#10/#11 surfaces
    so L0 is not the only path that exercises them in CI/harness.
-4. **Product defaults** — decide and land which of claim-stage / coalesce / cut-cost are
+3. **Product defaults** — decide and land which of claim-stage / coalesce / cut-cost are
    default-on for Direct production builds, with measured regression gates.
 
 ## Delete procedure (only after hard gates)
@@ -83,5 +97,6 @@ and ~470 disp/pass — comparable to L0’s ~488 disp, tok/s still below L0 mean
 | Checklist doc | This file |
 | Tracking issue | [#63](https://github.com/MicroPerceptron/ggml-npu/issues/63) |
 | Session health | #57 merged on `develop` (`de626a9`); #56 closed |
+| Hang/in-flight userspace | Sliced wait + `InFlightAbandoned` (this track); kernel abort residual documented |
 | Pad/binding claim-stage fix | #62 merged on `develop` |
 | L0 delete | **Not started** — hard gates above still open |
