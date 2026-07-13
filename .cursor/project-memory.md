@@ -94,6 +94,19 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `docs/compiler-migration-plan.md`, `.cursor/rules/rust-first-implementation.mdc`, `shim/`.
   - Verified: 2026-07-12
 
+- `ADR/direct-npu-host-residency` — Direct IVPU `supports_buft` accepts only our `NPU_HOST` buft;
+  `buft_alloc_buffer` fails closed without `SharedAllocationOwner`; `owns_tensor` requires a shared
+  owner (not buft-pointer equality alone). Level Zero keeps broad host `supports_buft` and may use
+  `alloc_host`. Profile attribution (`src/backend/buft.rs`) counts foreign-host refusals vs L0 and
+  tensor residency classes. Selective foreign-host allowlisting stays gated off until hermetic
+  import proofs exist; MoE `is_opt_in_one` is untouched.
+  - Rationale: L0’s broad host contract inflated NPU affinity while Direct cannot import foreign
+    host pointers; re-widening recreates owned-but-unimportable staging (#6). Honest residency keeps
+    scheduler affinity aligned with bindable storage.
+  - Evidence: `docs/direct-buft-residency.md`, `src/backend/buft.rs`, `src/backend/shell.rs`,
+    `src/backend/buffer.rs`, `FINDING/direct-host-buft-forced-staging`, issue #6, PR #22.
+  - Verified: 2026-07-13
+
 ## Verified findings
 
 
@@ -150,10 +163,12 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `src/vendor/ivpu/session_direct.rs`, `benchmarks/results/develop-8cc351f-pp512-fullperf-locked/`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #19.
   - Verified: 2026-07-12
 
-- `FINDING/direct-host-buft-forced-staging` — Under Direct IVPU, `supports_buft` historically accepted every host buffer type (Level Zero–era “shared RAM ⇒ bind without copy”). Direct can only import `SharedAllocationOwner` allocations from the NPU buft, so CPU-host tensors stayed foreign and were staged at dispatch. Remediation sharing-on still showed 416 staged / 880 imported under that contract. PR #22 narrows Direct-only `supports_buft` to our buft and refuses unimportable `alloc_host` fallbacks when shared alloc fails.
+- `FINDING/direct-host-buft-forced-staging` — Under Direct IVPU, `supports_buft` historically accepted every host buffer type (Level Zero–era “shared RAM ⇒ bind without copy”). Direct can only import `SharedAllocationOwner` allocations from the NPU buft, so CPU-host tensors stayed foreign and were staged at dispatch. Remediation sharing-on still showed 416 staged / 880 imported under that contract. PR #22 narrows Direct-only `supports_buft` to our buft and refuses unimportable `alloc_host` fallbacks when shared alloc fails. Follow-on `ADR/direct-npu-host-residency` adds profile probe/residency counters and hermetic policy tests (`foreign_host_refused` vs L0 broad host).
   - Scope: Placement/buffer-type policy for Direct zero-copy; not a claim that staged volume is already at remediation or better without a short attribution re-measure.
-  - Evidence: `src/backend/shell.rs`, `src/backend/buffer.rs`, `benchmarks/results/remediation-pp512-on-stable-locked/`, GitHub issue #6, PR #22.
-  - Verified: 2026-07-12
+  - Evidence: `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
+    `docs/direct-buft-residency.md`, `benchmarks/results/remediation-pp512-on-stable-locked/`,
+    GitHub issue #6, PR #22.
+  - Verified: 2026-07-13
 
 - `FINDING/offload-skipped-ffn-glue` — `offload_op` historically pulled only `MUL_MAT` / `SSM_CONV` (plus opt-in ShortConv candidates). FFN glue claimed via `supports_op`/`claims_glue` stayed on foreign buffers unless already placed, so matmul anchors and their silu/mul/residual often split into unitary NPU programs. Policy now dependency-pulls claimed FFN glue and layout under an FFN fusible ancestor, refuses non-claimable runtime-weight `MUL_MAT` pulls, and aligns `FORCE_GRAPH` fusible ancestry depth with `supports_region` (12).
   - Scope: Scheduler placement/`should_pull` only; not a measured split/unitary delta until short attribution or locked harness evidence.
@@ -285,6 +300,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Evidence: `ADR/sched-region-coalesce-rust-first`, `docs/sched-region-coalesce.md`, PR #41.
   - Verified: 2026-07-12
 
+- `REJECTED/blind-widen-direct-supports-buft-all-host` — Do not re-accept every host buft under
+  Direct to match Level Zero placement. That recreates owned-but-unimportable tensors and forced
+  staging (`FINDING/direct-host-buft-forced-staging`). Any widen must be a selective, hermetically
+  proven importable-buft allowlist (`importable_foreign_host_allowlist_enabled` stays false).
+  - Rationale: Scheduler affinity must match bindable storage; L0 duty-cycle is not a license to lie.
+  - Evidence: `ADR/direct-npu-host-residency`, `docs/direct-buft-residency.md`, `src/backend/buft.rs`,
+    issue #6, PR #22.
+  - Verified: 2026-07-13
+
 - `REJECTED/moe-enabled-via-is-set` — Do not treat `ConfigService::is_set("GGML_NPU_MOE")` as MoE
   enable. Targeted smokes and docs export `GGML_NPU_MOE=0` to mean off; presence-only gating falsely
   claimed Argsort/Sigmoid/SumRows/MatMulId, corrupted expert ids, and aborted on
@@ -399,9 +423,11 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Measurable drop in handoff bytes and/or splits on short attribution/profile vs coalesce-only; higher NPU duty cycle without inventing unsupported claims; Rust-first in `src/sched/` with thin `get_proc_address` POD export; attribution counters for cut cost / handoff / split shape. Full locked pp512 only when explicitly warranted.
   - Evidence: GitHub issue #48, `src/sched/region_coalesce.rs`, `src/sched/mod.rs`, `ADR/sched-region-coalesce-rust-first`, `docs/sched-region-coalesce.md`, issue #5.
 
-- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks.
+- `MILESTONE/residual-shared-binding-bounce` — Restore accurate no-copy binding attribution and reduce residual staged copies on LFM (GitHub #6). Develop `8cc351f` fullperf showed a false 0% no-copy line from merge-lost dispatch accounting; PR #19 restores the contract. PR #22 addresses a real residual cause: Direct no longer advertises foreign host bufts as bindable without copy, and refuses unimportable host alloc fallbacks. Buft probe/residency profile lines (`ADR/direct-npu-host-residency`, `docs/direct-buft-residency.md`) land next for short-attribution measurement of L0 `foreign_host` acceptance vs Direct refusal; selective allowlist remains gated off.
   - Acceptance: With shared bindings enabled, profile imported/staged counters and bounce allocation events match direct-vs-staged reality; residual staged volume moves toward remediation or better without requiring a locked fullperf as the first gate (binding counters / short attribution suffice).
-  - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`, `src/backend/shell.rs`, `src/backend/buffer.rs`, issue #6, PR #19, PR #22.
+  - Evidence: `src/vendor/ivpu/session_direct.rs`, `src/vendor/ivpu/direct/prepare.rs`,
+    `src/backend/shell.rs`, `src/backend/buffer.rs`, `src/backend/buft.rs`,
+    `docs/direct-buft-residency.md`, issue #6, PR #19, PR #22.
 
 - `MILESTONE/retire-level-zero-compat` — Keep Level Zero as the compatibility runtime and differential oracle until direct submission is qualified beyond the tiny artifact.
   - Acceptance: The same artifact/model corpus passes direct and Level Zero with matching binding metadata and numerics; direct relocation/HPI/firmware checks, resident accounting, import/copy behavior, synchronization, device-loss handling, reset recovery, and required operation coverage are proven.
