@@ -58,12 +58,13 @@ The following is **verified** in the current ggml-npu tree.
    locates `OpenVINOConfig.cmake`. The Rust crate does not link OpenVINO directly.
 6. `src/vendor/ivpu/lower/graph.rs` asks the compiler for a transient blob and passes the exact
    semantic key and runtime bindings to the selected session.
-7. With `level-zero-compat`, `src/vendor/ivpu/session.rs` creates a
+7. With `level-zero-compat`, `src/vendor/ivpu/session_level_zero.rs` creates a
    `ZE_GRAPH_FORMAT_NATIVE` graph, discovers blob arguments, initializes it, records bindings and
-   execution, and drops the transient bytes. By default, `src/vendor/ivpu/session_direct.rs` parses
-   the Intel ELF, validates firmware and memory requirements, applies the controlled relocation
-   allowlist, allocates/imports buffers, builds HostParsedInference and commands, and submits through
-   the `intel_vpu` DRM UAPI. Therefore replacing compilation does not imply replacing either runtime.
+   execution, and drops the transient bytes. By default, `src/vendor/ivpu/session.rs` (Direct IVPU)
+   parses the Intel ELF, validates firmware and memory requirements, applies the controlled
+   relocation allowlist, allocates/imports buffers, builds HostParsedInference and commands, and
+   submits through the `intel_vpu` DRM UAPI. Therefore replacing compilation does not imply
+   replacing either runtime.
 8. `src/runtime/artifact.rs` already defines a pointer-free outer envelope, opaque target identity,
    format identifier, binding ABI, payload/resident sizes, and compatibility checks.
 
@@ -372,7 +373,7 @@ Intel:
 - add `src/vendor/ivpu/compiler/{mod.rs,ffi.rs,lower.rs,target.rs}`
 - change `src/vendor/ivpu/lower/graph.rs`, `src/vendor/ivpu/lower/matmul.rs`,
   `src/vendor/ivpu/lower/subgraph.rs`, `src/vendor/ivpu/session.rs`,
-  `src/vendor/ivpu/session_direct.rs`, and direct artifact validation as required
+  `src/vendor/ivpu/session_level_zero.rs`, and direct artifact validation as required
 - retire `src/vendor/ivpu/compile.rs` and finally delete `shim/`
 - in the Intel compiler fork, add a standalone provider library/C header, neutral-request decoder,
   GraphIr-to-IE lowering, diagnostics, and standalone CMake profile; refactor existing pipeline,

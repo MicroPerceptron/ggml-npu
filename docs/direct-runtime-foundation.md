@@ -6,6 +6,8 @@ The dependency and promotion rules for this implementation are defined in
 This milestone introduces an OS-neutral runtime contract and a Linux implementation without
 replacing the working OpenVINO + Level Zero path. `rustix` supplies syscall mechanics only; it does
 not define Intel firmware commands, graph formats, queue semantics, or compiler behavior.
+Default execution lives in `src/vendor/ivpu/session.rs` (Direct IVPU); Level Zero remains an
+opt-in oracle in `src/vendor/ivpu/session_level_zero.rs` behind `level-zero-compat`.
 
 ## Implemented boundary
 

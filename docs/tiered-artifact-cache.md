@@ -183,7 +183,7 @@ Not yet hardware-proven:
 
 The active tree overlaps this work in `src/host/linux/process.rs`, `src/metrics.rs`,
 `src/vendor/ivpu/compile.rs`, `src/vendor/ivpu/profile.rs`, and
-`src/vendor/ivpu/session_direct.rs`. The last two compiler/runtime files should be merged
+`src/vendor/ivpu/session.rs`. The last two compiler/runtime files should be merged
 semantically, not accepted wholesale:
 
 1. Rebase or apply the saved patch after the zero-copy branch is stable.

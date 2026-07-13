@@ -1,9 +1,10 @@
 //! Intel NPU (`intel_vpu` driver) — the active vendor.
 //!
-//! Runtime: **Level Zero** ([`ze`], [`graph`]). Compile: OpenVINO via the shim, cached
-//! per-shape ([`compile`]). Op lowerings live under [`lower`]. [`IvpuVendor`] is the
-//! [`crate::vendor::Vendor`] impl the agnostic backend dispatches to; [`IvpuHal`] is the
-//! (still-aspirational) 5-verb submission seam.
+//! Runtime: **Direct IVPU** ([`session`], [`direct`]) by default. Opt-in Level Zero oracle
+//! ([`session_level_zero`], [`ze`], [`graph`]) behind `level-zero-compat`. Compile: OpenVINO
+//! via the shim, cached per-shape ([`compile`]). Op lowerings live under [`lower`].
+//! [`IvpuVendor`] is the [`crate::vendor::Vendor`] impl the agnostic backend dispatches to;
+//! [`IvpuHal`] is the (still-aspirational) 5-verb submission seam.
 
 pub(crate) mod address;
 pub(crate) mod artifact;
@@ -12,19 +13,20 @@ mod compile;
 pub(crate) use compile::wire_op_compile_supported;
 #[cfg(feature = "direct-ivpu")]
 pub mod direct;
-#[cfg(all(feature = "bench-hardware", feature = "level-zero-compat"))]
-#[path = "session_direct.rs"]
-mod direct_benchmark_session;
 #[cfg(feature = "level-zero-compat")]
 mod graph;
 mod lower;
 mod profile;
+/// Default execution session: Direct IVPU DRM submission.
+#[cfg(feature = "direct-ivpu")]
+mod session;
+/// Opt-in Level Zero compatibility/oracle session (not the default runtime).
 #[cfg(feature = "level-zero-compat")]
-mod session;
-#[cfg(all(not(feature = "level-zero-compat"), feature = "direct-ivpu"))]
-#[path = "session_direct.rs"]
-mod session;
-#[cfg(all(not(feature = "level-zero-compat"), not(feature = "direct-ivpu")))]
+mod session_level_zero;
+/// L0-only builds (no `direct-ivpu`): expose the oracle module as `session`.
+#[cfg(all(not(feature = "direct-ivpu"), feature = "level-zero-compat"))]
+use session_level_zero as session;
+#[cfg(all(not(feature = "direct-ivpu"), not(feature = "level-zero-compat")))]
 #[path = "session_unavailable.rs"]
 mod session;
 #[cfg(feature = "level-zero-compat")]
@@ -273,7 +275,7 @@ impl LevelZeroBenchmarkFixture {
 
 #[cfg(feature = "bench-hardware")]
 pub(crate) enum HardwareBenchmarkFixture {
-    Direct(direct_benchmark_session::DirectBenchmarkFixture),
+    Direct(session::DirectBenchmarkFixture),
     LevelZero(LevelZeroBenchmarkFixture),
 }
 
@@ -281,7 +283,7 @@ pub(crate) enum HardwareBenchmarkFixture {
 impl HardwareBenchmarkFixture {
     pub fn new(kind: u32, blob: &[u8], inputs: &[&[f32]]) -> Result<Self, i32> {
         match kind {
-            0 => direct_benchmark_session::DirectBenchmarkFixture::new(blob, inputs)
+            0 => session::DirectBenchmarkFixture::new(blob, inputs)
                 .map(Self::Direct)
                 .map_err(|_| -1),
             1 => LevelZeroBenchmarkFixture::new(blob, inputs)
