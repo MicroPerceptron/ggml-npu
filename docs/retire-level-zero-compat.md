@@ -18,7 +18,7 @@ qualification, GitHub [#63](https://github.com/MicroPerceptron/ggml-npu/issues/6
 | Claim-stage duty cycle near L0 (LFM shape) | **Done (parity of shape)** | Claim+stage + pad fix: locked Direct ~**205** tok/s / ~**470** disp vs L0 ~**266** / ~**488** (`BENCH/lfm-pp512-371b06d-coa1-cut1-cs1` vs `BENCH/lfm-pp512-68b7e8d-level-zero-flexiblas-coa1`). Gap remains; shape is L0-class |
 | ELF pad / binding cover under claim-stage | **Done** | PR #62: stage when ELF `allocation_bytes` pad exceeds shared view (`FINDING/claim-stage-elf-pad-binding-mismatch`) |
 | Model-corpus Direct↔L0 binding + numeric parity | **Required** | Same artifact/model corpus: binding metadata, relocations, HPI/firmware pins, resident accounting, import/copy, output tolerances — not tiny-only |
-| In-flight / hang abort after partial execution | **Required** | Kernel hang-reset and abort of in-flight work beyond cooperative cancel + post-fault reset (#56 leftover) |
+| In-flight / hang abort after partial execution | **Required** | Kernel hang-reset and abort of in-flight work beyond cooperative cancel + post-fault reset (post-#57 leftover) |
 | Required Direct op coverage leftovers | **Required** | ShortConv / RoPE / FA / MoE paths still tracked on #9 / #10 / #11; Direct must not depend on L0 for those gates |
 | Default-on knobs productization | **Required** | `GGML_SCHED_NPU_CLAIM_STAGE`, coalesce, cut-cost (and related) remain opt-in; product default path must not need a secret matrix to match L0-class duty cycle |
 
