@@ -385,8 +385,15 @@ pub const NPU_PRESERVE_MIN_BYTES: u64 = 64 * 1024;
 /// Prefer fat islands: require ≥3 non-view ops (2-op islands dissolve unless
 /// they meet the byte floor). MVP used 2 and inflated pp16 dispatch count.
 pub const NPU_PRESERVE_MIN_OPS: usize = 3;
+/// All-light glue needs a stricter op floor so asymmetric +light growth cannot
+/// mint barely-3-op preserves (preserve-all / ~412 failure class). Byte floor
+/// still applies.
+pub const NPU_PRESERVE_MIN_OPS_ALL_LIGHT: usize = 4;
 /// Heavy MatMul/FA unitary may preserve below the fat byte floor when large enough.
 pub const NPU_HEAVY_PRESERVE_MIN_BYTES: u64 = 16 * 1024;
+/// Neighbor NPU run length at which light/medium glue may use a wider absorb.
+/// Growing onto a unitary neighbor stays conservative.
+pub const NPU_FAT_NEIGHBOR_MIN_OPS: usize = 2;
 
 /// Decision for absorbing a foreign island into a target backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,9 +477,24 @@ fn record_decision(
 }
 
 /// True when an NPU island is worth keeping instead of dissolving into surround.
+///
+/// All-light islands use a stricter op floor ([`NPU_PRESERVE_MIN_OPS_ALL_LIGHT`])
+/// so small light absorbs cannot mint barely-3-op preserves.
 #[inline]
-pub fn is_fat_npu_island(island_op_count: usize, island_nbytes_sum: u64) -> bool {
-    island_op_count >= NPU_PRESERVE_MIN_OPS || island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES
+pub fn is_fat_npu_island(
+    island_op_count: usize,
+    island_nbytes_sum: u64,
+    compute: IslandCompute,
+) -> bool {
+    if island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES {
+        return true;
+    }
+    let min_ops = if compute.all_light {
+        NPU_PRESERVE_MIN_OPS_ALL_LIGHT
+    } else {
+        NPU_PRESERVE_MIN_OPS
+    };
+    island_op_count >= min_ops
 }
 
 /// Heavy compute on NPU is worth preserving even as a thin unitary when large enough.
@@ -486,13 +508,15 @@ pub fn is_heavy_compute_worth_preserving(
 
 /// Prefer an existing NPU neighbor as absorb target (anti-unitary growth).
 ///
-/// Does **not** invent NPU placement when neither neighbor is NPU — that would
-/// paint new NPU islands inside Vulkan/CPU runs.
+/// When both sides are NPU, prefer the larger activation edge (more handoff
+/// saved). Does **not** invent NPU when neither neighbor is NPU.
 pub fn npu_absorb_target(
     left: i32,
     right: i32,
     kinds: &[BackendKind],
     weighted: bool,
+    left_edge_nbytes: u32,
+    right_edge_nbytes: u32,
 ) -> Option<i32> {
     if !weighted || left < 0 || right < 0 {
         return None;
@@ -500,7 +524,13 @@ pub fn npu_absorb_target(
     let left_npu = kind_at(kinds, left).is_npu();
     let right_npu = kind_at(kinds, right).is_npu();
     match (left_npu, right_npu) {
-        (true, true) => Some(left), // sandwich / both NPU: grow left (same id when equal)
+        (true, true) => {
+            if left == right || left_edge_nbytes >= right_edge_nbytes {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
         (true, false) => Some(left),
         (false, true) => Some(right),
         (false, false) => None,
@@ -512,7 +542,8 @@ pub fn npu_absorb_target(
 /// - Growing onto NPU: absorb when feasible (caller already checked mask).
 /// - Dissolving an NPU island into non-NPU: refuse when fat **or** when the
 ///   island carries heavy MatMul/FA compute above
-///   [`NPU_HEAVY_PRESERVE_MIN_BYTES`]; thin light unitaries may still dissolve.
+///   [`NPU_HEAVY_PRESERVE_MIN_BYTES`]; thin light unitaries / 3-op all-light
+///   scraps may still dissolve.
 /// - Other sandwiches: absorb when estimated cut cost drops (or nbytes unknown).
 pub fn decide_absorb(
     island_backend: i32,
@@ -533,12 +564,12 @@ pub fn decide_absorb(
 
     // Prefer fat / heavy-compute NPU regions: keep them off Vulkan/CPU.
     if island_k.is_npu() && !target_k.is_npu() {
-        if is_fat_npu_island(island_op_count, island_nbytes_sum)
+        if is_fat_npu_island(island_op_count, island_nbytes_sum, compute)
             || is_heavy_compute_worth_preserving(island_nbytes_sum, compute)
         {
             return AbsorbDecision::RefusePreserveNpu;
         }
-        // Thin unitary / small 2-op NPU (light or tiny heavy): allow classic dissolve.
+        // Thin unitary / small 2-op / 3-op all-light NPU: allow classic dissolve.
         return AbsorbDecision::Absorb;
     }
 
@@ -548,20 +579,14 @@ pub fn decide_absorb(
     }
 
     // Non-NPU sandwich: require estimated latency improvement when we have sizes.
-    // Throughput tie-break: refuse dissolving a heavy island into another non-NPU
-    // when there is no latency gain (already RefuseNoGain when before==0).
     if island_nbytes_sum == 0 && left_edge_nbytes == 0 && right_edge_nbytes == 0 {
         return AbsorbDecision::Absorb; // fall back to length-only coalesce
     }
     let before = edge_cost(left_edge_nbytes, target_k, island_k)
         .saturating_add(edge_cost(right_edge_nbytes, island_k, target_k));
-    // After absorb there is no cut at this sandwich.
     let after = 0u64;
     if after < before {
         AbsorbDecision::Absorb
-    } else if compute.any_heavy {
-        // No latency win and heavy compute: keep current placement.
-        AbsorbDecision::RefuseNoGain
     } else {
         AbsorbDecision::RefuseNoGain
     }
@@ -587,10 +612,12 @@ pub fn note_absorb_outcome(
 }
 
 /// Effective max island length: boost when absorbing into NPU across heavy edges
-/// or when the island is all-light glue (throughput-friendly anti-unitary growth).
+/// or when growing light/medium glue onto an **already multi-op** NPU neighbor.
 ///
-/// Light boost stays modest (+3 vs +2): a flat 2× light `max_island` regressed
-/// pp16 toward the preserve-all ~412-disp failure mode.
+/// Fat-neighbor preferential growth: wider +4/+3 only when
+/// `npu_neighbor_ops ≥ `[`NPU_FAT_NEIGHBOR_MIN_OPS`]. Growing onto a unitary
+/// NPU neighbor stays at +2 so we do not recreate barely-fat light preserves
+/// (flat 2× light boost → pp16 ~412 rejected).
 pub fn effective_max_island(
     base: usize,
     target_backend: i32,
@@ -599,6 +626,7 @@ pub fn effective_max_island(
     right_edge_nbytes: u32,
     weighted: bool,
     compute: IslandCompute,
+    npu_neighbor_ops: usize,
 ) -> usize {
     if !weighted {
         return base;
@@ -607,13 +635,14 @@ pub fn effective_max_island(
         return base;
     }
     let edge = left_edge_nbytes.max(right_edge_nbytes);
-    // ≥256 KiB boundary → allow up to 2× island; ≥1 MiB → 3× (capped).
+    let fat_neighbor = npu_neighbor_ops >= NPU_FAT_NEIGHBOR_MIN_OPS;
     if edge >= 1 << 20 {
         base.saturating_mul(3).min(base.saturating_add(12))
     } else if edge >= 1 << 18 {
         base.saturating_mul(2).min(base.saturating_add(8))
-    } else if compute.all_light && edge >= 4096 {
-        // Light glue with a real activation edge: slightly wider absorb.
+    } else if fat_neighbor && compute.all_light && edge >= 4096 {
+        base.saturating_add(4)
+    } else if fat_neighbor && !compute.any_heavy && edge >= 4096 {
         base.saturating_add(3)
     } else {
         base.saturating_add(2)
@@ -671,8 +700,17 @@ mod tests {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
         let d = decide_absorb(1, 0, &kinds, 128 * 1024, 1, 4096, 4096, true, light());
         assert_eq!(d, AbsorbDecision::RefusePreserveNpu);
-        let multi = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true, light());
+        let multi = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true, IslandCompute::default());
         assert_eq!(multi, AbsorbDecision::RefusePreserveNpu);
+        let light4 = decide_absorb(1, 0, &kinds, 1024, 4, 4096, 4096, true, light());
+        assert_eq!(light4, AbsorbDecision::RefusePreserveNpu);
+    }
+
+    #[test]
+    fn dissolve_three_op_all_light_npu() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        let d = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true, light());
+        assert_eq!(d, AbsorbDecision::Absorb);
     }
 
     #[test]
@@ -716,10 +754,17 @@ mod tests {
     #[test]
     fn npu_target_asymmetric_picks_npu_neighbor() {
         let kinds = [BackendKind::Npu, BackendKind::Gpu, BackendKind::Cpu];
-        assert_eq!(npu_absorb_target(0, 2, &kinds, true), Some(0));
-        assert_eq!(npu_absorb_target(2, 0, &kinds, true), Some(0));
-        assert_eq!(npu_absorb_target(1, 2, &kinds, true), None);
-        assert_eq!(npu_absorb_target(0, 2, &kinds, false), None);
+        assert_eq!(npu_absorb_target(0, 2, &kinds, true, 4096, 1024), Some(0));
+        assert_eq!(npu_absorb_target(2, 0, &kinds, true, 1024, 4096), Some(0));
+        assert_eq!(npu_absorb_target(1, 2, &kinds, true, 1024, 1024), None);
+        assert_eq!(npu_absorb_target(0, 2, &kinds, false, 4096, 1024), None);
+    }
+
+    #[test]
+    fn npu_target_both_npu_prefers_heavier_edge() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu, BackendKind::Npu];
+        assert_eq!(npu_absorb_target(0, 2, &kinds, true, 1024, 8192), Some(2));
+        assert_eq!(npu_absorb_target(0, 2, &kinds, true, 8192, 1024), Some(0));
     }
 
     #[test]
@@ -757,19 +802,24 @@ mod tests {
     #[test]
     fn npu_max_island_boost_on_heavy_edge() {
         let kinds = [BackendKind::Npu, BackendKind::Gpu];
-        let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true, light());
+        let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true, light(), 1);
         assert!(boosted > 4);
         assert_eq!(
-            effective_max_island(4, 1, &kinds, 1 << 20, 64, true, light()),
+            effective_max_island(4, 1, &kinds, 1 << 20, 64, true, light(), 4),
             4
         );
-        // Light NPU growth edge still gets +2 anti-unitary headroom.
         assert_eq!(
-            effective_max_island(4, 0, &kinds, 64, 64, true, IslandCompute::default()),
+            effective_max_island(4, 0, &kinds, 8192, 64, true, light(), 1),
             6
         );
-        // All-light glue with real edge gets +3.
-        assert_eq!(effective_max_island(4, 0, &kinds, 8192, 64, true, light()), 7);
+        assert_eq!(
+            effective_max_island(4, 0, &kinds, 8192, 64, true, light(), 2),
+            8
+        );
+        assert_eq!(
+            effective_max_island(4, 0, &kinds, 8192, 64, true, IslandCompute::default(), 3),
+            7
+        );
     }
 
     #[test]
