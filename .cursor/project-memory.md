@@ -288,19 +288,30 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
   `traits.attention`, so `graph_feasible` rejected ShortConv/mutable-state write regions unless
-  `GGML_NPU_ATTENTION=full`. SetRows is stateful scatter (also used by LFM `cache_r*` recurrent
-  writes via CPY/GET_ROWS adjacency), not attention SoftMax/FA. Under
-  `GGML_NPU_LFM_SHORTCONV`, placement now pulls SSM_CONV/SET_ROWS/GET_ROWS/CPY when they sit under
-  `.conv.` ancestry or touch `cache_r*` (not `cache_k`/`cache_v`). Connected
-  gather→SSM_CONV→SetRows stays one semantic region; when Intel refuses SSM_CONV+SET_ROWS fusion,
-  the engine peels `feasibility_limit` adjacent NPU programs and never host-realizes those
-  stateful edges as `layout_glue_host`. Coverage matrix rows for SsmConv/GetRows/SetRows are
-  hermetic with those proofs plus the shim numerical script.
+  `GGML_NPU_ATTENTION=full`. SetRows is stateful scatter (KV / generic), not SoftMax/FA. LFM
+  ShortConv recurrent writes use **`ggml_cpy` into a view of `cache_r*`** (not SetRows; see
+  `llama.cpp` `models/lfm2.cpp`). Under `GGML_NPU_LFM_SHORTCONV`, placement pulls
+  SSM_CONV/SET_ROWS/GET_ROWS/CPY under `.conv.` ancestry or `cache_r*` (including `view_src`
+  chains when the CPY node name omits `cache_r`). Connected gather→SSM_CONV→SetRows **and**
+  LFM gather→CPY(`cache_r`)→SSM_CONV stay one semantic region; when Intel refuses
+  SSM_CONV+state-write fusion, the engine peels `feasibility_limit` adjacent NPU programs and
+  never host-realizes those stateful edges as `layout_glue_host`.
   - Scope: Capability/placement/partition contract for ShortConv state edges (#9); not a claim
-    that one OpenVINO program can fuse SSM_CONV+SET_ROWS, nor that LFM pp16 state-boundary
-    attribution is already reduced.
+    that one OpenVINO program can fuse SSM_CONV+SET_ROWS/CPY, nor that Direct places LFM CPY
+    writeback on NPU without `cache_r` NPU_HOST residency (view_src follows host buft).
   - Evidence: `src/graph.rs`, `src/policy.rs`, `src/engine.rs`, `tests/coverage_matrix.csv`,
-    `tests/graph_ir_shortconv_check.c`, GitHub issue #9, PR #34.
+    `docs/coverage-gates.md`, `tests/graph_ir_shortconv_check.c`, GitHub issue #9, PRs #34/#45/#58.
+  - Verified: 2026-07-13
+
+- `FINDING/shortconv-lfm-cpy-direct-buft-gap` — On Direct with honest `supports_buft` (NPU_HOST
+  only), LFM pp16 ShortConv smokes show GetRows+SsmConv on NPU but **zero** `Copy`/`SetRows`
+  claims: `ggml_cpy` into `cache_r` is a view whose backend follows the CPU recurrent buffer, so
+  the scheduler keeps the write off NPU unless claim+stage / residency moves `cache_r` onto
+  NPU_HOST (#6/#52). Hermetic peel for claimed CPY+SSM_CONV remains preferred over
+  `layout_glue_host`; do not invent OV fusion.
+  - Scope: Direct placement of LFM state writeback under buft-safe coalesce; not a locked pp512.
+  - Evidence: `benchmarks/results/develop-125b9f8-targeted-pp16-sharing-on-shortconv-cpy/`,
+    `FINDING/shortconv-setrows-attention-gate`, issue #9, PR #58.
   - Verified: 2026-07-13
 
 - `FINDING/prefill-qkv-rope-not-attention-gate` — `WireOp::Rope` and `WireOp::Permute` were tagged
@@ -572,6 +583,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `ab3eceb` 66-disp; pp128 soft tok/s slightly below coalesce-off despite fewer dispatches.
   - Evidence: `benchmarks/results/develop-8ec283e-targeted-pp{16,128}-sharing-on-coa{0,1}-buftsafe/`,
     GitHub #5, llama.cpp#12, ggml-npu PR #50.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-shortconv-cpy-pp16-targeted` — PR #58 tip, LFM Q4_K_M pp16 r=1 sharing-on
+  ShortConv=1 MoE=0 ATTENTION=full `COALESCE=1`, Direct, `-t 6`, flock + `ALLOW_HIGH_SWAP=1`:
+  exit 0; **108** disp / 55.6% unitary / avg nodes 1.85; soft ~59.5 tok/s;
+  `mutable_state_boundary=0`; SsmConv/GetRows claimed; **Copy=0 / SetRows=0** on NPU
+  (`FINDING/shortconv-lfm-cpy-direct-buft-gap`).
+  - Limitation: Soft r=1 only; not locked pp512; does not place LFM CPY writeback on Direct.
+  - Evidence: `benchmarks/results/develop-125b9f8-targeted-pp16-sharing-on-shortconv-cpy/`,
+    issue #9, PR #58.
+  - Reproduce: `THREADS=6 PROMPT_TOKENS=16 GGML_SCHED_REGION_COALESCE=1` targeted smoke with
+    ShortConv=1 MoE=0 ATTENTION=full.
   - Verified: 2026-07-13
 
 - `BENCH/lfm-pp512-direct-ivpu-aace217` — LFM2.5 8B.A1B Q4_K Medium pp512 on Lunar Lake, OpenVINO native-artifact compilation plus direct-IVPU submission, full attention placement, flash attention on, direct MoE disabled, scheduler fallback allowed, 8 threads and 3 repetitions: `8.292 ± 0.147 tok/s`, `61.758 ± 1.097 s`; 632 direct dispatches, 6.21 GiB peak RSS, and 3.19 GiB NPU high-water usage.
