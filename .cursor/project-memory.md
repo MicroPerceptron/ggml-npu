@@ -40,8 +40,8 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     mitigates FFI cost vs split overhead. Avoids growing opaque C++ scheduler logic.
     Host apply guards prevent Vulkan buffer inconsistency (pp128 SEGV).
   - Evidence: `docs/sched-region-coalesce.md`, `src/sched/region_coalesce.rs`,
-    `src/backend/shell.rs`, PR #41/#44; companion llama.cpp hook PRs
-    MicroPerceptron/llama.cpp#10/#11.
+    `src/backend/shell.rs`, PR #41/#44/#50; companion llama.cpp hook PRs
+    MicroPerceptron/llama.cpp#10/#11/#12.
   - Verified: 2026-07-13
 
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
@@ -114,16 +114,33 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `FINDING/sched-region-coalesce-pp128-vulkan-segv` — Unguarded `GGML_SCHED_REGION_COALESCE=1`
   island absorb into Vulkan left incompatible buffers inside Vulkan splits; LFM pp128
-  SIGSEGV in `ggml_vk_build_graph` (pp16 survived). Fix: llama.cpp apply only NPU/same-buft
-  + `view_src` sync (PR MicroPerceptron/llama.cpp#11); Rust leaves views untouched and
-  documents the contract (ggml-npu PR #44). Nearest-neighbor view paint rejected (broke
-  weight views, still crashed).
-  - Scope: Prefill coalesce enablement safety; not a claim that Vulkan-sandwich absorbs are
-    restored or that pp16 66-disp coalesce wins return under the NPU-only guard.
+  SIGSEGV in `ggml_vk_build_graph` (pp16 survived). Interim fix: llama.cpp apply only
+  NPU/same-buft + `view_src` sync (PR MicroPerceptron/llama.cpp#11); Rust leaves views
+  untouched (ggml-npu PR #44). Nearest-neighbor view paint rejected (broke weight views,
+  still crashed). Superseded for duty-cycle by buffer-safe apply
+  (`FINDING/sched-coalesce-buft-safe-duty-cycle`).
+  - Scope: Prefill coalesce enablement safety under the NPU-only guard era; does not
+    describe post–llama.cpp#12 behavior.
   - Evidence: `docs/sched-region-coalesce.md`, `src/sched/region_coalesce.rs`,
     `benchmarks/results/develop-ab3eceb-targeted-pp128-sharing-on-coalesce/`,
     `benchmarks/results/fix-coalesce-view-pp128-sharing-on-coalesce/`, GitHub #5, PRs #44 /
     llama.cpp#11.
+  - Verified: 2026-07-13
+
+- `FINDING/sched-coalesce-buft-safe-duty-cycle` — Buffer-safe coalesce apply (llama.cpp#12;
+  ggml-npu docs PR #50) allows non-NPU island absorbs only when every already-committed
+  buffer that would share the destination is `ggml_backend_supports_buft`-OK (unallocated
+  temps remain gallocr-safe). On develop tip with that apply, LFM sharing-on ShortConv=1
+  MoE=0 ATTENTION unset `COALESCE=1` raises duty cycle vs coalesce-off / prior NPU-only
+  guard without pp128 SEGV: pp16 **108** disp (vs 400 off) soft ~38 tok/s; pp128 **8**
+  disp (vs 12 off) soft ~71 tok/s. Does not fully restore unguarded `ab3eceb` pp16 66-disp
+  class; some staging returns (pp16 82.7% no-copy).
+  - Scope: Targeted r=1 attribution; not locked pp512; MoE `is_opt_in_one` unchanged.
+  - Evidence: `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-coa1-buftsafe/`,
+    `benchmarks/results/develop-8ec283e-targeted-pp16-sharing-on-coa0-buftsafe/`,
+    `benchmarks/results/develop-8ec283e-targeted-pp128-sharing-on-coa1-buftsafe/`,
+    `benchmarks/results/develop-8ec283e-targeted-pp128-sharing-on-coa0-buftsafe/`,
+    `docs/sched-region-coalesce.md`, GitHub #5, ggml-npu PR #50, llama.cpp#12.
   - Verified: 2026-07-13
 
 - `FINDING/direct-ivpu-tiny-execution` — Lunar Lake device `0x643e` revision 4 executed the same 45,192-byte vector-add artifact twice through direct IVPU. All 32 FP32 outputs were bit-identical to the Level Zero oracle; waits were bounded and successful cleanup restored the observed FD and device-memory baselines.
@@ -345,8 +362,20 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   dispatches, 50% unitary, avg nodes 3.00, soft ~83.2 tok/s (no SEGV). Matches coalesce-off
   dispatch shape on this prompt; prior unguarded coalesce crashed.
   - Limitation: Soft r=1 only; not locked pp512; NPU-only apply does not restore pp16’s prior
-    66-disp Vulkan-absorb win.
+    66-disp Vulkan-absorb win. Superseded for duty-cycle by
+    `BENCH/lfm-buft-safe-coalesce-targeted`.
   - Evidence: `benchmarks/results/fix-coalesce-view-pp128-sharing-on-coalesce/`, GitHub #5.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-buft-safe-coalesce-targeted` — LFM Q4_K_M targeted r=1 sharing-on ShortConv=1
+  MoE=0 ATTENTION unset, buffer-safe coalesce apply (llama.cpp#12 built atop `9e777bc77`),
+  direct-ivpu: coalesce=1 pp16 **108** disp / 55.6% unitary / avg nodes 1.85 / 82.7% no-copy /
+  soft 38.05 tok/s; pp128 **8** / 75% / 3.25 / 91.7% / 71.34. coalesce=0 controls: pp16 400 /
+  28% / 2.42 / 100% / 28.04; pp128 12 / 50% / 3.00 / 100% / 74.33. No SEGV.
+  - Limitation: Soft r=1 only; not locked pp512; pp16 does not fully match unguarded
+    `ab3eceb` 66-disp; pp128 soft tok/s slightly below coalesce-off despite fewer dispatches.
+  - Evidence: `benchmarks/results/develop-8ec283e-targeted-pp{16,128}-sharing-on-coa{0,1}-buftsafe/`,
+    GitHub #5, llama.cpp#12, ggml-npu PR #50.
   - Verified: 2026-07-13
 
 - `BENCH/lfm-pp512-direct-ivpu-aace217` — LFM2.5 8B.A1B Q4_K Medium pp512 on Lunar Lake, OpenVINO native-artifact compilation plus direct-IVPU submission, full attention placement, flash attention on, direct MoE disabled, scheduler fallback allowed, 8 threads and 3 repetitions: `8.292 ± 0.147 tok/s`, `61.758 ± 1.097 s`; 632 direct dispatches, 6.21 GiB peak RSS, and 3.19 GiB NPU high-water usage.
@@ -391,9 +420,9 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Acceptance: Cross-adapter known-answer tests cover zero/copy/shared bindings, lifetime and aliasing, synchronization, unsupported negotiation, and deterministic cleanup without generic foreign-handle types.
   - Evidence: `docs/architecture-boundaries.md`, `docs/compiler-migration-plan.md`.
 
-- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). SoftMax/FA/runtime-weight KQ opt-in under exact `ATTENTION=full` is contracted (`FINDING/attention-runtime-core-opt-in`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse. PR #44 + llama.cpp#11 guard coalesce apply (`FINDING/sched-region-coalesce-pp128-vulkan-segv`). Post-#45/#46/#47 attribution on `8ec283e` (`FINDING/coverage-prs-gated-surface-not-duty-cycle`, `BENCH/lfm-post-coverage-8ec283e-targeted`) confirms gated surface only — pp128 still 12 disp. Next: buffer-safe Vulkan-sandwich absorbs (restore pp16 66-disp class wins); placement that grows proven NPU duty cycle vs `5db8513` 24/0.09 GiB; safe async overlap only after per-submission completion objects. Weighted cut-cost follow-on is `MILESTONE/sched-weighted-cut-cost` (#48).
+- `MILESTONE/scheduler-handoff-reduction` — Reduce llama.cpp scheduler splits and uneconomic unitary NPU programs so handoff is no longer first-order on LFM pp512 (GitHub #5; parent #4). First slice (FFN-shaped residual glue + `npu_program` attribution, plus FFN activation-on-`src[1]` fix) landed on `main` via PR #15 and is on `develop` via PR #20 (`95f4baa` / `a4c8530` / merge `b2ab6ad`). PR #22 raises the default unitary offload floor to `4× MIN_OFFLOAD_WORK` and deepens ShortConv ancestry (6→12) when `GGML_NPU_LFM_SHORTCONV` is on. PR #23 dependency-pulls claimed FFN glue / FFN-span layout, refuses non-claimable matmul pulls, and sets `FORCE_GRAPH` fusible depth 12 (`FINDING/offload-skipped-ffn-glue`). PR #25 adds Direct warm binding reuse for small similar programs (`FINDING/direct-warm-binding-reuse`). PR #35/#36 lock prefer-unclaim for standalone layout-only Metadata; layout-only regions inside claimed splits are host-realized as glue (`FINDING/layout-only-semantic-region-failclosed`). PR #39 untags RoPE/Permute from the SoftMax/FA attention gate and pulls QKV-adjacent RoPE/qk-norm/KV writes for prefill continuity (`FINDING/prefill-qkv-rope-not-attention-gate`). SoftMax/FA/runtime-weight KQ opt-in under exact `ATTENTION=full` is contracted (`FINDING/attention-runtime-core-opt-in`). PR #41 adds Rust same-backend region coalesce ABI (`ADR/rust-first-sched-region-coalesce`). Prefill-region coalesce (`FINDING/prefill-const-weight-match-node-overrefuse`) restores const-weight / ShortConv / FFN-named prefill pulls after the post-#38 surface collapse.   PR #44 + llama.cpp#11 guard coalesce apply (`FINDING/sched-region-coalesce-pp128-vulkan-segv`). Post-#45/#46/#47 attribution on `8ec283e` (`FINDING/coverage-prs-gated-surface-not-duty-cycle`, `BENCH/lfm-post-coverage-8ec283e-targeted`) confirmed gated surface only under NPU-only apply. Buffer-safe Vulkan-sandwich absorbs (llama.cpp#12 / ggml-npu PR #50; `FINDING/sched-coalesce-buft-safe-duty-cycle`, `BENCH/lfm-buft-safe-coalesce-targeted`) restore short-smoke duty cycle (pp16 400→108 disp; pp128 12→8; no SEGV) without full unguarded 66-disp restore. Next: close remaining gap toward `ab3eceb` 66-disp / locked pp512 handoff vs remediation; placement that grows proven NPU bytes vs `5db8513` 24/0.09 GiB; safe async overlap only after per-submission completion objects. Weighted cut-cost follow-on is `MILESTONE/sched-weighted-cut-cost` (#48).
   - Acceptance: Measurable drop in splits/pass and/or unitary NPU programs vs `BENCH/lfm-pp512-remediation-sharing-on`, **or** (post-unclaim) a clearly larger proven NPU duty cycle (dispatches/bytes/avg nodes) vs `5db8513` 24 / 0.09 GiB without soft-success; attribution hooks and tok/s movement toward Vulkan under the locked harness.
-  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, `src/sched/region_coalesce.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39, PR #41.
+  - Evidence: `src/policy.rs`, `src/ops/subgraph.rs`, `src/engine.rs`, `src/metrics.rs`, `src/vendor/ivpu/session_direct.rs`, `src/sched/region_coalesce.rs`, issue #5, PR #15, PR #20, PR #22, PR #23, PR #25, PR #39, PR #41, PR #50, llama.cpp#12.
 
 - `MILESTONE/sched-weighted-cut-cost` — Weighted DAG / bitmat-inspired cut-cost scheduler on top of landed same-backend region coalesce (GitHub #48; follow-on to #5 coalesce, contributes toward #4). Prefer feasible fat NPU prefill regions over fragmented unitaries by pricing partition cuts (heuristic bytes × backend-pair handoff factors); bitset/bit-parallel region analysis for topology only — not a blind axiom bitmat port, not a per-ioctl bandwidth oracle, and no thick C++ cost model. Claim profitability stays in `offload_op` / policy. Stubs already exist in `region_coalesce` (`_edge_cost_stub` site; C ABI unchanged).
   - Acceptance: Measurable drop in handoff bytes and/or splits on short attribution/profile vs coalesce-only; higher NPU duty cycle without inventing unsupported claims; Rust-first in `src/sched/` with thin `get_proc_address` POD export; attribution counters for cut cost / handoff / split shape. Full locked pp512 only when explicitly warranted.
