@@ -70,8 +70,10 @@ cargo check --features direct-ivpu    # safe direct Linux foundation; no graph e
 ```
 
 The direct runtime boundary and exact prerequisites for a first direct matmul are documented in
-[`docs/direct-runtime-foundation.md`](docs/direct-runtime-foundation.md). The existing OpenVINO and
-Level Zero runtime remains the default compatibility path. `direct-ivpu` enables a no-std,
+[`docs/direct-runtime-foundation.md`](docs/direct-runtime-foundation.md). Direct IVPU
+(`src/vendor/ivpu/session.rs`) is the default runtime. Level Zero remains an opt-in
+compatibility / differential oracle behind `level-zero-compat`
+(`src/vendor/ivpu/session_level_zero.rs`). `direct-ivpu` enables a no-std,
 ELF-only Goblin configuration for device artifacts; host shared-library loading continues to use
 the platform `dlopen`/`dlsym` boundary.
 

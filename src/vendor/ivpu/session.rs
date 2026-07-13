@@ -1,528 +1,1300 @@
-//! Zero-copy dispatch for a compiled NPU program (one matmul, or a fused subgraph): a per-blob
-//! graph plus a per-node recorded execute list. The program has **N inputs and N outputs**; all
-//! weights are baked into the blob as compile-time `Constant`s, so they are neither bound nor
-//! copied. A single matmul is just the `1 input, 1 output` case (its input is the activation); a
-//! fused subgraph has one input per external boundary tensor and one output per node whose value
-//! leaves the subgraph (usually one — e.g. an FFN `down` — but several for a fan-out like Q/K/V).
-//!
-//! Two caches, both lock-free:
-//! - **[`CONST_GRAPHS`] / [`SG_GRAPHS`]** — one Level Zero graph per distinct *program*, keyed by
-//!   the same semantic identity that names the compiled artifact: `(weight ptr, M)` for a single
-//!   baked matmul, the exact [`sg_semantic_key`](super::compile::sg_semantic_key) for a fused
-//!   subgraph. The native blob is a **transient** compile artifact: [`build_graph`] parses it into
-//!   the driver-owned graph (`pfnCreate` then `pfnAppendGraphInitialize`, once), after which the
-//!   blob bytes are **freed** — only the graph is kept resident, so a program's weights are never
-//!   also held as a second, redundant copy of blob bytes in RAM.
-//! - **[`LISTS`]** — one recorded execute command list per program *instance*, keyed by a hash of
-//!   its **full binding set** (the program's graph identity plus every operand address). The list
-//!   bakes those pointers in at record time and is replayed verbatim, so the key must be the exact
-//!   set it was recorded with — keying on only the output address aliases distinct instances that
-//!   ggml's gallocr landed on a recycled address (a stale binding → NPU MMU fault). Addresses are
-//!   stable across tokens, so the common case is still a hit + verbatim replay; a shifted operand
-//!   simply re-records.
-//!
-//! Bindings are the operands' own `tensor->data` pointers when those live in NPU memory (our
-//! buffer type) — bound **zero copy**. A foreign operand (a CPU-produced activation, or an output
-//! consumed on CPU) is staged through a small bounce buffer. Single-threaded compute per backend;
-//! FP32 device I/O at the boundary.
+//! Direct IVPU execution session (default runtime) with byte-budgeted resident programs.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cmp::min;
-use core::ffi::c_void;
-use core::mem;
+use core::cell::UnsafeCell;
+use core::hint::spin_loop;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use super::cache::Cache;
+use super::direct::budget::RuntimeBudget;
+use super::direct::elf::parse_intel_elf_with_resident_limit;
+use super::direct::hpi::inspect_hpi_requirements;
+use super::direct::link::{visit_binding_requirements, DeviceMemoryClass};
+use super::direct::prepare::{
+    prepare_inference, prepare_inference_shared, rebind_inference_shared, PreparedInference,
+};
+use super::direct::transport::release_host_writes;
+use super::direct::{CommandQueue, IvpuDevice};
 use super::profile;
-use super::ze;
-use super::ze::raw::*;
-use super::NpuHostAlloc;
-use crate::host::{ConfigService, HostEnvironment};
+use crate::artifact_cache::WaitProvider;
+use crate::host::{ClockService, ConfigService, HostEnvironment};
+use crate::identity::{ExactKeyBuilder, ExactSemanticKey};
+use crate::metrics::MetricEvent;
 use crate::ops::Operand;
+use crate::runtime::{Deadline, RuntimeError};
 
-/// One graph argument: its index in the blob and element count (FP32 device I/O).
-#[derive(Clone, Copy)]
-struct ArgInfo {
-    index: u32,
-    elems: usize,
+struct DirectContext {
+    device: &'static IvpuDevice,
+    queue: CommandQueue<'static>,
 }
 
-/// A per-blob compiled graph: created + initialized once, shared by every instance using this blob.
-struct Graph {
-    handle: ze_graph_handle_t,
-    inputs: Vec<ArgInfo>, // the N inputs, in blob argument order; weights are baked, not args
-    outs: Vec<ArgInfo>,   // the N outputs, in blob argument order
+static CONTEXT: AtomicPtr<DirectContext> = AtomicPtr::new(ptr::null_mut());
+
+fn context() -> Result<&'static DirectContext, RuntimeError> {
+    let current = CONTEXT.load(Ordering::Acquire);
+    if !current.is_null() {
+        // SAFETY: published contexts are leaked and immutable after initialization.
+        return Ok(unsafe { &*current });
+    }
+    let device = Box::leak(Box::new(IvpuDevice::open_first()?));
+    let queue = device.create_queue(0, 0)?;
+    let candidate = Box::into_raw(Box::new(DirectContext { device, queue }));
+    match CONTEXT.compare_exchange(
+        ptr::null_mut(),
+        candidate,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // SAFETY: the winning allocation is process-lifetime.
+            Ok(unsafe { &*candidate })
+        }
+        Err(winner) => {
+            // SAFETY: this candidate was never published; dropping destroys its queue.
+            drop(unsafe { Box::from_raw(candidate) });
+            // SAFETY: the winner is a published process-lifetime context.
+            Ok(unsafe { &*winner })
+        }
+    }
 }
-// SAFETY: immutable after build; the Level Zero handle is shared read-only.
-unsafe impl Send for Graph {}
-unsafe impl Sync for Graph {}
 
-/// How one operand is fed. `bounce == None` → the operand's own NPU pointer was bound directly
-/// (zero copy). `Some(buf)` → a staging buffer, NPU-mapped via [`NpuHostAlloc`] and **owned** (freed
-/// with the [`NodeList`] rather than leaked as a raw pointer), through which `elems` f32 are copied
-/// each dispatch (the operand is in foreign, non-NPU memory). Its address is bound into the recorded
-/// execute list, so the allocation must outlive the list — which it does, being owned by it.
-struct Bind {
-    bounce: Option<Vec<u8, NpuHostAlloc>>,
-    elems: usize,
-}
-
-/// A per-instance recorded execute list. Operand pointers are baked in at record time (binding
-/// snapshot), so it is replayed verbatim across tokens.
-struct NodeList {
-    exec: ze_command_list_handle_t,
-    inputs: Vec<Bind>,
-    outs: Vec<Bind>,
-}
-// SAFETY: immutable after build; compute is single-threaded per backend.
-unsafe impl Send for NodeList {}
-unsafe impl Sync for NodeList {}
-
-/// One built graph per distinct program, keyed by the artifact's semantic identity — so the
-/// transient compile blob is dropped after [`build_graph`] rather than kept resident. `(weight
-/// ptr, M)` for a single baked matmul; the structural signature for a fused subgraph. Model-leaf
-/// weight pointers are stable (never recycled by gallocr, unlike activation buffers), so these keys
-/// are safe from the address-reuse aliasing that [`LISTS`] guards against.
-static CONST_GRAPHS: Cache<(u64, usize, i64), Option<&'static Graph>> = Cache::new(256);
-static SG_GRAPHS: Cache<(u64, crate::identity::ExactSemanticKey), Option<&'static Graph>> =
-    Cache::new(256);
-
-const MAX_INPUT_BINDINGS: usize = 64;
-const MAX_OUTPUT_BINDINGS: usize = 8;
-
-/// Exact recorded-command-list identity. A hash alone is unsafe here: a collision can replay a
-/// command list containing unrelated pointers and fault the NPU MMU. Fixed arrays keep the key
-/// `Copy` for the lock-free cache while covering the graph recognizer's explicit limits.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct BindingKey {
-    program: usize,
+struct ResidentProgram {
     generation: u64,
-    n_inputs: u8,
-    n_outputs: u8,
-    inputs: [usize; MAX_INPUT_BINDINGS],
-    outputs: [usize; MAX_OUTPUT_BINDINGS],
+    /// Resident-cache identity (program key for warm-reusable artifacts, else full binding key).
+    key: ExactSemanticKey,
+    program_key: ExactSemanticKey,
+    binding_fp: UnsafeCell<ExactSemanticKey>,
+    prepared: UnsafeCell<PreparedInference<'static>>,
+    /// Retained only for small artifacts so binding sets can re-JIT without recompile (#5).
+    warm_artifact: Option<alloc::sync::Arc<[u8]>>,
+    resident_bytes: u64,
+    accounted_bytes: u64,
+    last_used: AtomicU64,
+    pins: AtomicU32,
+    dispatch_locked: AtomicBool,
 }
 
-static LISTS: Cache<BindingKey, Option<&'static NodeList>> = Cache::new(2048);
-static PENDING: AtomicBool = AtomicBool::new(false);
+struct LoadingProgram {
+    generation: u64,
+    key: ExactSemanticKey,
+    state: Arc<AtomicU32>,
+}
+
+struct CacheState {
+    entries: Vec<Arc<ResidentProgram>>,
+    loading: Vec<LoadingProgram>,
+    resident_bytes: u64,
+    reserved_bytes: u64,
+    resident_high_water: u64,
+    accounted_high_water: u64,
+    clock: u64,
+    generation: u64,
+}
+
+fn oldest_unpinned(entries: impl Iterator<Item = (usize, u32, u64)>) -> Option<usize> {
+    entries
+        .filter(|(_, pins, _)| *pins == 0)
+        .min_by_key(|(_, _, last_used)| *last_used)
+        .map(|(index, _, _)| index)
+}
+
+impl CacheState {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            loading: Vec::new(),
+            resident_bytes: 0,
+            reserved_bytes: 0,
+            resident_high_water: 0,
+            accounted_high_water: 0,
+            clock: 0,
+            generation: 0,
+        }
+    }
+
+    fn evict_one(&mut self) -> Option<Arc<ResidentProgram>> {
+        let candidate = oldest_unpinned(self.entries.iter().enumerate().map(|(index, entry)| {
+            (
+                index,
+                entry.pins.load(Ordering::Acquire),
+                entry.last_used.load(Ordering::Relaxed),
+            )
+        }));
+        let index = candidate?;
+        let entry = self.entries.swap_remove(index);
+        self.resident_bytes = self.resident_bytes.saturating_sub(entry.resident_bytes);
+        profile::note(&alloc::format!(
+            "[npu direct] evict resident={} accounted={} remaining={}\n",
+            entry.resident_bytes,
+            entry.accounted_bytes,
+            self.resident_bytes
+        ));
+        profile::event(MetricEvent::CacheEviction {
+            cache: "direct-programs",
+            reason: "capacity",
+            bytes: entry.resident_bytes,
+        });
+        Some(entry)
+    }
+
+    fn make_room(
+        &mut self,
+        bytes: u64,
+        high_water: u64,
+        low_water: u64,
+    ) -> Option<Vec<Arc<ResidentProgram>>> {
+        let mut evicted = Vec::new();
+        if bytes > high_water {
+            return None;
+        }
+        let projected = self
+            .resident_bytes
+            .checked_add(self.reserved_bytes)
+            .and_then(|total| total.checked_add(bytes));
+        if projected.is_some_and(|total| total <= high_water) {
+            return Some(evicted);
+        }
+        let target_before_insert = low_water.saturating_sub(bytes);
+        while self.resident_bytes.saturating_add(self.reserved_bytes) > target_before_insert {
+            evicted.push(self.evict_one()?);
+        }
+        Some(evicted)
+    }
+}
+
+struct ResidentCache {
+    locked: AtomicBool,
+    state: UnsafeCell<CacheState>,
+}
+
+impl ResidentCache {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            state: UnsafeCell::new(CacheState::new()),
+        }
+    }
+
+    fn lock(&self) -> CacheGuard<'_> {
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        CacheGuard { cache: self }
+    }
+}
+
+// SAFETY: all access to the UnsafeCell is serialized by the atomic lock.
+unsafe impl Sync for ResidentCache {}
+
+struct CacheGuard<'a> {
+    cache: &'a ResidentCache,
+}
+
+impl CacheGuard<'_> {
+    fn state(&mut self) -> &mut CacheState {
+        // SAFETY: this guard uniquely owns the cache lock.
+        unsafe { &mut *self.cache.state.get() }
+    }
+}
+
+impl Drop for CacheGuard<'_> {
+    fn drop(&mut self) {
+        self.cache.locked.store(false, Ordering::Release);
+    }
+}
+
+static PROGRAMS: ResidentCache = ResidentCache::new();
+static DEVICE_FAILED: AtomicBool = AtomicBool::new(false);
+static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static ACCOUNTED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+const LOAD_RUNNING: u32 = 1;
+const LOAD_COMPLETE: u32 = 2;
+
+struct PinnedProgram {
+    program: Arc<ResidentProgram>,
+}
+
+impl Drop for PinnedProgram {
+    fn drop(&mut self) {
+        self.program.pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DispatchGuard<'a> {
+    program: &'a ResidentProgram,
+}
+
+impl ResidentProgram {
+    fn prepared(&self) -> &PreparedInference<'static> {
+        // SAFETY: exclusive dispatch lock or single-threaded construction before publish.
+        unsafe { &*self.prepared.get() }
+    }
+
+    fn prepared_mut(&self) -> &mut PreparedInference<'static> {
+        // SAFETY: caller holds `dispatch_locked` exclusively for this program.
+        unsafe { &mut *self.prepared.get() }
+    }
+
+    fn binding_fp(&self) -> &ExactSemanticKey {
+        // SAFETY: exclusive dispatch lock or cache lock during lookup publication.
+        unsafe { &*self.binding_fp.get() }
+    }
+
+    fn set_binding_fp(&self, fingerprint: ExactSemanticKey) {
+        // SAFETY: caller holds `dispatch_locked` exclusively for this program.
+        unsafe {
+            *self.binding_fp.get() = fingerprint;
+        }
+    }
+
+    fn lock_dispatch(&self) -> DispatchGuard<'_> {
+        while self
+            .dispatch_locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        DispatchGuard { program: self }
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.program.dispatch_locked.store(false, Ordering::Release);
+    }
+}
+
+struct LoadingGuard {
+    state: Arc<AtomicU32>,
+}
+
+impl Drop for LoadingGuard {
+    fn drop(&mut self) {
+        self.state.store(LOAD_COMPLETE, Ordering::Release);
+        {
+            let mut guard = PROGRAMS.lock();
+            let state = guard.state();
+            if let Some(index) = state
+                .loading
+                .iter()
+                .position(|loading| Arc::ptr_eq(&loading.state, &self.state))
+            {
+                state.loading.swap_remove(index);
+            }
+        }
+        crate::host::builtin().wait_provider().wake_all(&self.state);
+    }
+}
+
+struct ReservationGuard {
+    bytes: u64,
+    active: bool,
+}
+
+impl ReservationGuard {
+    fn release(&mut self, state: &mut CacheState) {
+        if self.active {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut guard = PROGRAMS.lock();
+            let state = guard.state();
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+            self.active = false;
+        }
+    }
+}
+
+enum ResidentAction {
+    Hit(PinnedProgram),
+    Wait(Arc<AtomicU32>),
+    Load(LoadingGuard),
+}
 
 pub(super) fn async_enabled() -> bool {
-    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
+    false
 }
 
 pub(super) fn synchronize() -> bool {
-    if !PENDING.swap(false, Ordering::AcqRel) {
+    true
+}
+
+pub(super) fn runtime_available() -> bool {
+    let Ok(device) = IvpuDevice::open_first() else {
+        return false;
+    };
+    let Ok(parameters) = device.parameters() else {
+        return false;
+    };
+    super::direct::validate::validate_device(&parameters).is_ok()
+        && RuntimeBudget::query(&parameters).is_ok()
+}
+
+fn operand_storage_bytes(operand: &Operand) -> Option<usize> {
+    // SAFETY: dtype comes from a live ggml tensor and the returned type traits are static.
+    let traits = unsafe { crate::ffi::ggml_get_type_traits(operand.dtype) };
+    if traits.is_null() {
+        return None;
+    }
+    // SAFETY: checked non-null static type-traits pointer.
+    let traits = unsafe { &*traits };
+    let block = usize::try_from(traits.blck_size).ok()?;
+    let type_size = traits.type_size;
+    if block == 0 || !operand.elems.is_multiple_of(block) {
+        return None;
+    }
+    operand.elems.checked_div(block)?.checked_mul(type_size)
+}
+
+fn operand_bytes(operand: &Operand, bytes: usize) -> Option<&[u8]> {
+    if operand.ptr.is_null() || operand_storage_bytes(operand)? < bytes {
+        return None;
+    }
+    // SAFETY: storage size was checked and the operand remains live through dispatch.
+    Some(unsafe { core::slice::from_raw_parts(operand.ptr.cast::<u8>(), bytes) })
+}
+
+fn copy_output(program: &PreparedInference<'_>, index: usize, output: &Operand) -> bool {
+    let Some(bytes) = program.output_bytes(index) else {
+        profile::note(&alloc::format!(
+            "[npu direct] output {index} missing from artifact bindings\n"
+        ));
+        return false;
+    };
+    let available = operand_storage_bytes(output);
+    if output.ptr.is_null() || available.is_none_or(|size| size < bytes) {
+        profile::note(&alloc::format!(
+            "[npu direct] output {index} storage mismatch: required={bytes} available={available:?} dtype={} elems={}\n",
+            output.dtype, output.elems
+        ));
+        return false;
+    }
+    if program.output_is_direct(index) {
         return true;
     }
-    let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
-        return false;
-    };
-    unsafe { (l.cmd_queue_sync)(rt.queue, u64::MAX) == ZE_RESULT_SUCCESS }
-}
-
-/// Build a program's graph on a cache miss: run the caller's `compile` to get a **transient** native
-/// blob, parse it into the driver-owned graph via [`build_graph`], and drop the blob (freed at the
-/// end of this call — only the graph is kept). `None` if compilation or graph creation failed
-/// (cached by the caller as `None`, not retried).
-fn build_from(compile: impl FnOnce() -> Option<Vec<u8>>) -> Option<&'static Graph> {
-    let blob = compile()?;
-    unsafe { build_graph(&blob) }
-}
-
-unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
-    let l = ze::lib()?;
-    let rt = ze::runtime()?;
-    let g = rt.ddi;
-    let pfn_create = (*g).pfnCreate?;
-    let pfn_props = (*g).pfnGetProperties?;
-    let pfn_arg = (*g).pfnGetArgumentProperties?;
-    let pfn_init = (*g).pfnAppendGraphInitialize?;
-    let pfn_destroy = (*g).pfnDestroy;
-
-    let mut gd: ze_graph_desc_t = mem::zeroed();
-    gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC;
-    gd.format = ZE_GRAPH_FORMAT_NATIVE;
-    gd.inputSize = blob.len();
-    gd.pInput = blob.as_ptr();
-    let mut handle: ze_graph_handle_t = ptr::null_mut();
-    if pfn_create(rt.context, rt.device, &gd, &mut handle) != ZE_RESULT_SUCCESS {
-        return None;
-    }
-
-    let mut gp: ze_graph_properties_t = mem::zeroed();
-    gp.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES;
-    if pfn_props(handle, &mut gp) != ZE_RESULT_SUCCESS {
-        if let Some(destroy) = pfn_destroy {
-            destroy(handle);
-        }
-        return None;
-    }
-
-    // Classify args: inputs then outputs, each in blob argument order. FP32 device I/O.
-    let mut inputs: Vec<ArgInfo> = Vec::new();
-    let mut outs: Vec<ArgInfo> = Vec::new();
-    for i in 0..gp.numGraphArgs {
-        let mut ap: ze_graph_argument_properties_t = mem::zeroed();
-        ap.stype = ZE_STRUCTURE_TYPE_GRAPH_ARGUMENT_PROPERTIES;
-        if pfn_arg(handle, i, &mut ap) != ZE_RESULT_SUCCESS {
-            if let Some(destroy) = pfn_destroy {
-                destroy(handle);
-            }
-            return None;
-        }
-        let mut elems = 1usize;
-        for d in 0..(ZE_MAX_GRAPH_ARGUMENT_DIMENSIONS_SIZE as usize) {
-            if ap.dims[d] > 0 {
-                elems *= ap.dims[d] as usize;
-            }
-        }
-        let info = ArgInfo { index: i, elems };
-        if ap.type_ == ZE_GRAPH_ARGUMENT_TYPE_INPUT {
-            inputs.push(info);
-        } else {
-            outs.push(info);
-        }
-    }
-    if inputs.is_empty() || outs.is_empty() {
-        if let Some(destroy) = pfn_destroy {
-            destroy(handle);
-        }
-        return None;
-    }
-
-    // Initialize the graph once — independent of argument binding (validated).
-    let mut ld: ze_command_list_desc_t = mem::zeroed();
-    ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
-    ld.commandQueueGroupOrdinal = 0;
-    let mut init_list: ze_command_list_handle_t = ptr::null_mut();
-    if (l.cmd_list_create)(rt.context, rt.device, &ld, &mut init_list) != ZE_RESULT_SUCCESS {
-        if let Some(destroy) = pfn_destroy {
-            destroy(handle);
-        }
-        return None;
-    }
-    let ok = pfn_init(init_list, handle, ptr::null_mut(), 0, ptr::null_mut()) == ZE_RESULT_SUCCESS
-        && (l.cmd_list_close)(init_list) == ZE_RESULT_SUCCESS
-        && (l.cmd_queue_exec)(rt.queue, 1, &mut init_list, ptr::null_mut()) == ZE_RESULT_SUCCESS
-        && (l.cmd_queue_sync)(rt.queue, u64::MAX) == ZE_RESULT_SUCCESS;
-    (l.cmd_list_destroy)(init_list);
-    if !ok {
-        if let Some(destroy) = pfn_destroy {
-            destroy(handle);
-        }
-        return None;
-    }
-
-    Some(Box::leak(Box::new(Graph {
-        handle,
-        inputs,
-        outs,
-    })))
-}
-
-fn node_list(
-    g: &'static Graph,
-    program_addr: usize,
-    inputs: &[&Operand],
-    outs: &[&Operand],
-) -> Option<&'static NodeList> {
-    if inputs.len() != g.inputs.len() || outs.len() != g.outs.len() || outs.is_empty() {
-        return None;
-    }
-    if inputs.len() > MAX_INPUT_BINDINGS || outs.len() > MAX_OUTPUT_BINDINGS {
-        return None;
-    }
-    // Key by the FULL binding set (program identity + every operand address), NOT just (first
-    // output, program). The recorded execute list bakes each operand pointer in at record time and
-    // is replayed verbatim, so the key must identify the exact set of pointers it was recorded with.
-    // Keying on only the output aliases distinct instances: ggml's gallocr recycles one address
-    // across non-overlapping tensors, and weightless glue subgraphs (norm×weight, residual-add,
-    // silu) share ONE program/graph across every layer (no baked weight to distinguish them) — so
-    // two different instances can collide on (output_ptr, program) and the second would replay the
-    // first's now-stale/foreign input bindings. The NPU then reads an unmapped address → MMU
-    // translation fault → device hang. Folding all operand pointers makes each distinct binding its
-    // own list, and self-heals if an operand's address shifts across tokens (new key → re-record
-    // against the live pointer). The program address is the built graph's own (stable, leaked)
-    // address — the same discriminator role the transient blob's address used to play.
-    let mut key = BindingKey {
-        program: program_addr,
-        generation: crate::backend::buffer_generation(),
-        n_inputs: inputs.len() as u8,
-        n_outputs: outs.len() as u8,
-        inputs: [0; MAX_INPUT_BINDINGS],
-        outputs: [0; MAX_OUTPUT_BINDINGS],
-    };
-    for (dst, op) in key.inputs.iter_mut().zip(inputs) {
-        *dst = op.ptr as usize;
-    }
-    for (dst, op) in key.outputs.iter_mut().zip(outs) {
-        *dst = op.ptr as usize;
-    }
-    LISTS.try_get_or_insert_with(key, || unsafe { build_node_list(g, inputs, outs) })?
-}
-
-/// Bind one operand: its own NPU pointer directly when owned (zero copy), else a fresh bounce
-/// buffer. Returns the [`Bind`] describing how to feed it at dispatch time.
-unsafe fn bind_arg(
-    pfn_set: unsafe extern "C" fn(ze_graph_handle_t, u32, *const c_void) -> ze_result_t,
-    handle: ze_graph_handle_t,
-    arg: ArgInfo,
-    op: &Operand,
-) -> Option<Bind> {
-    if op.owned {
-        let result = pfn_set(handle, arg.index, op.ptr);
-        if result != ZE_RESULT_SUCCESS {
+    // SAFETY: output storage is live and at least `bytes` long.
+    let target = unsafe { core::slice::from_raw_parts_mut(output.ptr.cast::<u8>(), bytes) };
+    match program.copy_output(index, target) {
+        Ok(()) => true,
+        Err(error) => {
             profile::note(&alloc::format!(
-                "[npu] bind FAIL: arg={} owned ptr={:p} op_elems={} graph_elems={} ze={}\n",
-                arg.index,
-                op.ptr,
-                op.elems,
-                arg.elems,
-                result
+                "[npu direct] output {index} readback failed: {error:?}\n"
             ));
-            return None;
+            false
         }
-        Some(Bind {
-            bounce: None,
-            elems: 0,
-        })
-    } else {
-        let bytes = arg.elems * 4;
-        // NPU-mapped staging buffer, owned via `NpuHostAlloc` (no leaked raw pointer). `try_reserve`
-        // so a missing runtime / OOM returns None rather than aborting.
-        let mut buf = Vec::<u8, NpuHostAlloc>::new_in(NpuHostAlloc);
-        buf.try_reserve_exact(bytes).ok()?;
-        ptr::write_bytes(buf.as_mut_ptr(), 0, bytes);
-        buf.set_len(bytes);
-        let result = pfn_set(handle, arg.index, buf.as_ptr() as *const c_void);
-        if result != ZE_RESULT_SUCCESS {
+    }
+}
+
+fn dispatch(
+    context: &DirectContext,
+    program: &PreparedInference<'_>,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+) -> bool {
+    let mut input_bytes = Vec::new();
+    if input_bytes.try_reserve_exact(inputs.len()).is_err() {
+        return false;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(bytes) = program.input_bytes(index) else {
             profile::note(&alloc::format!(
-                "[npu] bind FAIL: arg={} bounce={:p} op_elems={} graph_elems={} ze={}\n",
-                arg.index,
-                buf.as_ptr(),
-                op.elems,
-                arg.elems,
-                result
+                "[npu direct] dispatch input index {index} missing from artifact\n"
             ));
-            return None;
-        }
-        profile::event(crate::metrics::MetricEvent::StagingAllocation {
-            allocation: buf.as_ptr() as u64,
-            bytes: bytes as u64,
-        });
-        Some(Bind {
-            bounce: Some(buf),
-            elems: min(op.elems, arg.elems),
-        })
+            return false;
+        };
+        let Some(data) = operand_bytes(input, bytes) else {
+            profile::note(&alloc::format!(
+                "[npu direct] dispatch input {index} storage mismatch: required={bytes} available={:?} dtype={} elems={}\n",
+                operand_storage_bytes(input),
+                input.dtype,
+                input.elems
+            ));
+            return false;
+        };
+        input_bytes.push(data);
     }
-}
-
-unsafe fn build_node_list(
-    g: &Graph,
-    inputs: &[&Operand],
-    outs: &[&Operand],
-) -> Option<&'static NodeList> {
-    let l = ze::lib()?;
-    let rt = ze::runtime()?;
-    let ddi = rt.ddi;
-    let pfn_set = (*ddi).pfnSetArgumentValue?;
-    let pfn_exec = (*ddi).pfnAppendGraphExecute?;
-
-    let mut binds: Vec<Bind> = Vec::with_capacity(inputs.len());
-    for (i, op) in inputs.iter().enumerate() {
-        binds.push(bind_arg(pfn_set, g.handle, g.inputs[i], op)?);
-    }
-    let mut out_binds: Vec<Bind> = Vec::with_capacity(outs.len());
-    for (i, op) in outs.iter().enumerate() {
-        out_binds.push(bind_arg(pfn_set, g.handle, g.outs[i], op)?);
-    }
-
-    let mut ld: ze_command_list_desc_t = mem::zeroed();
-    ld.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
-    ld.commandQueueGroupOrdinal = 0;
-    let mut exec: ze_command_list_handle_t = ptr::null_mut();
-    let create_result = (l.cmd_list_create)(rt.context, rt.device, &ld, &mut exec);
-    if create_result != ZE_RESULT_SUCCESS {
-        profile::note(&alloc::format!(
-            "[npu] command-list create FAIL: ze={create_result}\n"
-        ));
-        return None;
-    }
-    let exec_result = pfn_exec(
-        exec,
-        g.handle,
-        ptr::null_mut(),
-        ptr::null_mut(),
-        0,
-        ptr::null_mut(),
-    );
-    let close_result = if exec_result == ZE_RESULT_SUCCESS {
-        (l.cmd_list_close)(exec)
-    } else {
-        ZE_RESULT_SUCCESS
-    };
-    if exec_result != ZE_RESULT_SUCCESS || close_result != ZE_RESULT_SUCCESS {
-        profile::note(&alloc::format!(
-            "[npu] command-list record FAIL: execute ze={exec_result}, close ze={close_result}\n"
-        ));
-        (l.cmd_list_destroy)(exec);
-        return None;
-    }
-    Some(Box::leak(Box::new(NodeList {
-        exec,
-        inputs: binds,
-        outs: out_binds,
-    })))
-}
-
-/// Run a single **baked-Constant matmul** program: reuse (or build) its graph — keyed by the weight
-/// identity + M, so its transient blob is freed after [`build_graph`] — then dispatch this instance.
-/// `compile` produces the native blob on a cold miss (see [`super::compile::compile_const_blob`]).
-pub(super) fn run_const(
-    weight_ptr: usize,
-    m: i64,
-    inputs: &[&Operand],
-    outs: &[&Operand],
-    compile: impl FnOnce() -> Option<Vec<u8>>,
-) -> bool {
-    let key = (crate::backend::buffer_generation(), weight_ptr, m);
-    let Some(g) = CONST_GRAPHS
-        .try_get_or_insert_with(key, || build_from(compile))
-        .flatten()
-    else {
-        profile::note("[npu] run FAIL: const graph build None\n");
-        return false;
-    };
-    dispatch(g, inputs, outs)
-}
-
-/// Run a **fused subgraph** program: reuse (or build) its graph — keyed by the structural
-/// [`sg_semantic_key`](super::compile::sg_semantic_key), so weightless glue subgraphs share one graph
-/// across layers and the transient blob is freed after build — then dispatch this instance.
-pub(super) fn run_subgraph(
-    semantic_key: crate::identity::ExactSemanticKey,
-    inputs: &[&Operand],
-    outs: &[&Operand],
-    compile: impl FnOnce() -> Option<Vec<u8>>,
-) -> bool {
-    let key = (crate::backend::buffer_generation(), semantic_key);
-    let Some(g) = SG_GRAPHS
-        .try_get_or_insert_with(key, || build_from(compile))
-        .flatten()
-    else {
-        profile::note("[npu] run FAIL: subgraph graph build None\n");
-        return false;
-    };
-    dispatch(g, inputs, outs)
-}
-
-/// Dispatch one instance of an already-built program `g`: reuse (or record) this instance's execute
-/// list, stage any foreign inputs, replay the list, wait, and copy back a foreign output. `inputs`
-/// must match the program's input arg order; NPU-resident operands are bound directly (no copy),
-/// foreign ones staged through bounces. The `node_list` key uses the graph's own (stable, leaked)
-/// address as the per-program discriminator, replacing the transient blob's address.
-fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
-    let Some(node) = node_list(g, g as *const Graph as usize, inputs, outs) else {
-        profile::note(&alloc::format!(
-            "[npu] run FAIL: node_list None — inputs {} (g.inputs {}) outs {} (g.outs {})\n",
-            inputs.len(),
-            g.inputs.len(),
-            outs.len(),
-            g.outs.len(),
-        ));
-        return false;
-    };
-    let (Some(l), Some(rt)) = (ze::lib(), ze::runtime()) else {
-        return false;
-    };
-    let prof = profile::enabled();
-    unsafe {
-        let has_bounce = node
-            .inputs
+    if outputs.len()
+        != program
+            .bindings
             .iter()
-            .chain(node.outs.iter())
-            .any(|b| b.bounce.is_some());
-        // A host-visible staging buffer cannot be overwritten/read while an earlier submission is
-        // in flight. Direct NPU-owned bindings can remain queued in order without this barrier.
-        if has_bounce && !synchronize() {
-            return false;
-        }
-        let t0 = if prof { profile::now_ns() } else { 0 };
-        // Stage foreign inputs (owned inputs are already bound to their own memory).
-        let mut bytes_in = 0u64;
-        for (bind, op) in node.inputs.iter().zip(inputs.iter()) {
-            stage_in(bind, op);
-            if prof && bind.bounce.is_some() {
-                bytes_in += bind.elems as u64 * 4;
-            }
-        }
-        let t1 = if prof { profile::now_ns() } else { 0 };
-        // Replay the pre-recorded execute list (async submit), then wait for completion. Split so
-        // the profiler can separate host submit cost from the NPU round-trip (the ~fixed floor).
-        let mut list = node.exec;
-        if (l.cmd_queue_exec)(rt.queue, 1, &mut list, ptr::null_mut()) != ZE_RESULT_SUCCESS {
-            profile::note("[npu] run FAIL: cmd_queue_exec\n");
-            return false;
-        }
-        let tmid = if prof { profile::now_ns() } else { 0 };
-        if async_enabled() && !has_bounce {
-            PENDING.store(true, Ordering::Release);
-            if prof {
-                profile::note("[npu] async queued (device/copy timing deferred to synchronize)\n");
-            }
-            return true;
-        }
-        if (l.cmd_queue_sync)(rt.queue, u64::MAX) != ZE_RESULT_SUCCESS {
-            profile::note("[npu] run FAIL: cmd_queue_sync\n");
-            return false;
-        }
-        let t2 = if prof { profile::now_ns() } else { 0 };
-        // Copy foreign outputs back (owned outputs were written in place — zero copy).
-        let mut bytes_out = 0u64;
-        for (bind, op) in node.outs.iter().zip(outs.iter()) {
-            if let Some(buf) = &bind.bounce {
-                let nout = min(op.elems, bind.elems);
-                ptr::copy_nonoverlapping(buf.as_ptr() as *const f32, op.ptr as *mut f32, nout);
-                if prof {
-                    bytes_out += nout as u64 * 4;
-                }
-            }
-        }
-        if prof {
-            let t3 = profile::now_ns();
-            let owned = node
-                .inputs
+            .filter(|binding| binding.class == super::direct::link::DeviceMemoryClass::Output)
+            .count()
+    {
+        profile::note(&alloc::format!(
+            "[npu direct] dispatch output count mismatch: runtime={} artifact={}\n",
+            outputs.len(),
+            program
+                .bindings
                 .iter()
-                .chain(node.outs.iter())
-                .filter(|b| b.bounce.is_none())
-                .count() as u64;
-            let bounced = (node.inputs.len() + node.outs.len()) as u64 - owned;
-            profile::record(
-                t0,
-                t1,
-                tmid,
-                t2,
-                t3,
-                owned,
-                0,
-                0,
-                bounced,
-                bytes_in.saturating_add(bytes_out),
-                bytes_in,
-                bytes_out,
-            );
+                .filter(|binding| binding.class == DeviceMemoryClass::Output)
+                .count()
+        ));
+        return false;
+    }
+
+    let prof = profile::enabled() || crate::trace::perf_enabled();
+    let t0 = if prof { profile::now_ns() } else { 0 };
+    if let Err(error) = program.write_inputs(&input_bytes) {
+        profile::note(&alloc::format!(
+            "[npu direct] input staging failed: {error:?}\n"
+        ));
+        return false;
+    }
+    if let Err(error) = program.zero_outputs() {
+        profile::note(&alloc::format!(
+            "[npu direct] output initialization failed: {error:?}\n"
+        ));
+        return false;
+    }
+    release_host_writes();
+    let t1 = if prof { profile::now_ns() } else { 0 };
+    let now = match crate::host::builtin().clock().monotonic_now_ns() {
+        Ok(now) => now,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] monotonic clock failed: {error:?}\n"
+            ));
+            return false;
         }
+    };
+    if context
+        .queue
+        .submit(&program.handles, program.commands_offset(), 0)
+        .is_err()
+    {
+        DEVICE_FAILED.store(true, Ordering::Release);
+        profile::note("[npu direct] submit failed\n");
+        return false;
+    }
+    let tmid = if prof { profile::now_ns() } else { 0 };
+    let status = program
+        .command
+        .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)));
+    if !matches!(status, Ok(0)) {
+        DEVICE_FAILED.store(true, Ordering::Release);
+        profile::note(&alloc::format!("[npu direct] wait failed: {status:?}\n"));
+        return false;
+    }
+    let t2 = if prof { profile::now_ns() } else { 0 };
+    for (index, output) in outputs.iter().enumerate() {
+        if !copy_output(program, index, output) {
+            return false;
+        }
+    }
+    let t3 = if prof { profile::now_ns() } else { 0 };
+    DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    if prof {
+        let bytes_in: u64 = input_bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !program.input_is_direct(*index))
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
+        let bytes_out: u64 = outputs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !program.output_is_direct(*index))
+            .filter_map(|(_, output)| operand_storage_bytes(output))
+            .map(|bytes| bytes as u64)
+            .sum();
+        let imported = program.direct_binding_count() as u64;
+        let staged = (inputs.len() + outputs.len()) as u64 - imported;
+        profile::record(
+            t0,
+            t1,
+            tmid,
+            t2,
+            t3,
+            0,
+            0,
+            imported,
+            staged,
+            bytes_in.saturating_add(bytes_out),
+            bytes_in,
+            bytes_out,
+        );
+        crate::trace::perf(
+            "dispatch",
+            &alloc::format!(
+                ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":{},\"copy_out_ns\":{},\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":{bytes_out}",
+                t1.saturating_sub(t0),
+                tmid.saturating_sub(t1),
+                t2.saturating_sub(tmid),
+                t3.saturating_sub(t2),
+                imported,
+                staged,
+            ),
+        );
     }
     true
 }
 
-/// Copy a foreign input's current data into its bounce buffer. No-op for a directly-bound operand.
-/// The bounce is NPU-mapped memory whose address is bound into the graph; each dispatch overwrites
-/// its contents in place (mutated through the bound pointer, hence the `as *mut`).
-unsafe fn stage_in(bind: &Bind, op: &Operand) {
-    if let Some(buf) = &bind.bounce {
-        ptr::copy_nonoverlapping(op.ptr as *const f32, buf.as_ptr() as *mut f32, bind.elems);
+struct PreparedCandidate {
+    prepared: PreparedInference<'static>,
+    resident_bytes: u64,
+    accounted_bytes: u64,
+    reservation: ReservationGuard,
+    artifact: alloc::sync::Arc<[u8]>,
+}
+
+/// Small weightless/glue artifacts can keep a host copy for warm IO rebind across similar programs
+/// without double-keeping baked-weight blobs that dominate resident FFN programs (#5).
+const WARM_REUSE_MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+
+fn binding_fingerprint(
+    key: &ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+) -> ExactSemanticKey {
+    let mut builder = ExactKeyBuilder::new(b"direct-runtime/shared-bindings-v1");
+    builder.field(b"program", &key.digest().0);
+    for (direction, operands) in [(0u8, inputs), (1u8, outputs)] {
+        for (index, operand) in operands.iter().enumerate() {
+            builder
+                .u8(b"direction", direction)
+                .u64(b"index", index as u64);
+            if let Some(view) = operand.shared {
+                builder
+                    .u64(b"provider", view.identity.provider)
+                    .u64(b"object", view.identity.object)
+                    .u64(b"generation", view.identity.generation)
+                    .u64(b"offset", view.offset as u64)
+                    .u64(b"bytes", view.bytes as u64);
+            } else {
+                builder.u8(b"staged", 1);
+            }
+        }
+    }
+    builder.finish()
+}
+
+/// Cache identity for a prepared program: warm-reusable artifacts share one resident entry across
+/// binding sets (L0 SG_GRAPHS analogue); large baked programs keep the binding-set fold.
+fn resident_cache_key(
+    program_key: ExactSemanticKey,
+    binding_fp: ExactSemanticKey,
+    artifact_len: usize,
+) -> ExactSemanticKey {
+    if artifact_len <= WARM_REUSE_MAX_ARTIFACT_BYTES {
+        program_key
+    } else {
+        binding_fp
+    }
+}
+
+fn warm_reuse_eligible(artifact_len: usize, prepared: &PreparedInference<'_>) -> bool {
+    artifact_len <= WARM_REUSE_MAX_ARTIFACT_BYTES && prepared.warm_rebind.is_some()
+}
+
+fn prepare_candidate(
+    context: &DirectContext,
+    parameters: &super::direct::DeviceParameters,
+    budget: RuntimeBudget,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+    blob: Vec<u8>,
+) -> Option<PreparedCandidate> {
+    profile::note(&alloc::format!(
+        "[npu direct] artifact bytes={} compiled/cache-loaded\n",
+        blob.len()
+    ));
+    let artifact: alloc::sync::Arc<[u8]> = alloc::sync::Arc::from(blob.into_boxed_slice());
+    let elf = match parse_intel_elf_with_resident_limit(&artifact, budget.resident_program_bytes) {
+        Ok(elf) => elf,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] unsupported artifact before load: {error:?}\n"
+            ));
+            return None;
+        }
+    };
+    let reservation_bytes = elf.inspection().resident_bytes;
+    let evicted = {
+        let mut guard = PROGRAMS.lock();
+        let state = guard.state();
+        let evicted = state.make_room(
+            reservation_bytes,
+            budget.resident_program_bytes,
+            budget.resident_low_water_bytes,
+        )?;
+        state.reserved_bytes = state.reserved_bytes.saturating_add(reservation_bytes);
+        evicted
+    };
+    // Resource destruction is intentionally outside the global cache lock.
+    drop(evicted);
+    let reservation = ReservationGuard {
+        bytes: reservation_bytes,
+        active: true,
+    };
+    let hpi = match inspect_hpi_requirements(&elf, parameters) {
+        Ok(hpi) => hpi,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] unsupported HPI metadata: {error:?}\n"
+            ));
+            return None;
+        }
+    };
+    let mut initial_inputs = Vec::new();
+    if initial_inputs.try_reserve_exact(inputs.len()).is_err() {
+        return None;
+    }
+    let mut input_requirements = Vec::new();
+    visit_binding_requirements(&elf, |binding| {
+        if binding.class == DeviceMemoryClass::Input {
+            input_requirements.push(binding);
+        }
+    });
+    if input_requirements.len() != inputs.len() {
+        profile::note(&alloc::format!(
+            "[npu direct] load input count mismatch: runtime={} artifact={}\n",
+            inputs.len(),
+            input_requirements.len()
+        ));
+        return None;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        let expected = input_requirements
+            .get(index)
+            .and_then(|binding| usize::try_from(binding.bytes).ok());
+        let Some(data) = expected.and_then(|bytes| operand_bytes(input, bytes)) else {
+            profile::note(&alloc::format!(
+                "[npu direct] load input {index} storage mismatch: required={expected:?} available={:?} dtype={} elems={}\n",
+                operand_storage_bytes(input),
+                input.dtype,
+                input.elems
+            ));
+            return None;
+        };
+        initial_inputs.push(data);
+    }
+    let shared_bindings = !crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_DISABLE_SHARED_BINDINGS");
+    let input_views: alloc::vec::Vec<_> = inputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    let output_views: alloc::vec::Vec<_> = outputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    let prepared = match prepare_inference_shared(
+        context.device,
+        parameters,
+        &elf,
+        &hpi,
+        &initial_inputs,
+        &input_views,
+        &output_views,
+        budget.preparation(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] artifact load failed: {error:?}\n"
+            ));
+            return None;
+        }
+    };
+    let resident_bytes = prepared.total_user_bo_bytes;
+    let accounted_bytes = prepared.total_accounted_bytes;
+    for binding in &prepared.bindings {
+        let allocation = binding
+            .bo
+            .shared_identity()
+            .map_or(binding.bo.vpu_address(), |identity| identity.object);
+        if !binding.direct {
+            profile::event(MetricEvent::StagingAllocation {
+                allocation,
+                bytes: binding.logical_bytes,
+            });
+        }
+    }
+    profile::record_direct_memory_breakdown(
+        prepared.executable_bo_bytes,
+        prepared.binding_bo_bytes,
+        prepared.hpi_bo_bytes,
+        prepared.command_bo_bytes,
+        prepared.preemption_bytes,
+    );
+    Some(PreparedCandidate {
+        prepared,
+        resident_bytes,
+        accounted_bytes,
+        reservation,
+        artifact,
+    })
+}
+
+fn try_warm_rebind(
+    context: &DirectContext,
+    budget: RuntimeBudget,
+    program: &ResidentProgram,
+    binding_fp: &ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+) -> bool {
+    if program.binding_fp() == binding_fp {
+        return true;
+    }
+    let Some(artifact) = program.warm_artifact.as_ref() else {
+        profile::note("[npu direct] binding set changed without warm artifact; miss\n");
+        return false;
+    };
+    if program.prepared().warm_rebind.is_none() {
+        return false;
+    }
+    let elf = match parse_intel_elf_with_resident_limit(artifact, budget.resident_program_bytes) {
+        Ok(elf) => elf,
+        Err(_) => return false,
+    };
+    let mut initial_inputs = Vec::new();
+    if initial_inputs.try_reserve_exact(inputs.len()).is_err() {
+        return false;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(bytes) = program.prepared().input_bytes(index) else {
+            return false;
+        };
+        let Some(data) = operand_bytes(input, bytes) else {
+            return false;
+        };
+        initial_inputs.push(data);
+    }
+    let shared_bindings = !crate::host::builtin()
+        .config()
+        .is_set(c"GGML_NPU_DISABLE_SHARED_BINDINGS");
+    let input_views: alloc::vec::Vec<_> = inputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    let output_views: alloc::vec::Vec<_> = outputs
+        .iter()
+        .map(|operand| shared_bindings.then_some(operand.shared).flatten())
+        .collect();
+    match rebind_inference_shared(
+        context.device,
+        program.prepared_mut(),
+        &elf,
+        &initial_inputs,
+        &input_views,
+        &output_views,
+    ) {
+        Ok(()) => {
+            program.set_binding_fp(binding_fp.clone());
+            profile::note("[npu direct] warm binding rebind\n");
+            true
+        }
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] warm binding rebind failed: {error:?}\n"
+            ));
+            false
+        }
+    }
+}
+
+fn evict_unpinned(program: &Arc<ResidentProgram>) {
+    let mut guard = PROGRAMS.lock();
+    let state = guard.state();
+    if let Some(index) = state
+        .entries
+        .iter()
+        .position(|entry| Arc::ptr_eq(entry, program) && entry.pins.load(Ordering::Acquire) == 0)
+    {
+        let entry = state.entries.swap_remove(index);
+        state.resident_bytes = state.resident_bytes.saturating_sub(entry.resident_bytes);
+        profile::event(MetricEvent::CacheEviction {
+            cache: "direct-programs",
+            reason: "rebind-miss",
+            bytes: entry.resident_bytes,
+        });
+        drop(entry);
+    }
+}
+
+fn run_program(
+    generation: u64,
+    program_key: ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+    compile: impl FnOnce() -> Option<Vec<u8>>,
+) -> bool {
+    let binding_fp = binding_fingerprint(&program_key, inputs, outputs);
+    profile::note(&alloc::format!(
+        "[npu direct] run generation={generation} inputs={} outputs={} program={} bindings={}\n",
+        inputs.len(),
+        outputs.len(),
+        program_key.digest().hex(),
+        binding_fp.digest().hex()
+    ));
+    if DEVICE_FAILED.load(Ordering::Acquire) {
+        profile::note("[npu direct] device fault latched; refusing automatic retry\n");
+        return false;
+    }
+    let context = match context() {
+        Ok(context) => context,
+        Err(error) => {
+            profile::note(&alloc::format!("[npu direct] context failed: {error:?}\n"));
+            return false;
+        }
+    };
+    let parameters = match context.device.parameters() {
+        Ok(parameters) => parameters,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] parameter query failed: {error:?}\n"
+            ));
+            return false;
+        }
+    };
+    let budget = match RuntimeBudget::query(&parameters) {
+        Ok(budget) => budget,
+        Err(error) => {
+            profile::note(&alloc::format!(
+                "[npu direct] budget rejected load: {error:?}\n"
+            ));
+            return false;
+        }
+    };
+    let mut compile = Some(compile);
+    // First probe: warm program-key entry, then exact binding-key entry (large programs).
+    let lookup_keys = [program_key.clone(), binding_fp.clone()];
+    loop {
+        let (action, stale) = {
+            let mut guard = PROGRAMS.lock();
+            let state = guard.state();
+            let mut stale = Vec::new();
+            if state.generation != generation {
+                let mut index = 0;
+                while index < state.entries.len() {
+                    if state.entries[index].generation != generation
+                        && state.entries[index].pins.load(Ordering::Acquire) == 0
+                    {
+                        let entry = state.entries.swap_remove(index);
+                        state.resident_bytes =
+                            state.resident_bytes.saturating_sub(entry.resident_bytes);
+                        profile::event(MetricEvent::CacheEviction {
+                            cache: "direct-programs",
+                            reason: "generation",
+                            bytes: entry.resident_bytes,
+                        });
+                        stale.push(entry);
+                    } else {
+                        index += 1;
+                    }
+                }
+                state.generation = generation;
+            }
+            state.clock = state.clock.wrapping_add(1);
+            let clock = state.clock;
+            let hit = state
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.generation == generation
+                        && lookup_keys.iter().any(|key| entry.key == *key)
+                })
+                .map(|entry| {
+                    entry.pins.fetch_add(1, Ordering::AcqRel);
+                    entry.last_used.store(clock, Ordering::Relaxed);
+                    PinnedProgram {
+                        program: Arc::clone(entry),
+                    }
+                });
+            let action = if let Some(hit) = hit {
+                ResidentAction::Hit(hit)
+            } else if let Some(loading) = state.loading.iter().find(|loading| {
+                loading.generation == generation
+                    && lookup_keys.iter().any(|key| loading.key == *key)
+            }) {
+                ResidentAction::Wait(Arc::clone(&loading.state))
+            } else {
+                // Reserve under the program key; final resident key is chosen after compile.
+                if state.loading.try_reserve(1).is_err() {
+                    return false;
+                }
+                let loading_state = Arc::new(AtomicU32::new(LOAD_RUNNING));
+                state.loading.push(LoadingProgram {
+                    generation,
+                    key: program_key.clone(),
+                    state: Arc::clone(&loading_state),
+                });
+                ResidentAction::Load(LoadingGuard {
+                    state: loading_state,
+                })
+            };
+            (action, stale)
+        };
+        drop(stale);
+        match action {
+            ResidentAction::Hit(pinned) => {
+                profile::event(MetricEvent::CacheHit {
+                    cache: "direct-programs",
+                    bytes: pinned.program.resident_bytes,
+                });
+                profile::note("[npu direct] resident program hit\n");
+                let program = Arc::clone(&pinned.program);
+                let _dispatch_guard = program.lock_dispatch();
+                if !try_warm_rebind(
+                    context,
+                    budget,
+                    &program,
+                    &binding_fp,
+                    inputs,
+                    outputs,
+                ) {
+                    profile::note("[npu direct] resident hit cannot rebind; reloading\n");
+                    drop(_dispatch_guard);
+                    drop(pinned);
+                    evict_unpinned(&program);
+                    continue;
+                }
+                let result = dispatch(context, program.prepared(), inputs, outputs);
+                profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
+                return result;
+            }
+            ResidentAction::Wait(loading) => {
+                profile::event(MetricEvent::CacheMiss {
+                    cache: "direct-programs",
+                });
+                crate::host::builtin()
+                    .wait_provider()
+                    .wait_while(&loading, LOAD_RUNNING);
+            }
+            ResidentAction::Load(loading) => {
+                profile::event(MetricEvent::CacheMiss {
+                    cache: "direct-programs",
+                });
+                let Some(blob) = compile.take().and_then(|compile| compile()) else {
+                    profile::note("[npu direct] compiler returned no artifact\n");
+                    return false;
+                };
+                let artifact_len = blob.len();
+                let Some(mut candidate) =
+                    prepare_candidate(context, &parameters, budget, inputs, outputs, blob)
+                else {
+                    return false;
+                };
+                let cache_key =
+                    resident_cache_key(program_key.clone(), binding_fp.clone(), artifact_len);
+                let warm_artifact = warm_reuse_eligible(artifact_len, &candidate.prepared)
+                    .then(|| alloc::sync::Arc::clone(&candidate.artifact));
+                let program = Arc::new(ResidentProgram {
+                    generation,
+                    key: cache_key,
+                    program_key: program_key.clone(),
+                    binding_fp: UnsafeCell::new(binding_fp.clone()),
+                    prepared: UnsafeCell::new(candidate.prepared),
+                    warm_artifact,
+                    resident_bytes: candidate.resident_bytes,
+                    accounted_bytes: candidate.accounted_bytes,
+                    last_used: AtomicU64::new(0),
+                    pins: AtomicU32::new(1),
+                    dispatch_locked: AtomicBool::new(false),
+                });
+                let insertion = {
+                    let mut guard = PROGRAMS.lock();
+                    let state = guard.state();
+                    candidate.reservation.release(state);
+                    if state.generation != generation || state.entries.try_reserve(1).is_err() {
+                        None
+                    } else {
+                        let evicted = state.make_room(
+                            program.resident_bytes,
+                            budget.resident_program_bytes,
+                            budget.resident_low_water_bytes,
+                        );
+                        evicted.inspect(|_| {
+                            state.clock = state.clock.wrapping_add(1);
+                            program.last_used.store(state.clock, Ordering::Relaxed);
+                            state.resident_bytes =
+                                state.resident_bytes.saturating_add(program.resident_bytes);
+                            state.resident_high_water =
+                                state.resident_high_water.max(state.resident_bytes);
+                            state.accounted_high_water = state
+                                .accounted_high_water
+                                .max(state.resident_bytes.saturating_add(budget.preemption_bytes));
+                            RESIDENT_HIGH_WATER
+                                .fetch_max(state.resident_high_water, Ordering::Relaxed);
+                            ACCOUNTED_HIGH_WATER
+                                .fetch_max(state.accounted_high_water, Ordering::Relaxed);
+                            profile::event(MetricEvent::MemoryState {
+                                resident_bytes: state.resident_bytes,
+                                resident_high_water: state.resident_high_water,
+                                accounted_high_water: state.accounted_high_water,
+                                resident_limit: budget.resident_program_bytes,
+                            });
+                            state.entries.push(Arc::clone(&program));
+                        })
+                    }
+                };
+                let Some(evicted) = insertion else {
+                    return false;
+                };
+                drop(evicted);
+                drop(loading);
+                profile::note(&alloc::format!(
+                    "[npu direct] loaded resident={} accounted={} cache_resident warm={}\n",
+                    program.resident_bytes,
+                    program.accounted_bytes,
+                    program.warm_artifact.is_some()
+                ));
+                let pinned = PinnedProgram { program };
+                let _dispatch_guard = pinned.program.lock_dispatch();
+                let result = dispatch(context, pinned.program.prepared(), inputs, outputs);
+                profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
+                return result;
+            }
+        }
+    }
+}
+
+pub(super) fn run_const(
+    weight_ptr: usize,
+    m: i64,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+    compile: impl FnOnce() -> Option<Vec<u8>>,
+) -> bool {
+    let generation = crate::backend::buffer_generation();
+    let mut key = ExactKeyBuilder::new(b"direct-runtime/constant-program");
+    key.u64(b"generation", generation)
+        .u64(b"weight-address", weight_ptr as u64)
+        .i64(b"m", m);
+    run_program(generation, key.finish(), inputs, outputs, compile)
+}
+
+pub(super) fn run_subgraph(
+    key: ExactSemanticKey,
+    inputs: &[&Operand],
+    outputs: &[&Operand],
+    compile: impl FnOnce() -> Option<Vec<u8>>,
+) -> bool {
+    run_program(
+        crate::backend::buffer_generation(),
+        key,
+        inputs,
+        outputs,
+        compile,
+    )
+}
+
+pub(super) fn memory_high_water() -> (u64, u64) {
+    (
+        RESIDENT_HIGH_WATER.load(Ordering::Relaxed),
+        ACCOUNTED_HIGH_WATER.load(Ordering::Relaxed),
+    )
+}
+
+pub(super) fn dispatch_count() -> u64 {
+    DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub(super) fn run_blob_selftest_multi(
+    blob: &[u8],
+    inputs: &[&[f32]],
+    output: &mut [f32],
+) -> Result<usize, RuntimeError> {
+    let context = context()?;
+    let parameters = context.device.parameters()?;
+    let budget = RuntimeBudget::query(&parameters)?;
+    let elf = parse_intel_elf_with_resident_limit(blob, budget.resident_program_bytes)
+        .map_err(|_| RuntimeError::Incompatible)?;
+    let hpi =
+        inspect_hpi_requirements(&elf, &parameters).map_err(|_| RuntimeError::Incompatible)?;
+    let input_bytes: Vec<&[u8]> = inputs
+        .iter()
+        .map(|input| {
+            // SAFETY: f32 has no invalid bit patterns and this is an exact immutable byte view.
+            unsafe {
+                core::slice::from_raw_parts(
+                    input.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(*input),
+                )
+            }
+        })
+        .collect();
+    let prepared = prepare_inference(
+        context.device,
+        &parameters,
+        &elf,
+        &hpi,
+        &input_bytes,
+        budget.preparation(),
+    )
+    .map_err(|_| RuntimeError::Incompatible)?;
+    release_host_writes();
+    context
+        .queue
+        .submit(&prepared.handles, prepared.commands_offset(), 0)?;
+    let now = crate::host::builtin()
+        .clock()
+        .monotonic_now_ns()
+        .map_err(|error| RuntimeError::External {
+            domain: crate::host::ERROR_DOMAIN,
+            code: error.0,
+        })?;
+    if prepared
+        .command
+        .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)))?
+        != 0
+    {
+        return Err(RuntimeError::DeviceLost);
+    }
+    let bytes = prepared.output_bytes(0).ok_or(RuntimeError::Incompatible)?;
+    if bytes % size_of::<f32>() != 0 || output.len() < bytes / size_of::<f32>() {
+        return Err(RuntimeError::InvalidArgument);
+    }
+    // SAFETY: output has capacity for `bytes` and is writable for the duration of the copy.
+    let target =
+        unsafe { core::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), bytes) };
+    prepared
+        .copy_output(0, target)
+        .map_err(|_| RuntimeError::Incompatible)?;
+    Ok(bytes / size_of::<f32>())
+}
+
+#[cfg(feature = "bench-hardware")]
+pub(crate) struct DirectBenchmarkFixture {
+    prepared: PreparedInference<'static>,
+}
+
+#[cfg(feature = "bench-hardware")]
+impl DirectBenchmarkFixture {
+    pub(super) fn new(blob: &[u8], inputs: &[&[f32]]) -> Result<Self, RuntimeError> {
+        let context = context()?;
+        let parameters = context.device.parameters()?;
+        let budget = RuntimeBudget::query(&parameters)?;
+        let elf = parse_intel_elf_with_resident_limit(blob, budget.resident_program_bytes)
+            .map_err(|_| RuntimeError::Incompatible)?;
+        let hpi =
+            inspect_hpi_requirements(&elf, &parameters).map_err(|_| RuntimeError::Incompatible)?;
+        let input_bytes: Vec<&[u8]> = inputs
+            .iter()
+            .map(|input| {
+                // SAFETY: exact immutable byte view of a live f32 slice.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        input.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(*input),
+                    )
+                }
+            })
+            .collect();
+        let prepared = prepare_inference(
+            context.device,
+            &parameters,
+            &elf,
+            &hpi,
+            &input_bytes,
+            budget.preparation(),
+        )
+        .map_err(|_| RuntimeError::Incompatible)?;
+        Ok(Self { prepared })
+    }
+
+    pub(super) fn execute(&self) -> Result<(), RuntimeError> {
+        let context = context()?;
+        self.prepared
+            .zero_outputs()
+            .map_err(|_| RuntimeError::Incompatible)?;
+        release_host_writes();
+        context
+            .queue
+            .submit(&self.prepared.handles, self.prepared.commands_offset(), 0)?;
+        let now = crate::host::builtin()
+            .clock()
+            .monotonic_now_ns()
+            .map_err(|error| RuntimeError::External {
+                domain: crate::host::ERROR_DOMAIN,
+                code: error.0,
+            })?;
+        if self
+            .prepared
+            .command
+            .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)))?
+            != 0
+        {
+            return Err(RuntimeError::DeviceLost);
+        }
+        Ok(())
+    }
+
+    pub(super) fn copy_output(&self, output: &mut [f32]) -> Result<usize, RuntimeError> {
+        let bytes = self
+            .prepared
+            .output_bytes(0)
+            .ok_or(RuntimeError::Incompatible)?;
+        if bytes % size_of::<f32>() != 0 || output.len() < bytes / size_of::<f32>() {
+            return Err(RuntimeError::InvalidArgument);
+        }
+        // SAFETY: output capacity was checked.
+        let target =
+            unsafe { core::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), bytes) };
+        self.prepared
+            .copy_output(0, target)
+            .map_err(|_| RuntimeError::Incompatible)?;
+        Ok(bytes / size_of::<f32>())
+    }
+}
+
+#[cfg(test)]
+mod cache_policy_tests {
+    use super::{
+        oldest_unpinned, resident_cache_key, WARM_REUSE_MAX_ARTIFACT_BYTES,
+    };
+    use crate::identity::ExactKeyBuilder;
+
+    #[test]
+    fn resident_eviction_never_selects_pinned_programs() {
+        let entries = [(0, 1, 1), (1, 0, 3), (2, 0, 2)];
+        assert_eq!(oldest_unpinned(entries.into_iter()), Some(2));
+        assert_eq!(oldest_unpinned([(0, 1, 1), (1, 2, 2)].into_iter()), None);
+    }
+
+    #[test]
+    fn warm_reusable_artifacts_cache_by_program_key_only() {
+        let mut program = ExactKeyBuilder::new(b"test/program");
+        program.u64(b"id", 1);
+        let program = program.finish();
+        let mut bindings = ExactKeyBuilder::new(b"test/bindings");
+        bindings.u64(b"id", 2);
+        let bindings = bindings.finish();
+        let key = resident_cache_key(program.clone(), bindings.clone(), 1024);
+        assert_eq!(key, program);
+        assert_ne!(key, bindings);
+    }
+
+    #[test]
+    fn large_artifacts_keep_binding_set_cache_key() {
+        let mut program = ExactKeyBuilder::new(b"test/program");
+        program.u64(b"id", 1);
+        let program = program.finish();
+        let mut bindings = ExactKeyBuilder::new(b"test/bindings");
+        bindings.u64(b"id", 2);
+        let bindings = bindings.finish();
+        let key = resident_cache_key(
+            program.clone(),
+            bindings.clone(),
+            WARM_REUSE_MAX_ARTIFACT_BYTES + 1,
+        );
+        assert_eq!(key, bindings);
+        assert_ne!(key, program);
     }
 }
