@@ -1145,12 +1145,26 @@ int ggml_npu_ov_compile_graph_v3(int32_t n_tensors, const struct npu_ir_tensor* 
                     const auto& it = tensors[nd.inputs[2]];
                     const int64_t K = wt.ne[0], N = wt.ne[1], E = wt.ne[2];
                     const int64_t U = it.ne[0], T = it.ne[1];
-                    if (K <= 0 || N <= 0 || E <= 0 || U <= 0 || T <= 0 ||
-                        !constant.values || constant.exactness != NPU_REQUANTIZED) return -1;
+                    if (K <= 0 || N <= 0 || E <= 0 || U <= 0 || T <= 0 || !constant.values) {
+                        return -1;
+                    }
+                    // Float f16 banks may be SourceBytes pass-through or legacy Requantized-tagged
+                    // ABI (shim tests historically left exactness=0). Packed integer banks must be
+                    // canonical requant (unpacked) — never packed source-native gather (#11).
+                    const bool float16_bank =
+                        constant.numeric_kind == NPU_NUMERIC_FLOAT && constant.bit_width == 16;
+                    if (float16_bank) {
+                        if (constant.exactness != NPU_REQUANTIZED
+                            && constant.exactness != NPU_SOURCE_BYTES) {
+                            return -1;
+                        }
+                    } else if (constant.exactness != NPU_REQUANTIZED) {
+                        return -1;
+                    }
                     auto ids_flat = reshape_output(ids, {T * U});
                     auto axis = v0::Constant::create(ov::element::i32, {}, std::vector<int32_t>{0});
                     ov::Output<ov::Node> selected;
-                    if (constant.numeric_kind == NPU_NUMERIC_FLOAT && constant.bit_width == 16) {
+                    if (float16_bank) {
                         auto bank = std::make_shared<v0::Constant>(
                             ov::element::f16, ov::Shape{(size_t)E, (size_t)N, (size_t)K},
                             (const void*)constant.values);

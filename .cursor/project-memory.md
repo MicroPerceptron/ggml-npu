@@ -160,9 +160,14 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 - `FINDING/moe-expert-id-assert-after-layout-glue` — After PR #37 cleared layout-only region rejects, develop `5ccffe4` pp16 r=1 sharing-on smoke aborted warmup (exit 134) with `GGML_ASSERT(id >= 0 && id < n_expert)` in llama.cpp `ggml-backend.cpp` after NPU claimed MoE routing (Argsort/GetRows/SumRows/Sigmoid) despite `npu_moe=0`. Root cause: `moe_enabled()` used `ConfigService::is_set`, and `_run_targeted_smoke.sh` always exports `GGML_NPU_MOE=0`, so presence alone falsely enabled MoE; bad expert ids then reached `MUL_MAT_ID` on another backend. Fix: MoE (and shared `is_opt_in_one`) requires exact value `1`; `=0`/unset unclaims MoE-tagged ops.
-  - Scope: Env-gate honesty for MoE claim policy under harness `GGML_NPU_MOE=0`; not a claim that `GGML_NPU_MOE=1` routing is correct on NPU.
+  - Scope: Env-gate honesty for MoE claim policy under harness `GGML_NPU_MOE=0`. Follow-on #11 coverage for `MOE=1` is `FINDING/moe-routed-bank-gather-contract`.
   - Evidence: `src/host/mod.rs`, `src/vendor/ivpu/compile.rs`, `src/policy.rs`, `benchmarks/results/_run_targeted_smoke.sh`, `benchmarks/results/develop-5ccffe4-targeted-pp16-sharing-on/` (pre-fix abort), `benchmarks/results/develop-0a804c7-targeted-pp16-sharing-on/` (post-fix exit 0; zero Argsort/Sigmoid/SumRows claims), issues #5/#11, PR #38.
   - Verified: 2026-07-12
+
+- `FINDING/moe-routed-bank-gather-contract` — Under exact `GGML_NPU_MOE=1`, Argsort/Sigmoid/SumRows/MatMulId are claimable when compile-ready. Float f16/bf16 expert banks pass through as gatherable `SourceBytes`; packed Q4/Q6/Q8 banks must take the canonical requant Fallback (unpacked) — packed source-native gather is refused before compile rather than silently claimed. Output-head-scale dense MatMul stays unclaimed via `expanded_constant_budget` (prefer GPU) unless `GGML_NPU_ALLOW_GIANT_CONSTANTS`. Shim numerical: Argsort+MatMulId, Sigmoid, SumRows in `tests/graph_ir_shortconv_check.c`.
+  - Scope: Compile/claim contract + shim e2e for routing/expert ops; not a locked LFM full-model `MOE=1` tok/s proof.
+  - Evidence: `src/ops/ggml_quant.rs`, `src/vendor/ivpu/compile.rs`, `shim/ov_compile.cpp`, `tests/coverage_matrix.csv`, `docs/coverage-gates.md`, issue #11.
+  - Verified: 2026-07-13
 
 - `FINDING/shortconv-setrows-attention-gate` — `WireOp::SetRows` was incorrectly tagged
   `traits.attention`, so `graph_feasible` rejected ShortConv/mutable-state write regions unless
@@ -295,6 +300,15 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Pending milestones
+
+- `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond hermetic/shim MoE contract: short
+  attribution or targeted smoke with `GGML_NPU_MOE=1` on LFM sparse-MoE proving routed experts
+  execute without expert-id corruption and without citing packed-gather as a native win; keep
+  default harness `MOE=0` unclaimed.
+  - Acceptance: Documented MoE strategy with passing routed-expert evidence when enabled; no silent
+    packed source-native gather; output-head remains explicitly unclaimed or validated; issue #11
+    acceptance met without requiring full locked pp512 as the first gate.
+  - Evidence: `docs/coverage-gates.md`, `FINDING/moe-routed-bank-gather-contract`, issue #11.
 
 - `MILESTONE/capability-contract-complete` — Finish GitHub #8 beyond fail-closed + layout-only
   unclaim: harness summaries that distinguish proven direct-IVPU vs scheduler/Vulkan fallback;

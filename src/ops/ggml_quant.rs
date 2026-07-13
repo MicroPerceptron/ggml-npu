@@ -54,8 +54,9 @@ pub enum PreparedConstant {
 }
 
 pub fn source_native_supported(dtype: crate::ffi::ggml_type, use_: ConstantUse) -> bool {
-    use_ == ConstantUse::Dense
-        && matches!(
+    match use_ {
+        // Dense programs may bake packed Q4/Q6/Q8 or float/i8 pass-through.
+        ConstantUse::Dense => matches!(
             dtype,
             GGML_TYPE_Q4_K
                 | GGML_TYPE_Q6_K
@@ -64,7 +65,18 @@ pub fn source_native_supported(dtype: crate::ffi::ggml_type, use_: ConstantUse) 
                 | GGML_TYPE_F16
                 | GGML_TYPE_BF16
                 | GGML_TYPE_I8
-        )
+        ),
+        // Routed expert gather can select whole float rows; packed sub-byte banks cannot be
+        // dynamically gathered on the current Intel path and must take the canonical fallback.
+        ConstantUse::RoutedGather => matches!(dtype, GGML_TYPE_F16 | GGML_TYPE_BF16),
+    }
+}
+
+/// True when a source-native constant is a gatherable float expert bank (f16/bf16).
+/// Packed integer source-native banks must not be claimed for `MatMulId` (#11).
+pub fn routed_source_native_gatherable(descriptor: &crate::ops::constant::ConstantDescriptor) -> bool {
+    descriptor.numeric_kind == crate::ops::constant::NumericKind::Float
+        && descriptor.bit_width == 16
 }
 
 impl PreparedConstant {
@@ -159,21 +171,23 @@ fn fallback_descriptor(value: &Requant) -> ConstantDescriptor {
     }
 }
 
-/// Cheap source and shape check. `source_native` reflects compiler capability; routed gathers are
-/// deliberately tested through the canonical fallback because the Intel path cannot gather packed
-/// sub-byte expert banks.
+/// Cheap source and shape check. `source_native` reflects compiler capability.
+/// Routed packed (Q4/Q6/Q8) banks use the canonical requant fallback — Intel cannot dynamically
+/// gather packed sub-byte experts. Float f16/bf16 banks may pass through for `RoutedGather`.
 pub fn can_prepare(weight: &Operand, k: usize, use_: ConstantUse, source_native: bool) -> bool {
     if weight.ptr.is_null() || k == 0 || weight.elems == 0 || !weight.elems.is_multiple_of(k) {
         return false;
     }
     match weight.dtype {
-        GGML_TYPE_F16 | GGML_TYPE_BF16 => source_native,
-        GGML_TYPE_I8 => source_native,
-        GGML_TYPE_Q8_0 if source_native && use_ == ConstantUse::Dense => {
+        GGML_TYPE_F16 | GGML_TYPE_BF16 if source_native_supported(weight.dtype, use_) => {
+            source_native
+        }
+        GGML_TYPE_I8 if source_native_supported(weight.dtype, use_) => source_native,
+        GGML_TYPE_Q8_0 if source_native && source_native_supported(weight.dtype, use_) => {
             k.is_multiple_of(Q8_0_BLOCK)
         }
         GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_Q8_K
-            if source_native && use_ == ConstantUse::Dense =>
+            if source_native && source_native_supported(weight.dtype, use_) =>
         {
             k.is_multiple_of(SUPER_BLOCK)
         }
@@ -249,7 +263,8 @@ pub fn prepare(
     }
 
     // Explicit canonical fallback: unsupported source, compiler capability rejection, policy
-    // override, or routed gather. Scalar float/int8 sources have no proven legacy conversion.
+    // override, or routed packed (non-float) gather. Scalar float/int8 sources have no proven
+    // legacy conversion once the source-native branch above declined them.
     if matches!(
         weight.dtype,
         GGML_TYPE_F16 | GGML_TYPE_BF16 | GGML_TYPE_I8
@@ -958,7 +973,88 @@ mod tests {
             GGML_TYPE_Q4_K,
             ConstantUse::RoutedGather
         ));
+        // Float expert banks are gatherable; packed Q4/Q6/Q8 are not (#11).
+        assert!(source_native_supported(
+            GGML_TYPE_F16,
+            ConstantUse::RoutedGather
+        ));
+        assert!(routed_source_native_gatherable(&value.descriptor));
         assert!(!source_native_supported(GGML_TYPE_F32, ConstantUse::Dense));
+    }
+
+    #[test]
+    fn routed_q4_takes_canonical_fallback_not_packed_source_native() {
+        // Packed sub-byte expert banks must not be claimed as source-native gather (#11).
+        // Full prepare→requant needs ggml type traits (shim/hw); hermetic gate locks the policy.
+        assert!(!source_native_supported(
+            GGML_TYPE_Q4_K,
+            ConstantUse::RoutedGather
+        ));
+        assert!(!source_native_supported(
+            GGML_TYPE_Q6_K,
+            ConstantUse::RoutedGather
+        ));
+        assert!(!source_native_supported(
+            GGML_TYPE_Q8_0,
+            ConstantUse::RoutedGather
+        ));
+        let packed = ConstantDescriptor {
+            numeric_kind: NumericKind::Integer,
+            bit_width: 4,
+            storage_bits: 4,
+            signedness: Signedness::Unsigned,
+            block_elems: SUPER_BLOCK as i32,
+            group_elems: 32,
+            packing: Packing::DenseLsb,
+            scale_encoding: ScaleEncoding::BlockF16TimesGroupU8,
+            offset_encoding: OffsetEncoding::NegativeBlockF16TimesGroupU8,
+            exactness: Exactness::SourceNumeric,
+        };
+        assert!(
+            !routed_source_native_gatherable(&packed),
+            "packed integer source-native must fail-closed for MatMulId"
+        );
+        // Canonical requant Fallback descriptors remain integer but are not is_source_native.
+        let fallbackish = ConstantDescriptor {
+            numeric_kind: NumericKind::Integer,
+            bit_width: 4,
+            storage_bits: 8,
+            signedness: Signedness::Unsigned,
+            block_elems: SUPER_BLOCK as i32,
+            group_elems: 32,
+            packing: Packing::Unpacked,
+            scale_encoding: ScaleEncoding::PerGroupF16,
+            offset_encoding: OffsetEncoding::ZeroPointU8,
+            exactness: Exactness::Requantized,
+        };
+        // Gatherability helper is only consulted for SourceNative; Requantized banks use the
+        // shim's unpacked path. Still assert float-only gatherable source-native.
+        assert!(!routed_source_native_gatherable(&fallbackish));
+    }
+
+    #[test]
+    fn routed_f16_pass_through_is_gatherable_source_native() {
+        let mut source = [0x00u8, 0x3c, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44];
+        let operand = Operand {
+            ptr: source.as_mut_ptr().cast(),
+            elems: 4,
+            dtype: GGML_TYPE_F16,
+            owned: false,
+            shared: None,
+        };
+        let prepared = prepare(
+            &operand,
+            2,
+            2,
+            16,
+            false,
+            ConstantUse::RoutedGather,
+            true,
+        )
+        .expect("routed f16 bank must pass through");
+        assert!(prepared.is_source_native());
+        assert!(routed_source_native_gatherable(&prepared.descriptor()));
+        assert_eq!(prepared.descriptor().exactness, Exactness::SourceBytes);
     }
 
     #[test]
@@ -970,8 +1066,12 @@ mod tests {
         assert_eq!(value.descriptor.bit_width, 16);
         assert_eq!(value.descriptor.exactness, Exactness::SourceBytes);
         assert!(source_native_supported(GGML_TYPE_BF16, ConstantUse::Dense));
-        assert!(!source_native_supported(
+        assert!(source_native_supported(
             GGML_TYPE_BF16,
+            ConstantUse::RoutedGather
+        ));
+        assert!(!source_native_supported(
+            GGML_TYPE_Q4_K,
             ConstantUse::RoutedGather
         ));
 

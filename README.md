@@ -112,8 +112,12 @@ GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
 - `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV and FlashAttention candidates; the default
   keeps the attention core on GPU while allowing constant-weight/QKV projections, RoPE (normal/NEOX),
   and KV-cache SetRows needed for contiguous prefill QKV regions.
-- `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path.
-  `GGML_NPU_MOE=0` or unset keeps MoE routing unclaimed (presence of `=0` must not enable).
+- `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path
+  (Argsort/Sigmoid/SumRows/MatMulId). `GGML_NPU_MOE=0` or unset keeps MoE routing **unclaimed**
+  (presence of `=0` must not enable). Packed expert banks use canonical requant fallback; float
+  f16/bf16 banks gather directly. Output-head-scale MatMuls stay unclaimed under the expanded
+  constant budget (prefer GPU) unless `GGML_NPU_ALLOW_GIANT_CONSTANTS` is set — see
+  [`docs/coverage-gates.md`](docs/coverage-gates.md) (#11).
 - `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
 - `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
   any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.

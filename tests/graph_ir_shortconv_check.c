@@ -25,7 +25,7 @@ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type t) { (void)t
 
 enum { IR_INPUT = 0, IR_CONSTANT = 1, IR_STATE = 2, IR_INTERMEDIATE = 3, IR_OUTPUT = 4,
        IR_SSM_CONV = 12, IR_ROPE = 13, IR_GET_ROWS = 15, IR_ARGSORT = 16, IR_MATMUL_ID = 17,
-       IR_FLASH_ATTN = 22, IR_SET_ROWS = 26,
+       IR_FLASH_ATTN = 22, IR_SIGMOID = 24, IR_SUM_ROWS = 25, IR_SET_ROWS = 26,
        IR_MAX_INPUTS = 16 };
 /* Matches shim `npu_constant_desc` / Rust `ConstantAbi` for compile_graph_v3. */
 struct ir_constant {
@@ -53,6 +53,8 @@ static struct ir_constant ir_f16_constant(const uint16_t * values, size_t n_valu
     c.numeric_kind = 0; /* NPU_NUMERIC_FLOAT */
     c.bit_width = 16;
     c.storage_bits = 16;
+    /* exactness left 0 (NPU_REQUANTIZED) for ShortConv/legacy ABI; MoE float banks may
+     * override to NPU_SOURCE_BYTES (=2) to exercise the gatherable pass-through path (#11). */
     c.values = (const uint8_t *)values;
     c.values_len = n_values * sizeof(uint16_t);
     return c;
@@ -178,6 +180,7 @@ int main(int argc, char ** argv) {
         {.role=IR_INTERMEDIATE, .dtype=1, .ne={2,1,1,1}},
         {.role=IR_OUTPUT, .dtype=0, .ne={2,2,1,1}},
     };
+    moe_tensors[1].constant.exactness = 2; /* NPU_SOURCE_BYTES float expert bank */
     struct ir_node moe_nodes[2] = {
         {.op=IR_ARGSORT, .n_inputs=1, .inputs={0}, .output=3},
         {.op=IR_MATMUL_ID, .n_inputs=3, .inputs={1,2,3}, .output=4},
@@ -209,6 +212,75 @@ int main(int argc, char ** argv) {
         }
     }
     free_blob(blob);
+
+    /* MoE gating + reduction glue used beside TopK/MatMulId (#11). */
+    {
+        struct ir_tensor sig_tensors[2] = {
+            {.role=IR_INPUT, .dtype=0, .ne={4,1,1,1}},
+            {.role=IR_OUTPUT, .dtype=0, .ne={4,1,1,1}},
+        };
+        struct ir_node sig_node = {.op=IR_SIGMOID, .n_inputs=1, .inputs={0}, .output=1};
+        uint32_t sig_inputs[] = {0}, sig_outputs[] = {1};
+        blob = NULL; blob_len = 0;
+        rc = compile(2, sig_tensors, 1, &sig_node, 1, sig_inputs, 1, sig_outputs,
+                     "ir3-moe-sigmoid-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "MoE Sigmoid compile failed: %d\n", rc);
+            return 1;
+        }
+        const float sig_in[] = {0.f, 2.f, -2.f, 4.f};
+        /* logistic(x) */
+        const float sig_expected[] = {0.5f, 0.880797f, 0.119203f, 0.982014f};
+        float sig_actual[4] = {0};
+        const void * sig_args[] = {sig_in};
+        const size_t sig_lens[] = {4};
+        rc = run_multi(blob, blob_len, sig_args, sig_lens, 1, sig_actual, 4);
+        if (rc != 4) {
+            fprintf(stderr, "MoE Sigmoid NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (fabsf(sig_actual[i] - sig_expected[i]) > 0.05f) {
+                fprintf(stderr, "Sigmoid mismatch[%d]: got %.5f expected %.5f\n",
+                        i, sig_actual[i], sig_expected[i]);
+                return 1;
+            }
+        }
+        free_blob(blob);
+
+        /* SumRows reduces ggml ne[0] (OV axis 3). Input [4,2,1,1] → output [1,2,1,1]. */
+        struct ir_tensor sum_tensors[2] = {
+            {.role=IR_INPUT, .dtype=0, .ne={4,2,1,1}},
+            {.role=IR_OUTPUT, .dtype=0, .ne={1,2,1,1}},
+        };
+        struct ir_node sum_node = {.op=IR_SUM_ROWS, .n_inputs=1, .inputs={0}, .output=1};
+        uint32_t sum_inputs[] = {0}, sum_outputs[] = {1};
+        blob = NULL; blob_len = 0;
+        rc = compile(2, sum_tensors, 1, &sum_node, 1, sum_inputs, 1, sum_outputs,
+                     "ir3-moe-sum-rows-v1", &blob, &blob_len);
+        if (rc != 0 || !blob || !blob_len) {
+            fprintf(stderr, "MoE SumRows compile failed: %d\n", rc);
+            return 1;
+        }
+        const float sum_in[] = {1,2,3,4, 10,20,30,40};
+        const float sum_expected[] = {10, 100};
+        float sum_actual[2] = {0};
+        const void * sum_args[] = {sum_in};
+        const size_t sum_lens[] = {8};
+        rc = run_multi(blob, blob_len, sum_args, sum_lens, 1, sum_actual, 2);
+        if (rc != 2) {
+            fprintf(stderr, "MoE SumRows NPU run failed: %d\n", rc);
+            return 1;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (fabsf(sum_actual[i] - sum_expected[i]) > 0.05f) {
+                fprintf(stderr, "SumRows mismatch[%d]: got %.5f expected %.5f\n",
+                        i, sum_actual[i], sum_expected[i]);
+                return 1;
+            }
+        }
+        free_blob(blob);
+    }
 
     /* Mutable KV/state write. Execute the same artifact twice, carrying the first output into the
      * second invocation, to verify recurrent state continuity without unsafe in-place aliasing. */
