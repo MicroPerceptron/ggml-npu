@@ -1,12 +1,15 @@
 //! Weighted DAG cut-cost helpers for region coalesce (#48).
 //!
 //! Heuristic edge cost = tensor nbytes × backend-pair handoff factor.
-//! Prefer growing / preserving NPU regions; never invent NPU claims
-//! (feasibility still comes from the caller's `feasible_mask`).
+//! Prefer growing / preserving fat NPU regions; dissolve thin unitaries;
+//! never invent NPU claims (feasibility still comes from the caller's
+//! `feasible_mask`).
 //!
 //! Not a per-ioctl bandwidth oracle. Factors are tunable constants.
 
 #![allow(dead_code)]
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Matches `enum ggml_backend_dev_type` ordinals in ggml-backend.h.
 #[repr(u8)]
@@ -176,10 +179,11 @@ fn kind_at(kinds: &[BackendKind], backend_id: i32) -> BackendKind {
 /// into Vulkan/CPU. Below this, classic coalesce may absorb (avoids 400-disp
 /// unitary explosion from preserving every tiny feasible NPU sandwich).
 pub const NPU_PRESERVE_MIN_BYTES: u64 = 64 * 1024;
-/// Or keep NPU islands with at least this many non-view ops.
-pub const NPU_PRESERVE_MIN_OPS: usize = 2;
+/// Prefer fat islands: require ≥3 non-view ops (2-op islands dissolve unless
+/// they meet the byte floor). MVP used 2 and inflated pp16 dispatch count.
+pub const NPU_PRESERVE_MIN_OPS: usize = 3;
 
-/// Decision for absorbing a foreign island into the surrounding backend.
+/// Decision for absorbing a foreign island into a target backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbsorbDecision {
     Absorb,
@@ -187,12 +191,98 @@ pub enum AbsorbDecision {
     RefuseNoGain,
 }
 
-/// NPU-aware absorb gate for a sandwich `left | island | right` with `left == right`.
+/// Process-wide cut-cost attribution (reset at the start of each weighted pass).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CutCostStats {
+    pub absorbed_into_npu: u64,
+    pub dissolved_npu: u64,
+    pub preserved_fat_npu: u64,
+    pub absorbed_other: u64,
+}
+
+static STAT_ABSORBED_INTO_NPU: AtomicU64 = AtomicU64::new(0);
+static STAT_DISSOLVED_NPU: AtomicU64 = AtomicU64::new(0);
+static STAT_PRESERVED_FAT_NPU: AtomicU64 = AtomicU64::new(0);
+static STAT_ABSORBED_OTHER: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_cut_cost_stats() {
+    STAT_ABSORBED_INTO_NPU.store(0, Ordering::Relaxed);
+    STAT_DISSOLVED_NPU.store(0, Ordering::Relaxed);
+    STAT_PRESERVED_FAT_NPU.store(0, Ordering::Relaxed);
+    STAT_ABSORBED_OTHER.store(0, Ordering::Relaxed);
+}
+
+pub fn snapshot_cut_cost_stats() -> CutCostStats {
+    CutCostStats {
+        absorbed_into_npu: STAT_ABSORBED_INTO_NPU.load(Ordering::Relaxed),
+        dissolved_npu: STAT_DISSOLVED_NPU.load(Ordering::Relaxed),
+        preserved_fat_npu: STAT_PRESERVED_FAT_NPU.load(Ordering::Relaxed),
+        absorbed_other: STAT_ABSORBED_OTHER.load(Ordering::Relaxed),
+    }
+}
+
+#[inline]
+fn record_decision(
+    decision: AbsorbDecision,
+    island_backend: i32,
+    target_backend: i32,
+    kinds: &[BackendKind],
+    recolored_ops: usize,
+) {
+    match decision {
+        AbsorbDecision::Absorb => {
+            if kind_at(kinds, target_backend).is_npu() {
+                STAT_ABSORBED_INTO_NPU.fetch_add(recolored_ops as u64, Ordering::Relaxed);
+            } else if kind_at(kinds, island_backend).is_npu() {
+                STAT_DISSOLVED_NPU.fetch_add(recolored_ops as u64, Ordering::Relaxed);
+            } else {
+                STAT_ABSORBED_OTHER.fetch_add(recolored_ops as u64, Ordering::Relaxed);
+            }
+        }
+        AbsorbDecision::RefusePreserveNpu => {
+            STAT_PRESERVED_FAT_NPU.fetch_add(1, Ordering::Relaxed);
+        }
+        AbsorbDecision::RefuseNoGain => {}
+    }
+}
+
+/// True when an NPU island is worth keeping instead of dissolving into surround.
+#[inline]
+pub fn is_fat_npu_island(island_op_count: usize, island_nbytes_sum: u64) -> bool {
+    island_op_count >= NPU_PRESERVE_MIN_OPS || island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES
+}
+
+/// Prefer an existing NPU neighbor as absorb target (anti-unitary growth).
+///
+/// Does **not** invent NPU placement when neither neighbor is NPU — that would
+/// paint new NPU islands inside Vulkan/CPU runs.
+pub fn npu_absorb_target(
+    left: i32,
+    right: i32,
+    kinds: &[BackendKind],
+    weighted: bool,
+) -> Option<i32> {
+    if !weighted || left < 0 || right < 0 {
+        return None;
+    }
+    let left_npu = kind_at(kinds, left).is_npu();
+    let right_npu = kind_at(kinds, right).is_npu();
+    match (left_npu, right_npu) {
+        (true, true) => Some(left), // sandwich / both NPU: grow left (same id when equal)
+        (true, false) => Some(left),
+        (false, true) => Some(right),
+        (false, false) => None,
+    }
+}
+
+/// NPU-aware absorb gate for island → `target_backend`.
 ///
 /// - Growing onto NPU: absorb when feasible (caller already checked mask).
 /// - Dissolving an NPU island into non-NPU: refuse only when the island is
-///   "fat" (multi-op or ≥ [`NPU_PRESERVE_MIN_BYTES`]); tiny unitaries may
-///   dissolve so buft-safe coalesce duty-cycle wins are not undone.
+///   "fat" (≥ [`NPU_PRESERVE_MIN_OPS`] ops or ≥ [`NPU_PRESERVE_MIN_BYTES`]);
+///   thin unitaries / 2-op scraps may dissolve so buft-safe coalesce duty-cycle
+///   wins are not undone.
 /// - Other sandwiches: absorb when estimated cut cost drops (or nbytes unknown).
 pub fn decide_absorb(
     island_backend: i32,
@@ -212,12 +302,10 @@ pub fn decide_absorb(
 
     // Prefer fat NPU regions: keep multi-op / heavy islands off Vulkan/CPU.
     if island_k.is_npu() && !target_k.is_npu() {
-        let fat = island_op_count >= NPU_PRESERVE_MIN_OPS
-            || island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES;
-        if fat {
+        if is_fat_npu_island(island_op_count, island_nbytes_sum) {
             return AbsorbDecision::RefusePreserveNpu;
         }
-        // Tiny unitary NPU: allow classic dissolve into surround.
+        // Thin unitary / small 2-op NPU: allow classic dissolve into surround.
         return AbsorbDecision::Absorb;
     }
 
@@ -241,6 +329,17 @@ pub fn decide_absorb(
     }
 }
 
+/// Record an absorb attempt for profile counters (call after decide + recolor).
+pub fn note_absorb_outcome(
+    decision: AbsorbDecision,
+    island_backend: i32,
+    target_backend: i32,
+    kinds: &[BackendKind],
+    recolored_ops: usize,
+) {
+    record_decision(decision, island_backend, target_backend, kinds, recolored_ops);
+}
+
 /// Effective max island length: boost when absorbing into NPU across heavy edges.
 pub fn effective_max_island(
     base: usize,
@@ -258,12 +357,14 @@ pub fn effective_max_island(
     }
     let edge = left_edge_nbytes.max(right_edge_nbytes);
     // ≥256 KiB boundary → allow up to 2× island; ≥1 MiB → 3× (capped).
+    // Anti-unitary: modest +2 on light NPU growth edges. Larger light boosts
+    // (2×) inflated pp16 disp toward the preserve-all failure mode (~412).
     if edge >= 1 << 20 {
         base.saturating_mul(3).min(base.saturating_add(12))
     } else if edge >= 1 << 18 {
         base.saturating_mul(2).min(base.saturating_add(8))
     } else {
-        base
+        base.saturating_add(2)
     }
 }
 
@@ -282,7 +383,7 @@ mod tests {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
         let d = decide_absorb(1, 0, &kinds, 128 * 1024, 1, 4096, 4096, true);
         assert_eq!(d, AbsorbDecision::RefusePreserveNpu);
-        let multi = decide_absorb(1, 0, &kinds, 1024, 2, 4096, 4096, true);
+        let multi = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true);
         assert_eq!(multi, AbsorbDecision::RefusePreserveNpu);
     }
 
@@ -294,10 +395,27 @@ mod tests {
     }
 
     #[test]
+    fn allow_dissolving_thin_two_op_npu() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        // 2-op below byte floor dissolves (anti-unitary / dispatch hygiene).
+        let d = decide_absorb(1, 0, &kinds, 8192, 2, 4096, 4096, true);
+        assert_eq!(d, AbsorbDecision::Absorb);
+    }
+
+    #[test]
     fn absorb_into_npu() {
         let kinds = [BackendKind::Npu, BackendKind::Gpu];
         let d = decide_absorb(1, 0, &kinds, 1024, 1, 1024, 1024, true);
         assert_eq!(d, AbsorbDecision::Absorb);
+    }
+
+    #[test]
+    fn npu_target_asymmetric_picks_npu_neighbor() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu, BackendKind::Cpu];
+        assert_eq!(npu_absorb_target(0, 2, &kinds, true), Some(0));
+        assert_eq!(npu_absorb_target(2, 0, &kinds, true), Some(0));
+        assert_eq!(npu_absorb_target(1, 2, &kinds, true), None);
+        assert_eq!(npu_absorb_target(0, 2, &kinds, false), None);
     }
 
     #[test]
@@ -326,5 +444,20 @@ mod tests {
         let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true);
         assert!(boosted > 4);
         assert_eq!(effective_max_island(4, 1, &kinds, 1 << 20, 64, true), 4);
+        // Light NPU growth edge still gets +2 anti-unitary headroom.
+        assert_eq!(effective_max_island(4, 0, &kinds, 64, 64, true), 6);
+    }
+
+    #[test]
+    fn stats_track_absorb_and_dissolve() {
+        reset_cut_cost_stats();
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        note_absorb_outcome(AbsorbDecision::Absorb, 1, 0, &kinds, 2);
+        note_absorb_outcome(AbsorbDecision::Absorb, 0, 1, &kinds, 1);
+        note_absorb_outcome(AbsorbDecision::RefusePreserveNpu, 0, 1, &kinds, 0);
+        let s = snapshot_cut_cost_stats();
+        assert_eq!(s.absorbed_into_npu, 2);
+        assert_eq!(s.dissolved_npu, 1);
+        assert_eq!(s.preserved_fat_npu, 1);
     }
 }
