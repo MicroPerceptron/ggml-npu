@@ -6,7 +6,7 @@
 //! `get_proc_address` — Rust-owned algorithm, thin C ABI only (no thick C++
 //! cost model; free to take crates/`core::simd` without ggml C++ compat).
 
-mod auto;
+pub(crate) mod auto;
 mod cut_cost;
 mod region_coalesce;
 

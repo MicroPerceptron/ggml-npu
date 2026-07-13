@@ -50,9 +50,24 @@ Level Zero / non-Direct builds return 0). Explicit `GGML_SCHED_*` overrides
 always win when set. Unset / non-`auto` keeps the historical default-off trio
 (safe; no SEGV / BindingMismatch reintroduction from silent enable).
 
+**Decode-aware split (prefill vs gen):** locked LFM tg128 showed the prefill
+trio *hurts* token-gen (auto ~1.9 tok/s / ~25k+ NPU disp/token vs sched-off
+~2.6; Vulkan ~53). Under `auto`:
+
+| Graph shape | Claim / cut / coalesce | `offload_op` / `should_pull` |
+|-------------|------------------------|------------------------------|
+| Prefill-sized (any `MUL_MAT` with `ne[1] > 1`) | Auto-applied trio (unless explicit `GGML_SCHED_*`) | Existing profitability |
+| Decode / M=1 (all `MUL_MAT` have `ne[1] <= 1`) | Auto-applied trio **suspended** for that graph | Prefer **unclaim** (Vulkan/host-first) |
+
+Explicit `GGML_SCHED_REGION_COALESCE` / `CUT_COST` / `NPU_CLAIM_STAGE` still win
+for decode if set (experiments). `GGML_NPU_FORCE_GRAPH` still forces pulls.
+Capability (`supports_op`) is unchanged — decode unclaim is profitability /
+scheduler-gate only.
+
 ## Flags
 
-- `GGML_NPU_SCHED=auto` — master opt-in for the recommended Direct trio (above).
+- `GGML_NPU_SCHED=auto` — master opt-in: prefill Direct trio + decode
+  Vulkan/host-first (skip auto claim/cut/coalesce; prefer unclaim for M=1).
 - `GGML_SCHED_REGION_COALESCE=1` — enable pass (scheduler must resolve the Rust
   ABI from a loaded backend registry, typically `libggml_npu.so`).
 - `GGML_SCHED_REGION_COALESCE=2` — enable + verbose flip / reassignment dump.
@@ -195,6 +210,12 @@ typedef int (*ggml_backend_npu_sched_auto_eligible_t)(void);
 
 Proc name: `ggml_backend_npu_sched_auto_eligible`. Returns `1` for Direct narrow
 buft builds, `0` otherwise. Used by llama.cpp when `GGML_NPU_SCHED=auto`.
+
+llama.cpp keeps the auto trio armed on the sched for **prefill**, and per
+`split_graph` **suspends** auto-applied claim/cut/coalesce when every `MUL_MAT`
+has `ne[1] <= 1` (decode). Explicit `GGML_SCHED_*` overrides are not suspended.
+Rust `policy::should_pull` additionally prefers unclaim for decode-batch
+tensors under exact `GGML_NPU_SCHED=auto` (unless `GGML_NPU_FORCE_GRAPH`).
 
 LTO / same-process dynamic load is assumed to keep FFI cost negligible vs split
 overhead.
