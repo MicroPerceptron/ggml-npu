@@ -1323,7 +1323,8 @@ mod tests {
 
     #[test]
     fn moe_routing_ops_are_moe_tagged_not_attention() {
-        // Sparse MoE routing/expert ops are gated by GGML_NPU_MOE=1, not ATTENTION=full (#11).
+        // Sparse MoE ops are MoE-gated (not ATTENTION=full). Argsort/MatMulId stay MoE-tagged but
+        // supports_op-unclaimed even under MOE=1 until model-scale ids/experts are proven (#11).
         for (op, unary, n_inputs, wire) in [
             (GGML_OP_ARGSORT, 0, 1usize, WireOp::Argsort),
             (GGML_OP_SUM_ROWS, 0, 1, WireOp::SumRows),

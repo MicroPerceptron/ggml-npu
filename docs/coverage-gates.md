@@ -96,10 +96,14 @@ Do not cite tok/s movement from enabling `ATTENTION=full` without a measured att
 
 | Path | Default (`MOE` unset/`=0`) | Opt-in (`GGML_NPU_MOE=1`) |
 | --- | --- | --- |
-| Argsort / Sigmoid / SumRows / MatMulId | **Unclaim** (`traits.moe` + `is_opt_in_one`) | Claim when compile-ready |
-| Packed Q4/Q6/Q8 expert banks | n/a | Canonical **requant** Fallback (unpacked); never packed source-native gather |
-| Float f16/bf16 expert banks | n/a | SourceBytes pass-through + Gather-before-MatMul |
+| Argsort (expert ids) / MatMulId | **Unclaim** | **Unclaim** until model-scale ids/experts proven (shim may still lower Argsort→MatMulId with ids internal) |
+| Sigmoid / SumRows | **Unclaim** (`traits.moe` + `is_opt_in_one`) | Claim when compile-ready |
+| Packed Q4/Q6/Q8 expert banks | n/a | Canonical **requant** Fallback (unpacked) when MatMulId is later re-enabled; never packed source-native gather |
+| Float f16/bf16 expert banks | n/a | SourceBytes pass-through + Gather-before-MatMul (shim today; claim gated with MatMulId) |
 | Output-head-scale dense MatMul | **Unclaim** via `expanded_constant_budget` (GPU-class vocab×hidden); `GGML_NPU_ALLOW_GIANT_CONSTANTS` is the explicit escape hatch — do not claim then corrupt |
 
-Presence of `GGML_NPU_MOE=0` must not enable MoE (PR #38). Shim numerical coverage for MoE routing
-lives in `tests/graph_ir_shortconv_check.c` (Argsort+MatMulId, Sigmoid, SumRows).
+Presence of `GGML_NPU_MOE=0` must not enable MoE (PR #38). Claiming Argsort under `MOE=1`
+corrupted expert ids for host/Vulkan `MUL_MAT_ID` (device-intermediate TopK never reached ggml
+tensors). MatMulId remains supports_op-unclaimed at model scale after the same opt-in. Shim
+numerical coverage lives in `tests/graph_ir_shortconv_check.c` (Argsort+MatMulId fused, Sigmoid,
+SumRows).
