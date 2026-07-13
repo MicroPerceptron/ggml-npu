@@ -236,8 +236,10 @@ fn run_partitions(vendor: &dyn Vendor, graph: &GraphIr) -> bool {
 /// `supports_op`: can the present NPU vendor **execute** this node correctly?
 ///
 /// Capability only — profitability / region expansion live in [`crate::policy::should_pull`]
-/// (`offload_op`). Never claim a node the vendor lowerer rejects, and never claim a matched
-/// single-op path when `can_lower` fails (#8).
+/// (`offload_op`). Never claim a node the vendor lowerer rejects. Const-weight matmuls that pass
+/// `node_support` remain claimable even when the dedicated Constant-path `can_lower` probe fails
+/// — Graph IR still lowers them in fused prefill splits; refusing here silently handed large-M
+/// FFN/ShortConv/QKV work to Vulkan (#5 / #8).
 pub unsafe fn supports(op: *const ggml_tensor) -> bool {
     let Some(v) = vendor::present() else {
         return false;
@@ -245,10 +247,31 @@ pub unsafe fn supports(op: *const ggml_tensor) -> bool {
     if let Ok(spec) = OpRegistry::decode_tensor(op) {
         match v.node_support(op, &spec) {
             LoweringSupport::Supported => {
-                // Dedicated single-op lowerers must accept the node; otherwise refuse rather than
-                // over-claim and hope graph fusion covers it.
                 if let Some(matched) = ops::match_node(op) {
-                    return ops::can_lower(matched, op, v);
+                    if ops::can_lower(matched, op, v) {
+                        return true;
+                    }
+                    // Constant-path probe missed; keep Graph IR eligibility for bakeable weights.
+                    if ops::subgraph::is_const_weight_matmul(op) {
+                        crate::trace::perf(
+                            "placement_rejection",
+                            &alloc::format!(
+                                ",\"reason\":\"constant_path_probe_miss_graph_ir_ok\",\"op\":{},\"wire\":{}",
+                                (*op).op,
+                                spec.wire as i32,
+                            ),
+                        );
+                        return true;
+                    }
+                    crate::trace::perf(
+                        "placement_rejection",
+                        &alloc::format!(
+                            ",\"reason\":\"constant_path_can_lower\",\"op\":{},\"wire\":{}",
+                            (*op).op,
+                            spec.wire as i32,
+                        ),
+                    );
+                    return false;
                 }
                 return true;
             }

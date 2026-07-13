@@ -129,7 +129,9 @@ unsafe fn has_claimable_matmul_ancestor(t: *const ggml_tensor, depth: usize) -> 
         .copied()
         .filter(|src| !src.is_null())
         .any(|src| {
-            crate::ops::subgraph::is_claimable_matmul(src)
+            // Prefer const-weight (not match_node) so QKV continuity survives non-contiguous
+            // prefill activations after Views (#5 / #10).
+            crate::ops::subgraph::is_const_weight_matmul(src)
                 || has_claimable_matmul_ancestor(src, depth - 1)
         })
 }
@@ -209,25 +211,61 @@ unsafe fn has_ffn_fusible_ancestor(t: *const ggml_tensor, depth: usize) -> bool 
         })
 }
 
-/// Dependency-aware fusible/metadata pull: FFN glue claims, or layout under an FFN fusible span.
+/// True when `t` sits under a const-weight matmul or ShortConv state edge — enlarge prefill
+/// FFN/ShortConv/QKV neighborhoods without requiring the strict contiguous `match_node` gate.
+unsafe fn has_static_prefill_span_ancestor(t: *const ggml_tensor, depth: usize) -> bool {
+    if t.is_null() || depth == 0 {
+        return false;
+    }
+    (*t).src
+        .iter()
+        .copied()
+        .filter(|src| !src.is_null())
+        .any(|src| {
+            crate::ops::subgraph::is_const_weight_matmul(src)
+                || (*src).op == GGML_OP_SSM_CONV
+                || name_contains(src, b".conv.")
+                || has_static_prefill_span_ancestor(src, depth - 1)
+        })
+}
+
+unsafe fn is_attention_side_name(t: *const ggml_tensor) -> bool {
+    name_contains(t, b"self_attn")
+        || name_contains(t, b"attn_q")
+        || name_contains(t, b"attn_k")
+        || name_contains(t, b"attn_v")
+        || name_contains(t, b"attn_output")
+        || name_contains(t, b"kq_")
+        || name_contains(t, b"kqv")
+}
+
+/// Dependency-aware fusible/metadata pull: FFN glue, FFN-span layout, or ShortConv/static prefill
+/// span glue (not attention-side orphans that become unitary NPU islands).
 fn fusible_neighborhood_should_pull(
     placement: PlacementClass,
     claims_glue: bool,
     ffn_fusible_ancestor: bool,
+    static_prefill_span: bool,
 ) -> bool {
     match placement {
         PlacementClass::FusibleOnly | PlacementClass::Metadata => {
-            claims_glue || ffn_fusible_ancestor
+            claims_glue || ffn_fusible_ancestor || static_prefill_span
         }
         _ => false,
     }
 }
 
 unsafe fn should_pull_fusible_neighborhood(node: *const ggml_tensor, spec: OpSpec) -> bool {
+    let static_prefill_span = !is_attention_side_name(node)
+        && (has_shortconv_ancestor(node, 12)
+            || touches_shortconv_state(node)
+            || (output_elements(&*node) >= env_u64(c"GGML_NPU_MIN_REGION_ELEMENTS", 32_768)
+                && has_static_prefill_span_ancestor(node, 12)));
     fusible_neighborhood_should_pull(
         spec.placement,
         crate::ops::subgraph::claims_glue(node),
         has_ffn_fusible_ancestor(node, 12),
+        static_prefill_span,
     )
 }
 
@@ -334,8 +372,9 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
                 return false;
             }
             // Runtime-weight matmuls cannot bake into fused NPU programs; pulling them creates
-            // uneconomic unitary islands. Const-weight FFN/attention projections remain eligible.
-            if x.op == GGML_OP_MUL_MAT && !crate::ops::subgraph::is_claimable_matmul(node) {
+            // uneconomic unitary islands. Const-weight projections remain eligible even when
+            // activations are non-contiguous (Graph IR + layout glue) — do not require match_node.
+            if x.op == GGML_OP_MUL_MAT && !crate::ops::subgraph::is_const_weight_matmul(node) {
                 return false;
             }
             (x.ne[0].max(0) as u64)
@@ -346,15 +385,17 @@ pub(crate) unsafe fn should_pull(node: *const ggml_tensor) -> bool {
             x.ne.iter()
                 .fold(1u64, |a, &b| a.saturating_mul(b.max(0) as u64))
         }
-        // Dependency-aware FFN glue/layout pull: enlarge fused partitions around ShortConv/FFN
-        // instead of leaving claimable silu/mul/residual on CPU while matmuls go NPU (#5).
+        // Dependency-aware FFN/ShortConv/prefill glue pull: enlarge fused partitions around
+        // static spans instead of leaving claimable silu/mul/residual on CPU while matmuls go
+        // NPU — and refuse fusible orphans that do not sit in such a span (#5).
         _ => return should_pull_fusible_neighborhood(node, spec),
     };
-    // Orphan/attention-side matmuls (not FFN-local) pay full handoff cost as unitary programs.
-    // Default unitary floor is 4× MIN_OFFLOAD_WORK so uneconomic 1-node MUL_MAT pulls stay off
-    // NPU unless explicitly lowered via GGML_NPU_MIN_UNITARY_OFFLOAD_WORK (#5).
+    // Orphan/attention-side decode matmuls pay full handoff as unitary programs. Prefill-sized
+    // const projections (QKV/FFN/conv) and FFN-shaped mats use the general floor (#5).
     let min_work = if x.op == GGML_OP_MUL_MAT
         && !crate::ops::subgraph::is_ffn_shaped_matmul(node)
+        && !crate::ops::subgraph::is_prefill_static_projection(node)
+        && !has_shortconv_ancestor(node, 12)
     {
         unitary_offload_floor(min_work)
     } else {
@@ -435,24 +476,34 @@ mod tests {
 
     #[test]
     fn fusible_neighborhood_pulls_claimed_glue_and_ffn_span_layout() {
-        // Claimed FFN glue always pulls; layout/metadata only under an FFN fusible ancestor.
+        // Claimed FFN glue always pulls; layout/metadata under FFN or static prefill span.
         assert!(fusible_neighborhood_should_pull(
             PlacementClass::FusibleOnly,
             true,
+            false,
             false
         ));
         assert!(fusible_neighborhood_should_pull(
             PlacementClass::Metadata,
+            false,
+            true,
+            false
+        ));
+        assert!(fusible_neighborhood_should_pull(
+            PlacementClass::FusibleOnly,
+            false,
             false,
             true
         ));
         assert!(!fusible_neighborhood_should_pull(
             PlacementClass::FusibleOnly,
             false,
+            false,
             false
         ));
         assert!(!fusible_neighborhood_should_pull(
             PlacementClass::Anchor,
+            true,
             true,
             true
         ));

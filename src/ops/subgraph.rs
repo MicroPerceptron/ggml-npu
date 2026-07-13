@@ -372,7 +372,19 @@ unsafe fn glue_2d(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).ne[2] == 1 && (*t).ne[3] == 1
 }
 
-/// Is `t` a MUL_MAT we would claim (a bakeable constant-weight matmul)?
+/// Is `t` a MUL_MAT with a bakeable model-leaf weight (Constant path / Graph IR const input)?
+/// Unlike [`is_claimable_matmul`], this does **not** require contiguity or the single-op
+/// `match_node` shape gate — prefill activations are often non-contiguous after Views, but the
+/// weight is still a static leaf the graph compiler can bake (#5 prefill coalesce).
+pub(crate) unsafe fn is_const_weight_matmul(t: *const ggml_tensor) -> bool {
+    if t.is_null() || (*t).op != GGML_OP_MUL_MAT {
+        return false;
+    }
+    let w = (*t).src[0];
+    !w.is_null() && (*w).op == GGML_OP_NONE && !(*w).data.is_null()
+}
+
+/// Is `t` a MUL_MAT we would claim on the dedicated Constant single-op path (`match_node`)?
 pub(crate) unsafe fn is_claimable_matmul(t: *const ggml_tensor) -> bool {
     !t.is_null() && (*t).op == GGML_OP_MUL_MAT && super::matmul::match_node(t).is_some()
 }
@@ -388,7 +400,7 @@ pub(crate) unsafe fn is_ffn_shaped_activation(t: *const ggml_tensor) -> bool {
     }
     if (*t).op == GGML_OP_MUL {
         let (a, b) = ((*t).src[0], (*t).src[1]);
-        return (is_silu(a) && is_claimable_matmul(b)) || (is_silu(b) && is_claimable_matmul(a));
+        return (is_silu(a) && is_const_weight_matmul(b)) || (is_silu(b) && is_const_weight_matmul(a));
     }
     false
 }
@@ -397,6 +409,15 @@ pub(crate) unsafe fn is_ffn_shaped_activation(t: *const ggml_tensor) -> bool {
 pub(crate) unsafe fn is_ffn_shaped_matmul(t: *const ggml_tensor) -> bool {
     // ggml MUL_MAT: src[0]=weights, src[1]=activation (same as recognize / match_node).
     !t.is_null() && (*t).op == GGML_OP_MUL_MAT && is_ffn_shaped_activation((*t).src[1])
+}
+
+/// Const-weight projection large enough that prefill rows amortize NPU handoff (QKV / FFN / conv).
+/// Decode-sized `M==1` stays on the stricter unitary floor in `policy` (#5).
+pub(crate) unsafe fn is_prefill_static_projection(t: *const ggml_tensor) -> bool {
+    if !is_const_weight_matmul(t) || !glue_2d(t) {
+        return false;
+    }
+    (*t).ne[1] >= 32
 }
 
 /// Is `node` a glue op *type* (silu, mul, SwiGLU, add, or RMSNorm) — dispatched via
@@ -411,10 +432,10 @@ pub unsafe fn is_glue_op(node: *const ggml_tensor) -> bool {
 }
 
 /// Should `supports_op` claim this glue node as part of a claimable FFN? Upstream structure only
-/// (per-node can't see downstream): a silu fed by a claimable matmul; a mul combining such a silu
-/// and a claimable matmul; a SwiGLU fed by two claimable matmuls (gate + up); a **residual add**
-/// combining an FFN-shaped claimable matmul (the `down` projection after silu/SwiGLU) and a runtime
-/// tensor. Claiming these + the matmuls groups the FFN (+ its residual) into one NPU split.
+/// (per-node can't see downstream): a silu fed by a const-weight matmul; a mul combining such a silu
+/// and a const-weight matmul; a SwiGLU fed by two const-weight matmuls (gate + up); a **residual add**
+/// combining an FFN-shaped const-weight matmul (the `down` projection after silu/SwiGLU) and a
+/// runtime tensor. Claiming these + the matmuls groups the FFN (+ its residual) into one NPU split.
 /// Attention residuals (matmul after norm/QKV) are intentionally not claimed — they became
 /// uneconomic unitary NPU islands under LFM pp512 (#5).
 pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
@@ -422,25 +443,25 @@ pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
         return false;
     }
     if is_silu(node) {
-        return is_claimable_matmul((*node).src[0]);
+        return is_const_weight_matmul((*node).src[0]);
     }
     if is_swiglu(node) {
-        return is_claimable_matmul((*node).src[0]) && is_claimable_matmul((*node).src[1]);
+        return is_const_weight_matmul((*node).src[0]) && is_const_weight_matmul((*node).src[1]);
     }
-    // RMSNorm and its weight-multiply — only at decode (M==1), where the per-channel weight-multiply
-    // is same-shape (no broadcast). Over-claims: an attention norm gets claimed too and runs as its
-    // own standalone dispatch (correct, minor cost) until attention fuses.
+    // RMSNorm: decode (M==1) always (same-shape weight mul). Prefill only when clearly FFN-local
+    // by name so attention norms do not become lone NPU unitaries (#5).
     if is_rms_norm(node) {
-        return (*node).ne[1] == 1;
+        return (*node).ne[1] == 1 || name_contains_ffn(node);
     }
     if (*node).op == GGML_OP_MUL {
         let (a, b) = ((*node).src[0], (*node).src[1]);
-        let silu_mm = |s: *const ggml_tensor| is_silu(s) && is_claimable_matmul((*s).src[0]);
-        if (silu_mm(a) && is_claimable_matmul(b)) || (silu_mm(b) && is_claimable_matmul(a)) {
+        let silu_mm = |s: *const ggml_tensor| is_silu(s) && is_const_weight_matmul((*s).src[0]);
+        if (silu_mm(a) && is_const_weight_matmul(b)) || (silu_mm(b) && is_const_weight_matmul(a)) {
             return true;
         }
-        // norm-weight mul: rms_norm × per-channel weight, at decode.
-        return (*node).ne[1] == 1 && (is_rms_norm(a) || is_rms_norm(b));
+        // norm-weight mul: rms_norm × per-channel weight — decode always; prefill FFN-named only.
+        let norm_mul = is_rms_norm(a) || is_rms_norm(b);
+        return norm_mul && ((*node).ne[1] == 1 || name_contains_ffn(node));
     }
     if (*node).op == GGML_OP_ADD {
         let (a, b) = ((*node).src[0], (*node).src[1]);
@@ -451,6 +472,16 @@ pub unsafe fn claims_glue(node: *const ggml_tensor) -> bool {
         return residual(a, b) || residual(b, a);
     }
     false
+}
+
+unsafe fn name_contains_ffn(t: *const ggml_tensor) -> bool {
+    if t.is_null() {
+        return false;
+    }
+    let name = &(*t).name;
+    let needle = b"ffn";
+    name.windows(needle.len())
+        .any(|window| window.iter().zip(needle).all(|(&a, &b)| a as u8 == b))
 }
 
 /// Build a single-node subgraph for a claimed glue op (silu or mul) — the per-node fallback for a
@@ -582,4 +613,60 @@ pub unsafe fn recognize_glue(node: *const ggml_tensor) -> Option<Subgraph> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ptr;
+
+    fn empty_tensor() -> ggml_tensor {
+        unsafe { core::mem::zeroed() }
+    }
+
+    #[test]
+    fn const_weight_matmul_accepts_leaf_weight_without_match_node() {
+        let mut weight = empty_tensor();
+        weight.op = GGML_OP_NONE;
+        // Non-null data pointer (not dereferenced by is_const_weight_matmul).
+        weight.data = 1 as *mut _;
+
+        let mut mm = empty_tensor();
+        mm.op = GGML_OP_MUL_MAT;
+        mm.src[0] = &mut weight;
+        mm.ne = [64, 128, 1, 1];
+
+        assert!(unsafe { is_const_weight_matmul(&mm) });
+        assert!(unsafe { is_prefill_static_projection(&mm) });
+
+        mm.ne[1] = 1;
+        assert!(!unsafe { is_prefill_static_projection(&mm) });
+    }
+
+    #[test]
+    fn const_weight_matmul_rejects_runtime_weight() {
+        let mut runtime = empty_tensor();
+        runtime.op = GGML_OP_MUL;
+        runtime.data = 1 as *mut _;
+
+        let mut mm = empty_tensor();
+        mm.op = GGML_OP_MUL_MAT;
+        mm.src[0] = &mut runtime;
+        assert!(!unsafe { is_const_weight_matmul(&mm) });
+        assert!(!unsafe { is_const_weight_matmul(ptr::null()) });
+    }
+
+    #[test]
+    fn claims_glue_prefill_rms_norm_requires_ffn_name() {
+        let mut norm = empty_tensor();
+        norm.op = GGML_OP_RMS_NORM;
+        norm.ne = [64, 128, 1, 1];
+        assert!(!unsafe { claims_glue(&norm) });
+
+        let name = b"blk.0.ffn_norm\0";
+        for (i, &b) in name.iter().enumerate() {
+            norm.name[i] = b as i8;
+        }
+        assert!(unsafe { claims_glue(&norm) });
+    }
 }
