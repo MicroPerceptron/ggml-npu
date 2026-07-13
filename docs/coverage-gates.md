@@ -92,3 +92,14 @@ Shim numerical proofs for SoftMax and FlashAttention live in `tests/graph_ir_sho
 (gate=`shim`). Hermetic contract tests cover decode variants and the env gate without NPU hardware.
 Do not cite tok/s movement from enabling `ATTENTION=full` without a measured attribution run.
 
+## Sparse MoE + output head (#11)
+
+| Path | Default (`MOE` unset/`=0`) | Opt-in (`GGML_NPU_MOE=1`) |
+| --- | --- | --- |
+| Argsort / Sigmoid / SumRows / MatMulId | **Unclaim** (`traits.moe` + `is_opt_in_one`) | Claim when compile-ready |
+| Packed Q4/Q6/Q8 expert banks | n/a | Canonical **requant** Fallback (unpacked); never packed source-native gather |
+| Float f16/bf16 expert banks | n/a | SourceBytes pass-through + Gather-before-MatMul |
+| Output-head-scale dense MatMul | **Unclaim** via `expanded_constant_budget` (GPU-class vocab×hidden); `GGML_NPU_ALLOW_GIANT_CONSTANTS` is the explicit escape hatch — do not claim then corrupt |
+
+Presence of `GGML_NPU_MOE=0` must not enable MoE (PR #38). Shim numerical coverage for MoE routing
+lives in `tests/graph_ir_shortconv_check.c` (Argsort+MatMulId, Sigmoid, SumRows).

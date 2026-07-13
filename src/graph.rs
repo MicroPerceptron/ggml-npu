@@ -1322,6 +1322,27 @@ mod tests {
     }
 
     #[test]
+    fn moe_routing_ops_are_moe_tagged_not_attention() {
+        // Sparse MoE routing/expert ops are gated by GGML_NPU_MOE=1, not ATTENTION=full (#11).
+        for (op, unary, n_inputs, wire) in [
+            (GGML_OP_ARGSORT, 0, 1usize, WireOp::Argsort),
+            (GGML_OP_SUM_ROWS, 0, 1, WireOp::SumRows),
+            (GGML_OP_MUL_MAT_ID, 0, 3, WireOp::MatMulId),
+            (
+                GGML_OP_UNARY,
+                GGML_UNARY_OP_SIGMOID as i32,
+                1,
+                WireOp::Sigmoid,
+            ),
+        ] {
+            let spec = decode_spec(op, unary, 0.0, 0, n_inputs).expect("MoE op must decode");
+            assert_eq!(spec.wire, wire);
+            assert!(spec.traits.moe);
+            assert!(!spec.traits.attention);
+        }
+    }
+
+    #[test]
     fn operation_contract_assigns_explicit_placement_classes() {
         assert_eq!(
             decode_spec(GGML_OP_MUL_MAT, 0, 0.0, 0, 2).map(|spec| spec.placement),

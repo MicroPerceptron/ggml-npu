@@ -1150,10 +1150,14 @@ fn compile_graph_uncached(graph: &GraphIr) -> Option<Vec<u8>> {
             return None;
         }
         if routed[id] && constant.is_source_native() {
-            super::profile::note(
-                "[npu ir2] rejected source-native routed bank: packed dynamic gather unavailable\n",
-            );
-            return None;
+            // Float f16/bf16 banks are gatherable. Packed integer source-native cannot be
+            // dynamically gathered — refuse rather than silently pretending native win (#11).
+            if !ggml_quant::routed_source_native_gatherable(&constant.descriptor()) {
+                super::profile::note(
+                    "[npu ir2] rejected source-native routed bank: packed dynamic gather unavailable\n",
+                );
+                return None;
+            }
         }
         constant_index[id] = Some(constants.len());
         constants.push(constant);
@@ -1911,6 +1915,64 @@ mod tests {
             value: c"1",
         };
         assert!(on.is_opt_in_one(c"GGML_NPU_MOE"));
+    }
+
+    #[test]
+    fn moe_routing_ops_admit_only_when_moe_opt_in_one() {
+        // Argsort/Sigmoid/SumRows/MatMulId are MoE-tagged; default/unset/=0 unclaim, =1 admits (#11).
+        use crate::graph::{Node, OpRegistry, OP_PARAM_BYTES};
+        let cases = [
+            (crate::ffi::GGML_OP_ARGSORT, 0, 1usize, crate::graph::WireOp::Argsort),
+            (crate::ffi::GGML_OP_SUM_ROWS, 0, 1, crate::graph::WireOp::SumRows),
+            (
+                crate::ffi::GGML_OP_MUL_MAT_ID,
+                0,
+                3,
+                crate::graph::WireOp::MatMulId,
+            ),
+            (
+                crate::ffi::GGML_OP_UNARY,
+                crate::ffi::GGML_UNARY_OP_SIGMOID as i32,
+                1,
+                crate::graph::WireOp::Sigmoid,
+            ),
+        ];
+        for (op, unary, n_inputs, wire) in cases {
+            let mut params = [0u8; OP_PARAM_BYTES];
+            if op == crate::ffi::GGML_OP_UNARY {
+                params[0..4].copy_from_slice(&unary.to_ne_bytes());
+            }
+            let inputs: alloc::vec::Vec<u32> = (0..n_inputs as u32).collect();
+            let spec = OpRegistry::decode_node(&Node {
+                op,
+                spec: Err(crate::graph::OpReject::UnsupportedOp),
+                inputs,
+                output: n_inputs as u32,
+                op_params: params,
+            })
+            .unwrap_or_else(|_| panic!("{wire:?} must decode"));
+            assert_eq!(spec.wire, wire);
+            assert!(spec.traits.moe, "{wire:?} must be MoE-tagged");
+            assert!(!env_policy_admits_gated(&spec, false, false, false));
+            assert!(env_policy_admits_gated(&spec, false, true, false));
+            assert!(wire_op_compile_supported(wire));
+        }
+    }
+
+    #[test]
+    fn output_head_scale_matmul_is_unclaimed_without_giant_override() {
+        // Output-head weights are GPU-class (~vocab×hidden). Prefer explicit unclaim via the
+        // expanded-constant budget over claiming then corrupting / OOM (#11 §5.7).
+        let output_head = predicted_compiler_constant_bytes(128_000 * 2_048);
+        let defaultish_budget = 384 * MIB;
+        assert!(
+            !expanded_constant_admitted(output_head, defaultish_budget, false),
+            "output-head sized MatMul must unclaim under default budgets"
+        );
+        assert!(
+            expanded_constant_admitted(output_head, defaultish_budget, true),
+            "GGML_NPU_ALLOW_GIANT_CONSTANTS remains the explicit opt-in escape hatch"
+        );
     }
 
     #[test]
