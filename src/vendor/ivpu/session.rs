@@ -345,6 +345,28 @@ pub(super) fn session_health() -> HealthState {
     health::health_state()
 }
 
+fn monotonic_now_ns() -> Result<u64, RuntimeError> {
+    crate::host::builtin()
+        .clock()
+        .monotonic_now_ns()
+        .map_err(|error| RuntimeError::External {
+            domain: crate::host::ERROR_DOMAIN,
+            code: error.0,
+        })
+}
+
+/// Hang/cancel-observable command-BO wait after submit (sliced `BO_WAIT`; no kernel abort).
+fn wait_command_bo(command: &super::direct::BufferObject<'_>, now_ns: u64) -> WaitOutcome {
+    let overall = Deadline::MonotonicNs(now_ns.saturating_add(health::DEFAULT_DISPATCH_WAIT_NS));
+    let raw = health::wait_in_flight(
+        overall,
+        health::DEFAULT_WAIT_SLICE_NS,
+        monotonic_now_ns,
+        |deadline| command.wait_idle(deadline),
+    );
+    health::apply_wait_outcome(raw)
+}
+
 /// Drop resident programs and clear a latched device-loss only after firmware re-negotiation.
 pub(super) fn try_reset_after_fault() -> Result<u64, RuntimeError> {
     let context = context()?;
@@ -497,7 +519,7 @@ fn dispatch(
     }
     release_host_writes();
     let t1 = if prof { profile::now_ns() } else { 0 };
-    let now = match crate::host::builtin().clock().monotonic_now_ns() {
+    let now = match monotonic_now_ns() {
         Ok(now) => now,
         Err(error) => {
             profile::note(&alloc::format!(
@@ -517,10 +539,7 @@ fn dispatch(
         return false;
     }
     let tmid = if prof { profile::now_ns() } else { 0 };
-    let wait = program
-        .command
-        .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)));
-    let outcome = health::apply_wait_outcome(health::classify_wait_result(wait));
+    let outcome = wait_command_bo(&program.command, now);
     match outcome {
         WaitOutcome::Success => {}
         WaitOutcome::Cancelled => {
@@ -1202,18 +1221,8 @@ pub(super) fn run_blob_selftest_multi(
     context
         .queue
         .submit(&prepared.handles, prepared.commands_offset(), 0)?;
-    let now = crate::host::builtin()
-        .clock()
-        .monotonic_now_ns()
-        .map_err(|error| RuntimeError::External {
-            domain: crate::host::ERROR_DOMAIN,
-            code: error.0,
-        })?;
-    match health::apply_wait_outcome(health::classify_wait_result(
-        prepared
-            .command
-            .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000))),
-    )) {
+    let now = monotonic_now_ns()?;
+    match wait_command_bo(&prepared.command, now) {
         WaitOutcome::Success => {}
         WaitOutcome::Cancelled => return Err(RuntimeError::Unsupported),
         WaitOutcome::DeadlineExpired => return Err(RuntimeError::DeadlineExpired),
@@ -1281,18 +1290,8 @@ impl DirectBenchmarkFixture {
         context
             .queue
             .submit(&self.prepared.handles, self.prepared.commands_offset(), 0)?;
-        let now = crate::host::builtin()
-            .clock()
-            .monotonic_now_ns()
-            .map_err(|error| RuntimeError::External {
-                domain: crate::host::ERROR_DOMAIN,
-                code: error.0,
-            })?;
-        match health::apply_wait_outcome(health::classify_wait_result(
-            self.prepared
-                .command
-                .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000))),
-        )) {
+        let now = monotonic_now_ns()?;
+        match wait_command_bo(&self.prepared.command, now) {
             WaitOutcome::Success => {}
             WaitOutcome::Cancelled => return Err(RuntimeError::Unsupported),
             WaitOutcome::DeadlineExpired => return Err(RuntimeError::DeadlineExpired),
