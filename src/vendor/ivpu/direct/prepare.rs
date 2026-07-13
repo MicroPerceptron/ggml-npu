@@ -60,7 +60,8 @@ pub enum PrepareError {
     Runtime(RuntimeError),
     Load(LoadError),
     Validation(ValidationError),
-    InvalidMetadata,
+    /// ELF/HPI/BO metadata failed a Direct prepare check. `site` names the check for diagnosis.
+    InvalidMetadata(&'static str),
     BindingMismatch,
     BudgetExceeded,
     Allocation,
@@ -140,12 +141,12 @@ impl PreparedInference<'_> {
         } else {
             let mapping = binding.bo.map(false).map_err(PrepareError::Runtime)?;
             let offset = usize::try_from(binding.allocation_offset)
-                .map_err(|_| PrepareError::InvalidMetadata)?;
+                .map_err(|_| PrepareError::InvalidMetadata("copy_output_offset"))?;
             if offset
                 .checked_add(target.len())
                 .is_none_or(|end| end > mapping.len())
             {
-                return Err(PrepareError::InvalidMetadata);
+                return Err(PrepareError::InvalidMetadata("copy_output_bounds"));
             }
             acquire_device_writes();
             // SAFETY: both regions are live, non-overlapping, and exactly bounded by target.
@@ -241,7 +242,7 @@ impl PreparedInference<'_> {
             .nth(output_index)
             .ok_or(PrepareError::BindingMismatch)?;
         let bytes =
-            usize::try_from(binding.logical_bytes).map_err(|_| PrepareError::InvalidMetadata)?;
+            usize::try_from(binding.logical_bytes).map_err(|_| PrepareError::InvalidMetadata("output_shared_bytes"))?;
         binding
             .bo
             .export_shared()
@@ -294,7 +295,7 @@ impl PreparedInference<'_> {
                     .checked_add(binding.logical_bytes as usize)
                     .is_none_or(|end| end > mapping.len())
                 {
-                    return Err(PrepareError::InvalidMetadata);
+                    return Err(PrepareError::InvalidMetadata("outputs_zero_bounds"));
                 }
                 // SAFETY: bounded read-only view while the mapping is alive.
                 let bytes = unsafe {
@@ -341,7 +342,7 @@ fn map_and_initialize(
         .is_none_or(|end| end > mapping.len())
         || initial.is_some_and(|data| data.len() > logical_bytes)
     {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("map_initialize_bounds"));
     }
     // SAFETY: unique live mapping, with both zeroing and copy bounded to the logical object.
     unsafe {
@@ -367,9 +368,9 @@ fn performance_metrics<'a>(elf: &'a ParsedIntelElf<'a>) -> Result<&'a [u8], Prep
             }
         }
     });
-    let metrics = metrics.ok_or(PrepareError::InvalidMetadata)?;
+    let metrics = metrics.ok_or(PrepareError::InvalidMetadata("perf_metrics_missing"))?;
     if duplicate || metrics.len() < PERFORMANCE_METRICS_BYTES {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("perf_metrics_invalid"));
     }
     Ok(&metrics[..PERFORMANCE_METRICS_BYTES])
 }
@@ -388,12 +389,12 @@ fn create_hpi<'device>(
         .map_err(PrepareError::Runtime)?;
     let info = bo.info().map_err(PrepareError::Runtime)?;
     if info.vpu_address % HOST_PARSED_INFERENCE_ALIGNMENT != 0 {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("hpi_alignment"));
     }
     let metrics = performance_metrics(elf)?;
     let mapping = bo.map(true).map_err(PrepareError::Runtime)?;
     if mapping.len() < HOST_PARSED_INFERENCE_BYTES as usize {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("hpi_mapping_size"));
     }
     let target = mapping.address().as_ptr();
     // SAFETY: exact public VpuHostParsedInference v1.32.0 offsets, each bounded by 384 bytes.
@@ -407,7 +408,7 @@ fn create_hpi<'device>(
         *target.add(18) = hpi.resources.slice_count;
         *target.add(19) = hpi.resources.barriers;
         *target.add(20) = u8::try_from(hpi.versions.mapped_inference_format)
-            .map_err(|_| PrepareError::InvalidMetadata)?;
+            .map_err(|_| PrepareError::InvalidMetadata("mapped_inference_format"))?;
         ptr::copy_nonoverlapping(metrics.as_ptr(), target.add(24), metrics.len());
         ptr::copy_nonoverlapping(entry_address.to_le_bytes().as_ptr(), target.add(368), 8);
         ptr::copy_nonoverlapping(1u64.to_le_bytes().as_ptr(), target.add(376), 8);
@@ -416,19 +417,27 @@ fn create_hpi<'device>(
     Ok((bo, info.bytes))
 }
 
-/// Whether a host shared view can back an ELF binding section without overrun.
+/// Whether a host shared view can back an ELF binding section without overrun or
+/// device-address misalignment.
 ///
 /// OpenVINO often pads `allocation_bytes` past the logical tensor size. Claim+stage
 /// NPU_HOST tensors are typically sized to exact `nbytes`, so the padded section may
 /// not fit past `view.offset` even when the logical bytes match — that must stage-copy
 /// into a fresh BO rather than abort as `BindingMismatch` (pp512 MatMul+Swiglu).
+///
+/// Decode / tg shapes also commonly place small activations at offsets that are not a
+/// multiple of the ELF section alignment (typically 64). Direct JIT bindings require
+/// `vpu_address + offset` aligned; refuse the shared path early so the caller stages
+/// instead of fail-closing as `InvalidMetadata("binding_alignment")`.
 fn shared_view_covers_requirement(
     view: &SharedAllocationView,
     requirement: &BindingRequirement,
 ) -> bool {
     let requested = requirement.allocation_bytes.max(1) as usize;
     let logical = requirement.bytes as usize;
+    let align = requirement.alignment.max(1);
     view.bytes >= logical
+        && (view.offset as u64).is_multiple_of(align)
         && view
             .offset
             .checked_add(requested)
@@ -604,14 +613,16 @@ fn create_bindings<'device>(
             }
             Some(view) => {
                 super::super::profile::note(&alloc::format!(
-                    "[npu direct] shared view cannot cover padded binding; staging section={} class={:?} view_bytes={} view_off={} view_alloc={} logical={} alloc={}\n",
+                    "[npu direct] shared view cannot cover binding; staging section={} class={:?} view_bytes={} view_off={} view_alloc={} view_align={} logical={} alloc={} req_align={}\n",
                     requirement.section,
                     requirement.class,
                     view.bytes,
                     view.offset,
                     view.allocation_bytes,
+                    view.alignment,
                     requirement.bytes,
                     requirement.allocation_bytes,
+                    requirement.alignment,
                 ));
                 let (bo, backing) =
                     allocate_binding_bo(device, requirement, &mut timings, measure)?;
@@ -623,13 +634,44 @@ fn create_bindings<'device>(
                 (bo, backing, 0, false, true)
             }
         };
-        let info = bo.info().map_err(PrepareError::Runtime)?;
-        let device_address = info
+        let mut bo = bo;
+        let mut backing = backing;
+        let mut allocation_offset = allocation_offset;
+        let mut direct = direct;
+        let mut is_new = is_new;
+        let mut info = bo.info().map_err(PrepareError::Runtime)?;
+        let mut device_address = info
             .vpu_address
             .checked_add(allocation_offset)
-            .ok_or(PrepareError::InvalidMetadata)?;
-        if device_address % requirement.alignment != 0 {
-            return Err(PrepareError::InvalidMetadata);
+            .ok_or(PrepareError::InvalidMetadata("binding_address_overflow"))?;
+        // Imported host tensors can still land misaligned after DMA-BUF import even when
+        // the host offset looked fine; stage rather than fail-close decode/tg blobs.
+        if device_address % requirement.alignment.max(1) != 0 {
+            if !direct {
+                return Err(PrepareError::InvalidMetadata("binding_alignment"));
+            }
+            super::super::profile::note(&alloc::format!(
+                "[npu direct] shared binding device address misaligned; staging section={} class={:?} vpu={:#x} off={} align={} logical={} alloc={}\n",
+                requirement.section,
+                requirement.class,
+                info.vpu_address,
+                allocation_offset,
+                requirement.alignment,
+                requirement.bytes,
+                requirement.allocation_bytes,
+            ));
+            let (staged_bo, staged_backing) =
+                allocate_binding_bo(device, requirement, &mut timings, measure)?;
+            bo = staged_bo;
+            backing = staged_backing;
+            allocation_offset = 0;
+            direct = false;
+            is_new = true;
+            info = bo.info().map_err(PrepareError::Runtime)?;
+            device_address = info.vpu_address;
+            if device_address % requirement.alignment.max(1) != 0 {
+                return Err(PrepareError::InvalidMetadata("binding_alignment"));
+            }
         }
         if !direct {
             let started = if measure {
@@ -858,7 +900,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
     }
     for (index, &handle) in handles.iter().enumerate() {
         if handle == 0 || handles[..index].contains(&handle) {
-            return Err(PrepareError::InvalidMetadata);
+            return Err(PrepareError::InvalidMetadata("duplicate_or_zero_handle"));
         }
     }
 
@@ -910,7 +952,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
 
     let command_mapping = command.map(false).map_err(PrepareError::Runtime)?;
     if command_mapping.len() < COMMAND_LOGICAL_BYTES {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("command_mapping_size"));
     }
     // SAFETY: bounded read-only view for command validation while mapping is alive.
     let command_bytes = unsafe {
@@ -926,7 +968,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
     )
     .map_err(PrepareError::Validation)?;
     if command_count != 2 {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("command_count"));
     }
 
     // Managed CMDQ submit with preemption index 0 causes the kernel to account the reported
@@ -948,7 +990,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
         || command_info.vpu_address != command.vpu_address()
         || hpi_info.flags & DRM_IVPU_BO_MAPPABLE == 0
     {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("command_or_hpi_flags"));
     }
     for (section, placement) in staged.sections().iter().zip(staged.placements()) {
         let info = section.bo.info().map_err(PrepareError::Runtime)?;
@@ -956,7 +998,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
             || info.bytes < placement.bytes.max(1)
             || info.flags & !super::uapi::DRM_IVPU_BO_FLAGS != 0
         {
-            return Err(PrepareError::InvalidMetadata);
+            return Err(PrepareError::InvalidMetadata("staged_section_info"));
         }
     }
     for binding in &bindings {
@@ -977,7 +1019,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
                 .checked_add(binding.logical_bytes)
                 .is_none_or(|end| end > info.bytes)
         {
-            return Err(PrepareError::InvalidMetadata);
+            return Err(PrepareError::InvalidMetadata("binding_info"));
         }
     }
 
@@ -1003,7 +1045,7 @@ pub(in crate::vendor::ivpu) fn prepare_inference_shared<'device>(
     };
     prepared.zero_outputs()?;
     if !prepared.outputs_are_zero()? {
-        return Err(PrepareError::InvalidMetadata);
+        return Err(PrepareError::InvalidMetadata("outputs_not_zero"));
     }
     Ok(prepared)
 }
@@ -1033,7 +1075,7 @@ fn rebuild_handles(
     }
     for (index, &handle) in handles.iter().enumerate() {
         if handle == 0 || handles[..index].contains(&handle) {
-            return Err(PrepareError::InvalidMetadata);
+            return Err(PrepareError::InvalidMetadata("rebind_duplicate_or_zero_handle"));
         }
     }
     Ok(handles)
@@ -1052,7 +1094,7 @@ pub(in crate::vendor::ivpu) fn rebind_inference_shared<'device>(
     let warm = prepared
         .warm_rebind
         .as_ref()
-        .ok_or(PrepareError::InvalidMetadata)?;
+        .ok_or(PrepareError::InvalidMetadata("warm_rebind_missing"))?;
     prepared
         .staged
         .restore_logical_bytes(&warm.pre_jit_sections, warm.jit_relocations)
@@ -1212,5 +1254,39 @@ mod tests {
             address: core::ptr::NonNull::dangling(),
         };
         assert!(!shared_view_covers_requirement(&view, &requirement));
+    }
+
+    #[test]
+    fn shared_view_rejects_misaligned_offset_for_elf_section() {
+        let requirement = BindingRequirement {
+            section: 1,
+            class: DeviceMemoryClass::Input,
+            bytes: 8192,
+            allocation_bytes: 8192,
+            alignment: 64,
+        };
+        // Decode/tg activations often sit at non-64 offsets inside a larger host slab.
+        let view = SharedAllocationView {
+            identity: crate::interop::AllocationIdentity {
+                provider: 1,
+                object: 1,
+                generation: 1,
+            },
+            token: crate::interop::AllocationToken {
+                provider: 1,
+                owner: core::ptr::NonNull::dangling(),
+            },
+            allocation_bytes: 16384,
+            offset: 32,
+            bytes: 8192,
+            alignment: 32,
+            address: core::ptr::NonNull::dangling(),
+        };
+        assert!(!shared_view_covers_requirement(&view, &requirement));
+        let aligned = SharedAllocationView {
+            offset: 64,
+            ..view
+        };
+        assert!(shared_view_covers_requirement(&aligned, &requirement));
     }
 }

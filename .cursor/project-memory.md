@@ -817,6 +817,65 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `./benchmarks/results/_run_targeted_smoke.sh`.
   - Verified: 2026-07-13
 
+- `FINDING/direct-tg128-decode-ffn-invalid-metadata` — Direct tg128 gen warmup
+  fail-closed on decode FFN load (`InvalidMetadata`) because shared ggml views often
+  sit at offsets not divisible by ELF section alignment (typically 64), e.g.
+  `view_off=8196` (≡4 mod 64). Site-tagged prepare diagnosed
+  `InvalidMetadata("binding_alignment")`. Bare prepare without shared views succeeded;
+  L0 ran the same OpenVINO blob. Fix: refuse misaligned shared views in
+  `shared_view_covers_requirement` and stage-copy (plus post-import misalignment
+  fallback), mirroring PR #62 pad staging; keep site-tagged `InvalidMetadata` for
+  true unloadable cases. Does not widen `supports_buft`.
+  - Scope: Direct prepare/load of decode/tg M=1-shaped bindings; tok/s still
+    duty-cycle limited (~25k disp/tg128) vs Vulkan ~53.
+  - Evidence: issue #72, `src/vendor/ivpu/direct/prepare.rs`,
+    `benchmarks/results/develop-f1c4c98-tg128-diag-nosched-r1/`,
+    `benchmarks/results/develop-wip-tg128-align-stage-smoke/`,
+    `benchmarks/results/develop-wip-tg128-align-stage-sched-auto-smoke/`.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-pp512-f1c4c98-sched-auto-clean` — Develop `f1c4c98` (PR #70 sched-auto,
+  atop #69/#68/#67/#66/#59) + llama.cpp `78eb7ecce` (#17) locked LFM Q4_K_M pp512
+  r=3 t=6 sharing-on ShortConv=1 MoE=0 ATTENTION=full FA on FlexiBLAS+Vulkan+Direct,
+  `GGML_NPU_SCHED=auto` (explicit `GGML_SCHED_*` unset), fresh cache label, flock:
+  **184.530 ± 29.620 tok/s**, 2.819 ± 0.417 s; exit 0; baseline-eligible direct-ivpu;
+  profile **940** disp / 33.6% unitary / avg nodes 2.45 / **99.3%** no-copy (20 staged)
+  — same duty-cycle shape as `BENCH/lfm-pp512-f662b28-coa1-cut1-cs1`. Vs that tip
+  ~247 tok/s and L0 FlexiBLAS coa1 ~266 (thread caveat): tok/s lower with high
+  variance under ~11.7 GiB peak swap + ~190 s fresh-cache compile (host-polluted
+  wall/samples; shape not regressing).
+  - Limitation: `ALLOW_HIGH_SWAP=1`; harness `environment.txt` getenv dump shows
+    coalesce/cut/claim=0 while auto applies inside llama.cpp; do not treat this
+    tok/s as the clean productized-auto ceiling without a low-swap re-run.
+  - Evidence: `benchmarks/results/develop-f1c4c98-pp512-fullperf-locked-sharing-on-sched-auto-t6-clean/`,
+    issues #5/#63, PR #70, llama.cpp#17.
+  - Reproduce: flock + `THREADS=6` `OMP_NUM_THREADS=6` `FLEXIBLAS=OPENBLAS-OPENMP`
+    `GGML_NPU_SCHED=auto` unset `GGML_SCHED_REGION_COALESCE`/`CUT_COST`/`NPU_CLAIM_STAGE`
+    fresh `GGML_NPU_CACHE=…/lfm-pp512-cache-<sha>-sched-auto-clean`
+    `./benchmarks/results/_run_pp512_fullperf.sh`.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-tg128-f1c4c98-tip` — LFM **tg128** tip probe (`f1c4c98` / llama
+  `78eb7ec`, t=6, FA on, ShortConv=1 MoE=0 ATTENTION=full where NPU, FlexiBLAS
+  hybrid, flock). Historical: Vulkan **62.32 ± 0.96** / **60.98 ± 1.80** FA on/off;
+  early Vulkan+NPU `-ngl 23` **~47**. Tip before align-stage fix: Direct
+  `GGML_NPU_SCHED=auto` r=3 **gen warmup fail** (`InvalidMetadata`). After
+  binding-alignment stage fix (issue #72): Direct r=1 green —
+  sched default-off **2.471 tok/s** (25929 disp / 27.9% unitary / avg 2.45 /
+  **97.0%** no-copy); `GGML_NPU_SCHED=auto` **1.812 tok/s** (25413 / 39.6% /
+  2.43 / **92.8%** no-copy). Vulkan-only tip r=3 **53.433 ± 1.432 tok/s**; L0 soft
+  r=1 (older .so) **7.029** tok/s / 22774 disp / 44.9% no-copy.
+  - Limitation: Direct r=1 only; decode still ~200 disp/token vs Vulkan; not locked
+    Direct tg; L0 soft + older .so; host swap may be elevated.
+  - Evidence: `benchmarks/results/develop-wip-tg128-align-stage-smoke/`,
+    `benchmarks/results/develop-wip-tg128-align-stage-sched-auto-smoke/`,
+    `benchmarks/results/develop-f1c4c98-tg128-vulkan-only-t6-r3/`,
+    `benchmarks/results/develop-f1c4c98-tg128-level-zero-r1-soft/`, issues #4/#5/#72.
+  - Reproduce: flock + `THREADS=6` `-p 0 -n 128 -r 1`; Direct with tip
+    `libggml_npu.so` (± `GGML_NPU_SCHED=auto`); Vulkan without `GGML_BACKEND_PATH`
+    `-ngl 99`.
+  - Verified: 2026-07-13
+
 ## Pending milestones
 
 - `MILESTONE/moe-coverage-model-scale` — Finish GitHub #11 beyond Argsort writeback reclaim
