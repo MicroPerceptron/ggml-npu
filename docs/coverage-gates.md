@@ -86,11 +86,18 @@ continuity pulls do **not** require this gate (PR #39).
 | SoftMax | unclaim | capability + fusible pull under an anchor | `max_bias == 0`; arity 1–2 (optional mask); scale in `op_params[0]` |
 | FlashAttention | unclaim | capability + anchor pull | `max_bias == 0` and `logit_softcap == 0`; arity 3–4; GQA when query heads divisible by KV heads |
 | Runtime-weight MatMul (KQ/KQV) | unclaim + no `offload_op` pull | capability + work-floor pull | same MatMul lowering as const-weight; weight is a non-`NONE` producer |
+| Attention-core fusible glue (Scale/Mul/Add/…) | unclaim (attention-side refused) | `offload_op` pull under SoftMax/FA/runtime-KQ or attention-side QKV/RoPE span | Non-Metadata only; layout View/Reshape/Permute stay supports_op-unclaimed (PR #35) |
 | Const-weight MatMul / RoPE / KV SetRows | claimable without `full` | unchanged | see prefill QKV row / ShortConv docs |
 
 Shim numerical proofs for SoftMax and FlashAttention live in `tests/graph_ir_shortconv_check.c`
 (gate=`shim`). Hermetic contract tests cover decode variants and the env gate without NPU hardware.
 Do not cite tok/s movement from enabling `ATTENTION=full` without a measured attribution run.
+
+**Duty-cycle note (Direct):** `ATTENTION=full` admits SoftMax/FA/runtime KQ and pulls their fusible
+neighborhood. LFM short smokes with `-fa on` still often show FA as thin NPU islands (FA+Reshape)
+because intervening layout Metadata cannot be `supports_op`-claimed. Shared tensor GiB may stay flat
+while program-resident ELF grows; coalesce/cut-cost may re-absorb thin FA into Vulkan. Growing fused
+NPU work further is a scheduler/layout-continuity problem, not a missing SoftMax/FA capability gate.
 
 ## Sparse MoE + output head (#11)
 
