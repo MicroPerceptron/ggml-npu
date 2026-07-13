@@ -4,9 +4,10 @@ Prefill-oriented prototype: widen **same-backend feasible intervals** before
 `ggml_backend_sched` cuts the graph on backend color changes. Inspired by
 axiom/kore bit-row set algebra for DAG intervals — **not** a Q1 tensor port.
 
-Weighted **cut-cost** mode (GitHub #48) prices handoff edges, grows onto
-existing NPU neighbors (anti-unitary), and preserves only fat NPU islands —
-without inventing claims.
+Weighted **cut-cost** mode (GitHub #48) prices handoff edges (**latency**),
+scores op-class compute weight (**throughput** — MatMul/FA heavy vs glue light),
+grows onto existing NPU neighbors (anti-unitary), and preserves fat / heavy
+NPU islands — without inventing claims.
 
 ## Division of responsibility
 
@@ -54,32 +55,40 @@ Does **not** invent NPU claims: feasibility comes from the scheduler’s
 `supports_op` packing. Weights / `INPUT` stay pinned. Rust leaves `VIEW` rows
 unchanged so the host can honor the view_src invariant.
 
-## Cut-cost mode (v1 / #48 MVP → anti-unitary)
+## Cut-cost mode (v1 / #48 → anti-unitary + compute weight)
 
 When `GGML_SCHED_CUT_COST=1`, the v2 provider additionally:
 
 1. Scores sandwich edges as `nbytes × handoff_factor(from_kind, to_kind)`
-   (heuristic table; NPU↔GPU highest).
-2. **Anti-unitary grow-first**: absorb feasible foreign islands onto an
+   (heuristic table; NPU↔GPU highest) — the **latency** objective.
+2. Packs `ggml_op` and scores **throughput** via op-class compute weights
+   (MatMul / FA / conv / SSM **heavy**; norms/activations **medium**;
+   elementwise/layout **light**). Combined objective prefers keeping heavy
+   compute on fat NPU-compatible islands and absorbing light glue onto NPU
+   neighbors.
+3. **Anti-unitary grow-first**: absorb feasible foreign islands onto an
    **existing** NPU neighbor (classic sandwich **or** asymmetric
    `NPU|foreign|other`), then run classic same-backend sandwiches. Never paints
    a new NPU island when neither neighbor is NPU.
-3. **Preserve fat NPU islands** (≥3 ops or ≥64 KiB) instead of dissolving them
-   into Vulkan/CPU; thin unitaries and small 2-op scraps may still dissolve so
-   buft-safe coalesce duty-cycle wins are not undone (blanket preserve-all-NPU
-   rejected — it revived ~412 pp16 disp).
-4. Boosts effective `max_island` across NPU growth edges (+2 light; up to 2–3×
-   on ≥256 KiB / ≥1 MiB boundaries) so fat prefill glue can merge. Larger light
-   boosts were rejected (pp16 ~412 disp).
-5. Uses `core::simd` (`portable-simd` feature) to batch nbytes×factor products
+4. **Preserve fat / heavy NPU islands** (≥3 ops or ≥64 KiB, **or** a heavy-class
+   op ≥16 KiB) instead of dissolving them into Vulkan/CPU; thin light unitaries
+   and small 2-op scraps may still dissolve so buft-safe coalesce duty-cycle
+   wins are not undone (blanket preserve-all-NPU rejected — it revived ~412
+   pp16 disp).
+5. Boosts effective `max_island` across NPU growth edges (+2 default; +3 for
+   all-light glue with ≥4 KiB edge; up to 2–3× on ≥256 KiB / ≥1 MiB boundaries).
+   Flat 2× light boosts were rejected (pp16 ~412 disp).
+6. Uses `core::simd` (`portable-simd` feature) to batch nbytes×factor products
    when attributing total cut cost along a coloring.
-6. Cheap process counters (absorb-into-NPU / dissolve-NPU / preserve-fat /
-   absorb-other) via `ggml_backend_sched_cut_cost_stats[_reset]`; verbose
-   coalesce (≥2) dumps them from the llama hook.
+7. Cheap process counters (absorb-into-NPU / dissolve-NPU / preserve-fat /
+   absorb-other / light-glue-into-NPU / heavy-compute-preserved) via
+   `ggml_backend_sched_cut_cost_stats[_reset]`; verbose coalesce (≥2) dumps
+   them from the llama hook.
 
 MoE policy remains `is_opt_in_one`; MatMulId stays unclaimed (Vulkan/host experts).
 Host apply stays buft-safe (NPU/same-buft always; other targets only when
-committed buffers are supported).
+committed buffers are supported). Claim-stage + ELF pad staging (#62) remain
+orthogonal — cut-cost does not widen Direct `supports_buft`.
 
 ## C ABI
 
@@ -107,13 +116,15 @@ Proc name: `ggml_backend_sched_region_coalesce`.
 ### v2 (cut-cost)
 
 ```c
-#define GGML_SCHED_CUT_COST_OPT_WEIGHTED (1u << 0)
+#define GGML_SCHED_CUT_COST_OPT_WEIGHTED        (1u << 0)
+#define GGML_SCHED_CUT_COST_OPT_COMPUTE_WEIGHT  (1u << 1)
 
 struct ggml_sched_cut_cost_node {
     int32_t  backend_id;
     uint32_t feasible_mask;
     uint32_t flags;
     uint32_t nbytes;
+    uint32_t op;              /* ggml_op; 0 ⇒ medium weight */
 };
 
 typedef int (*ggml_backend_sched_region_coalesce_v2_t)(
@@ -133,11 +144,9 @@ struct ggml_sched_cut_cost_stats {
     uint64_t dissolved_npu;
     uint64_t preserved_fat_npu;
     uint64_t absorbed_other;
+    uint64_t light_glue_into_npu;
+    uint64_t heavy_compute_preserved;
 };
-
-typedef void (*ggml_backend_sched_cut_cost_stats_t)(
-    struct ggml_sched_cut_cost_stats * out);
-typedef void (*ggml_backend_sched_cut_cost_stats_reset_t)(void);
 ```
 
 Proc names: `ggml_backend_sched_cut_cost_stats`,
@@ -149,7 +158,7 @@ overhead.
 ## Future
 
 - Full bit-row reachability for non-linear maximal feasible regions.
-- Calibrated handoff factors from short attribution (not a live BW oracle).
+- Calibrated handoff / compute factors from short attribution (not a live BW oracle).
 - Layer-windowed analysis for multi-thousand-node prefill graphs.
 
 ## Tests

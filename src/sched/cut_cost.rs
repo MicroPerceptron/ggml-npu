@@ -1,6 +1,12 @@
 //! Weighted DAG cut-cost helpers for region coalesce (#48).
 //!
-//! Heuristic edge cost = tensor nbytes × backend-pair handoff factor.
+//! Two-objective scoring (latency × throughput):
+//! - **Latency**: edge cost = tensor nbytes × backend-pair handoff factor
+//!   (cross-backend handoffs / unitary islands).
+//! - **Throughput**: node compute weight by op class (MatMul/FA heavy vs
+//!   elementwise/layout glue light) so heavy work prefers fat NPU-compatible
+//!   regions instead of thin unitaries.
+//!
 //! Prefer growing / preserving fat NPU regions; dissolve thin unitaries;
 //! never invent NPU claims (feasibility still comes from the caller's
 //! `feasible_mask`).
@@ -10,6 +16,8 @@
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::ffi;
 
 /// Matches `enum ggml_backend_dev_type` ordinals in ggml-backend.h.
 #[repr(u8)]
@@ -45,6 +53,201 @@ impl BackendKind {
 
 /// Options bit for `ggml_backend_sched_region_coalesce_v2`.
 pub const OPT_WEIGHTED_CUT_COST: u32 = 1 << 0;
+/// When set (or when node `op` ≠ 0), score islands with compute weights.
+pub const OPT_COMPUTE_WEIGHT: u32 = 1 << 1;
+
+/// Op-class compute intensity for throughput-aware absorb / preserve.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComputeClass {
+    /// MatMul / FA / conv / SSM — prefer keep / grow onto NPU.
+    Heavy = 3,
+    /// Norms, softmax, rope, unary activations.
+    Medium = 2,
+    /// Elementwise / layout / copy glue — cheap to absorb into neighbors.
+    Light = 1,
+    /// Unknown / unset op → treat as medium.
+    Unknown = 0,
+}
+
+/// Fixed-point compute weight (×16), same scale family as [`handoff_factor`].
+pub const COMPUTE_WEIGHT_HEAVY: u32 = 64; // 4.0×
+pub const COMPUTE_WEIGHT_MEDIUM: u32 = 16; // 1.0×
+pub const COMPUTE_WEIGHT_LIGHT: u32 = 4; // 0.25×
+
+impl ComputeClass {
+    #[inline]
+    pub fn weight(self) -> u32 {
+        match self {
+            Self::Heavy => COMPUTE_WEIGHT_HEAVY,
+            Self::Medium | Self::Unknown => COMPUTE_WEIGHT_MEDIUM,
+            Self::Light => COMPUTE_WEIGHT_LIGHT,
+        }
+    }
+
+    #[inline]
+    pub fn is_heavy(self) -> bool {
+        matches!(self, Self::Heavy)
+    }
+
+    #[inline]
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+}
+
+/// Map a `ggml_op` ordinal to a compute class (heuristic, not a FLOP model).
+pub fn compute_class(op: u32) -> ComputeClass {
+    if op == 0 {
+        return ComputeClass::Unknown;
+    }
+    // Heavy: matmul / attention / conv / state-space / RWKV kernels.
+    if op == ffi::GGML_OP_MUL_MAT as u32
+        || op == ffi::GGML_OP_MUL_MAT_ID as u32
+        || op == ffi::GGML_OP_OUT_PROD as u32
+        || op == ffi::GGML_OP_FLASH_ATTN_EXT as u32
+        || op == ffi::GGML_OP_FLASH_ATTN_BACK as u32
+        || op == ffi::GGML_OP_CONV_TRANSPOSE_1D as u32
+        || op == ffi::GGML_OP_CONV_2D as u32
+        || op == ffi::GGML_OP_CONV_3D as u32
+        || op == ffi::GGML_OP_CONV_2D_DW as u32
+        || op == ffi::GGML_OP_CONV_TRANSPOSE_2D as u32
+        || op == ffi::GGML_OP_IM2COL as u32
+        || op == ffi::GGML_OP_IM2COL_BACK as u32
+        || op == ffi::GGML_OP_IM2COL_3D as u32
+        || op == ffi::GGML_OP_SSM_CONV as u32
+        || op == ffi::GGML_OP_SSM_SCAN as u32
+        || op == ffi::GGML_OP_RWKV_WKV6 as u32
+        || op == ffi::GGML_OP_RWKV_WKV7 as u32
+    {
+        return ComputeClass::Heavy;
+    }
+    // Light: elementwise + layout / residency glue.
+    if op == ffi::GGML_OP_ADD as u32
+        || op == ffi::GGML_OP_ADD1 as u32
+        || op == ffi::GGML_OP_ADD_ID as u32
+        || op == ffi::GGML_OP_ACC as u32
+        || op == ffi::GGML_OP_SUB as u32
+        || op == ffi::GGML_OP_MUL as u32
+        || op == ffi::GGML_OP_DIV as u32
+        || op == ffi::GGML_OP_SQR as u32
+        || op == ffi::GGML_OP_SQRT as u32
+        || op == ffi::GGML_OP_SCALE as u32
+        || op == ffi::GGML_OP_SET as u32
+        || op == ffi::GGML_OP_CPY as u32
+        || op == ffi::GGML_OP_CONT as u32
+        || op == ffi::GGML_OP_RESHAPE as u32
+        || op == ffi::GGML_OP_VIEW as u32
+        || op == ffi::GGML_OP_PERMUTE as u32
+        || op == ffi::GGML_OP_TRANSPOSE as u32
+        || op == ffi::GGML_OP_GET_ROWS as u32
+        || op == ffi::GGML_OP_SET_ROWS as u32
+        || op == ffi::GGML_OP_REPEAT as u32
+        || op == ffi::GGML_OP_CONCAT as u32
+        || op == ffi::GGML_OP_CLAMP as u32
+        || op == ffi::GGML_OP_PAD as u32
+        || op == ffi::GGML_OP_PAD_REFLECT_1D as u32
+        || op == ffi::GGML_OP_DIAG as u32
+        || op == ffi::GGML_OP_DIAG_MASK_INF as u32
+        || op == ffi::GGML_OP_DIAG_MASK_ZERO as u32
+    {
+        return ComputeClass::Light;
+    }
+    ComputeClass::Medium
+}
+
+#[inline]
+pub fn compute_weight(op: u32) -> u32 {
+    compute_class(op).weight()
+}
+
+/// Per-node throughput term: nbytes × compute weight (fixed-point).
+#[inline]
+pub fn node_compute_cost(nbytes: u32, op: u32) -> u64 {
+    (nbytes as u64).saturating_mul(compute_weight(op) as u64)
+}
+
+/// Aggregate island compute cost + whether every op is light glue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IslandCompute {
+    pub cost: u64,
+    pub max_weight: u32,
+    pub all_light: bool,
+    pub any_heavy: bool,
+}
+
+impl IslandCompute {
+    pub fn from_nodes<'a, I>(nodes: I) -> Self
+    where
+        I: IntoIterator<Item = (u32, u32)>, // (nbytes, op)
+    {
+        let mut cost = 0u64;
+        let mut max_weight = 0u32;
+        let mut all_light = true;
+        let mut any_heavy = false;
+        let mut saw = false;
+        for (nbytes, op) in nodes {
+            saw = true;
+            let class = compute_class(op);
+            let w = class.weight();
+            cost = cost.saturating_add(node_compute_cost(nbytes, op));
+            if w > max_weight {
+                max_weight = w;
+            }
+            if !class.is_light() {
+                all_light = false;
+            }
+            if class.is_heavy() {
+                any_heavy = true;
+            }
+        }
+        if !saw {
+            all_light = false;
+        }
+        Self {
+            cost,
+            max_weight,
+            all_light,
+            any_heavy,
+        }
+    }
+}
+
+/// Combined latency + stranded-compute objective for a linear coloring.
+/// Lower is better. `stranded_compute` sums compute cost of nodes whose
+/// backend is non-NPU while an NPU backend bit is feasible (bit 0..n).
+pub fn coloring_objectives(
+    backend_ids: &[i32],
+    nbytes: &[u32],
+    ops: &[u32],
+    kinds: &[BackendKind],
+    feasible_masks: &[u32],
+) -> (u64, u64) {
+    let latency = total_cut_cost(backend_ids, nbytes, kinds);
+    let mut stranded = 0u64;
+    let n = backend_ids.len().min(nbytes.len()).min(ops.len());
+    for i in 0..n {
+        let bid = backend_ids[i];
+        if bid < 0 {
+            continue;
+        }
+        if kind_at(kinds, bid).is_npu() {
+            continue;
+        }
+        let mask = feasible_masks.get(i).copied().unwrap_or(0);
+        let mut npu_feasible = false;
+        for (b, k) in kinds.iter().enumerate() {
+            if k.is_npu() && mask & (1u32 << b) != 0 {
+                npu_feasible = true;
+                break;
+            }
+        }
+        if npu_feasible {
+            stranded = stranded.saturating_add(node_compute_cost(nbytes[i], ops[i]));
+        }
+    }
+    (latency, stranded)
+}
 
 /// Fixed-point handoff factor (×16). Higher ⇒ more expensive cross-backend edge.
 #[inline]
@@ -182,6 +385,8 @@ pub const NPU_PRESERVE_MIN_BYTES: u64 = 64 * 1024;
 /// Prefer fat islands: require ≥3 non-view ops (2-op islands dissolve unless
 /// they meet the byte floor). MVP used 2 and inflated pp16 dispatch count.
 pub const NPU_PRESERVE_MIN_OPS: usize = 3;
+/// Heavy MatMul/FA unitary may preserve below the fat byte floor when large enough.
+pub const NPU_HEAVY_PRESERVE_MIN_BYTES: u64 = 16 * 1024;
 
 /// Decision for absorbing a foreign island into a target backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,18 +404,26 @@ pub struct CutCostStats {
     pub dissolved_npu: u64,
     pub preserved_fat_npu: u64,
     pub absorbed_other: u64,
+    /// Absorbs of all-light glue islands onto NPU (throughput-friendly growth).
+    pub light_glue_into_npu: u64,
+    /// Fat/heavy-compute preserves (subset counted in preserved_fat_npu).
+    pub heavy_compute_preserved: u64,
 }
 
 static STAT_ABSORBED_INTO_NPU: AtomicU64 = AtomicU64::new(0);
 static STAT_DISSOLVED_NPU: AtomicU64 = AtomicU64::new(0);
 static STAT_PRESERVED_FAT_NPU: AtomicU64 = AtomicU64::new(0);
 static STAT_ABSORBED_OTHER: AtomicU64 = AtomicU64::new(0);
+static STAT_LIGHT_GLUE_INTO_NPU: AtomicU64 = AtomicU64::new(0);
+static STAT_HEAVY_COMPUTE_PRESERVED: AtomicU64 = AtomicU64::new(0);
 
 pub fn reset_cut_cost_stats() {
     STAT_ABSORBED_INTO_NPU.store(0, Ordering::Relaxed);
     STAT_DISSOLVED_NPU.store(0, Ordering::Relaxed);
     STAT_PRESERVED_FAT_NPU.store(0, Ordering::Relaxed);
     STAT_ABSORBED_OTHER.store(0, Ordering::Relaxed);
+    STAT_LIGHT_GLUE_INTO_NPU.store(0, Ordering::Relaxed);
+    STAT_HEAVY_COMPUTE_PRESERVED.store(0, Ordering::Relaxed);
 }
 
 pub fn snapshot_cut_cost_stats() -> CutCostStats {
@@ -219,6 +432,8 @@ pub fn snapshot_cut_cost_stats() -> CutCostStats {
         dissolved_npu: STAT_DISSOLVED_NPU.load(Ordering::Relaxed),
         preserved_fat_npu: STAT_PRESERVED_FAT_NPU.load(Ordering::Relaxed),
         absorbed_other: STAT_ABSORBED_OTHER.load(Ordering::Relaxed),
+        light_glue_into_npu: STAT_LIGHT_GLUE_INTO_NPU.load(Ordering::Relaxed),
+        heavy_compute_preserved: STAT_HEAVY_COMPUTE_PRESERVED.load(Ordering::Relaxed),
     }
 }
 
@@ -229,11 +444,15 @@ fn record_decision(
     target_backend: i32,
     kinds: &[BackendKind],
     recolored_ops: usize,
+    compute: IslandCompute,
 ) {
     match decision {
         AbsorbDecision::Absorb => {
             if kind_at(kinds, target_backend).is_npu() {
                 STAT_ABSORBED_INTO_NPU.fetch_add(recolored_ops as u64, Ordering::Relaxed);
+                if compute.all_light {
+                    STAT_LIGHT_GLUE_INTO_NPU.fetch_add(recolored_ops as u64, Ordering::Relaxed);
+                }
             } else if kind_at(kinds, island_backend).is_npu() {
                 STAT_DISSOLVED_NPU.fetch_add(recolored_ops as u64, Ordering::Relaxed);
             } else {
@@ -242,6 +461,9 @@ fn record_decision(
         }
         AbsorbDecision::RefusePreserveNpu => {
             STAT_PRESERVED_FAT_NPU.fetch_add(1, Ordering::Relaxed);
+            if compute.any_heavy {
+                STAT_HEAVY_COMPUTE_PRESERVED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         AbsorbDecision::RefuseNoGain => {}
     }
@@ -251,6 +473,15 @@ fn record_decision(
 #[inline]
 pub fn is_fat_npu_island(island_op_count: usize, island_nbytes_sum: u64) -> bool {
     island_op_count >= NPU_PRESERVE_MIN_OPS || island_nbytes_sum >= NPU_PRESERVE_MIN_BYTES
+}
+
+/// Heavy compute on NPU is worth preserving even as a thin unitary when large enough.
+#[inline]
+pub fn is_heavy_compute_worth_preserving(
+    island_nbytes_sum: u64,
+    compute: IslandCompute,
+) -> bool {
+    compute.any_heavy && island_nbytes_sum >= NPU_HEAVY_PRESERVE_MIN_BYTES
 }
 
 /// Prefer an existing NPU neighbor as absorb target (anti-unitary growth).
@@ -276,13 +507,12 @@ pub fn npu_absorb_target(
     }
 }
 
-/// NPU-aware absorb gate for island → `target_backend`.
+/// NPU-aware absorb gate for island → `target_backend` (latency + throughput).
 ///
 /// - Growing onto NPU: absorb when feasible (caller already checked mask).
-/// - Dissolving an NPU island into non-NPU: refuse only when the island is
-///   "fat" (≥ [`NPU_PRESERVE_MIN_OPS`] ops or ≥ [`NPU_PRESERVE_MIN_BYTES`]);
-///   thin unitaries / 2-op scraps may dissolve so buft-safe coalesce duty-cycle
-///   wins are not undone.
+/// - Dissolving an NPU island into non-NPU: refuse when fat **or** when the
+///   island carries heavy MatMul/FA compute above
+///   [`NPU_HEAVY_PRESERVE_MIN_BYTES`]; thin light unitaries may still dissolve.
 /// - Other sandwiches: absorb when estimated cut cost drops (or nbytes unknown).
 pub fn decide_absorb(
     island_backend: i32,
@@ -293,6 +523,7 @@ pub fn decide_absorb(
     left_edge_nbytes: u32,
     right_edge_nbytes: u32,
     weighted: bool,
+    compute: IslandCompute,
 ) -> AbsorbDecision {
     if !weighted {
         return AbsorbDecision::Absorb;
@@ -300,21 +531,25 @@ pub fn decide_absorb(
     let island_k = kind_at(kinds, island_backend);
     let target_k = kind_at(kinds, target_backend);
 
-    // Prefer fat NPU regions: keep multi-op / heavy islands off Vulkan/CPU.
+    // Prefer fat / heavy-compute NPU regions: keep them off Vulkan/CPU.
     if island_k.is_npu() && !target_k.is_npu() {
-        if is_fat_npu_island(island_op_count, island_nbytes_sum) {
+        if is_fat_npu_island(island_op_count, island_nbytes_sum)
+            || is_heavy_compute_worth_preserving(island_nbytes_sum, compute)
+        {
             return AbsorbDecision::RefusePreserveNpu;
         }
-        // Thin unitary / small 2-op NPU: allow classic dissolve into surround.
+        // Thin unitary / small 2-op NPU (light or tiny heavy): allow classic dissolve.
         return AbsorbDecision::Absorb;
     }
 
-    // Absorbs onto NPU always welcome when feasible.
+    // Absorbs onto NPU always welcome when feasible (anti-unitary + throughput).
     if target_k.is_npu() {
         return AbsorbDecision::Absorb;
     }
 
-    // Non-NPU sandwich: require estimated cost improvement when we have sizes.
+    // Non-NPU sandwich: require estimated latency improvement when we have sizes.
+    // Throughput tie-break: refuse dissolving a heavy island into another non-NPU
+    // when there is no latency gain (already RefuseNoGain when before==0).
     if island_nbytes_sum == 0 && left_edge_nbytes == 0 && right_edge_nbytes == 0 {
         return AbsorbDecision::Absorb; // fall back to length-only coalesce
     }
@@ -324,6 +559,9 @@ pub fn decide_absorb(
     let after = 0u64;
     if after < before {
         AbsorbDecision::Absorb
+    } else if compute.any_heavy {
+        // No latency win and heavy compute: keep current placement.
+        AbsorbDecision::RefuseNoGain
     } else {
         AbsorbDecision::RefuseNoGain
     }
@@ -336,11 +574,23 @@ pub fn note_absorb_outcome(
     target_backend: i32,
     kinds: &[BackendKind],
     recolored_ops: usize,
+    compute: IslandCompute,
 ) {
-    record_decision(decision, island_backend, target_backend, kinds, recolored_ops);
+    record_decision(
+        decision,
+        island_backend,
+        target_backend,
+        kinds,
+        recolored_ops,
+        compute,
+    );
 }
 
-/// Effective max island length: boost when absorbing into NPU across heavy edges.
+/// Effective max island length: boost when absorbing into NPU across heavy edges
+/// or when the island is all-light glue (throughput-friendly anti-unitary growth).
+///
+/// Light boost stays modest (+3 vs +2): a flat 2× light `max_island` regressed
+/// pp16 toward the preserve-all ~412-disp failure mode.
 pub fn effective_max_island(
     base: usize,
     target_backend: i32,
@@ -348,6 +598,7 @@ pub fn effective_max_island(
     left_edge_nbytes: u32,
     right_edge_nbytes: u32,
     weighted: bool,
+    compute: IslandCompute,
 ) -> usize {
     if !weighted {
         return base;
@@ -357,12 +608,13 @@ pub fn effective_max_island(
     }
     let edge = left_edge_nbytes.max(right_edge_nbytes);
     // ≥256 KiB boundary → allow up to 2× island; ≥1 MiB → 3× (capped).
-    // Anti-unitary: modest +2 on light NPU growth edges. Larger light boosts
-    // (2×) inflated pp16 disp toward the preserve-all failure mode (~412).
     if edge >= 1 << 20 {
         base.saturating_mul(3).min(base.saturating_add(12))
     } else if edge >= 1 << 18 {
         base.saturating_mul(2).min(base.saturating_add(8))
+    } else if compute.all_light && edge >= 4096 {
+        // Light glue with a real activation edge: slightly wider absorb.
+        base.saturating_add(3)
     } else {
         base.saturating_add(2)
     }
@@ -372,6 +624,24 @@ pub fn effective_max_island(
 mod tests {
     use super::*;
 
+    fn light() -> IslandCompute {
+        IslandCompute {
+            cost: 4096 * COMPUTE_WEIGHT_LIGHT as u64,
+            max_weight: COMPUTE_WEIGHT_LIGHT,
+            all_light: true,
+            any_heavy: false,
+        }
+    }
+
+    fn heavy(nbytes: u64) -> IslandCompute {
+        IslandCompute {
+            cost: nbytes.saturating_mul(COMPUTE_WEIGHT_HEAVY as u64),
+            max_weight: COMPUTE_WEIGHT_HEAVY,
+            all_light: false,
+            any_heavy: true,
+        }
+    }
+
     #[test]
     fn npu_gpu_factor_exceeds_default() {
         assert!(handoff_factor(BackendKind::Npu, BackendKind::Gpu) > 16);
@@ -379,18 +649,52 @@ mod tests {
     }
 
     #[test]
+    fn matmul_is_heavy_add_is_light() {
+        assert_eq!(
+            compute_class(ffi::GGML_OP_MUL_MAT as u32),
+            ComputeClass::Heavy
+        );
+        assert_eq!(
+            compute_class(ffi::GGML_OP_FLASH_ATTN_EXT as u32),
+            ComputeClass::Heavy
+        );
+        assert_eq!(compute_class(ffi::GGML_OP_ADD as u32), ComputeClass::Light);
+        assert_eq!(
+            compute_class(ffi::GGML_OP_RMS_NORM as u32),
+            ComputeClass::Medium
+        );
+        assert!(compute_weight(ffi::GGML_OP_MUL_MAT as u32) > compute_weight(ffi::GGML_OP_ADD as u32));
+    }
+
+    #[test]
     fn refuse_dissolving_fat_npu_island() {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
-        let d = decide_absorb(1, 0, &kinds, 128 * 1024, 1, 4096, 4096, true);
+        let d = decide_absorb(1, 0, &kinds, 128 * 1024, 1, 4096, 4096, true, light());
         assert_eq!(d, AbsorbDecision::RefusePreserveNpu);
-        let multi = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true);
+        let multi = decide_absorb(1, 0, &kinds, 1024, 3, 4096, 4096, true, light());
         assert_eq!(multi, AbsorbDecision::RefusePreserveNpu);
+    }
+
+    #[test]
+    fn refuse_dissolving_heavy_matmul_unitary() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        // 32 KiB MatMul unitary: below fat byte floor but heavy-compute preserve.
+        let d = decide_absorb(1, 0, &kinds, 32 * 1024, 1, 4096, 4096, true, heavy(32 * 1024));
+        assert_eq!(d, AbsorbDecision::RefusePreserveNpu);
+    }
+
+    #[test]
+    fn allow_dissolving_tiny_heavy_unitary() {
+        let kinds = [BackendKind::Gpu, BackendKind::Npu];
+        // Tiny MatMul below heavy preserve floor still dissolves.
+        let d = decide_absorb(1, 0, &kinds, 4096, 1, 4096, 4096, true, heavy(4096));
+        assert_eq!(d, AbsorbDecision::Absorb);
     }
 
     #[test]
     fn allow_dissolving_tiny_npu_unitary() {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
-        let d = decide_absorb(1, 0, &kinds, 4096, 1, 4096, 4096, true);
+        let d = decide_absorb(1, 0, &kinds, 4096, 1, 4096, 4096, true, light());
         assert_eq!(d, AbsorbDecision::Absorb);
     }
 
@@ -398,14 +702,14 @@ mod tests {
     fn allow_dissolving_thin_two_op_npu() {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
         // 2-op below byte floor dissolves (anti-unitary / dispatch hygiene).
-        let d = decide_absorb(1, 0, &kinds, 8192, 2, 4096, 4096, true);
+        let d = decide_absorb(1, 0, &kinds, 8192, 2, 4096, 4096, true, light());
         assert_eq!(d, AbsorbDecision::Absorb);
     }
 
     #[test]
     fn absorb_into_npu() {
         let kinds = [BackendKind::Npu, BackendKind::Gpu];
-        let d = decide_absorb(1, 0, &kinds, 1024, 1, 1024, 1024, true);
+        let d = decide_absorb(1, 0, &kinds, 1024, 1, 1024, 1024, true, light());
         assert_eq!(d, AbsorbDecision::Absorb);
     }
 
@@ -422,7 +726,7 @@ mod tests {
     fn unweighted_always_absorbs() {
         let kinds = [BackendKind::Gpu, BackendKind::Npu];
         assert_eq!(
-            decide_absorb(1, 0, &kinds, 128 * 1024, 2, 4096, 4096, false),
+            decide_absorb(1, 0, &kinds, 128 * 1024, 2, 4096, 4096, false, heavy(128 * 1024)),
             AbsorbDecision::Absorb
         );
     }
@@ -439,25 +743,67 @@ mod tests {
     }
 
     #[test]
+    fn coloring_objectives_strand_heavy_on_gpu() {
+        let kinds = [BackendKind::Npu, BackendKind::Gpu];
+        let ids = [1i32]; // GPU
+        let nb = [1024u32];
+        let ops = [ffi::GGML_OP_MUL_MAT as u32];
+        let masks = [0b11u32]; // feasible on both
+        let (lat, stranded) = coloring_objectives(&ids, &nb, &ops, &kinds, &masks);
+        assert_eq!(lat, 0);
+        assert_eq!(stranded, node_compute_cost(1024, ffi::GGML_OP_MUL_MAT as u32));
+    }
+
+    #[test]
     fn npu_max_island_boost_on_heavy_edge() {
         let kinds = [BackendKind::Npu, BackendKind::Gpu];
-        let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true);
+        let boosted = effective_max_island(4, 0, &kinds, 1 << 20, 64, true, light());
         assert!(boosted > 4);
-        assert_eq!(effective_max_island(4, 1, &kinds, 1 << 20, 64, true), 4);
+        assert_eq!(
+            effective_max_island(4, 1, &kinds, 1 << 20, 64, true, light()),
+            4
+        );
         // Light NPU growth edge still gets +2 anti-unitary headroom.
-        assert_eq!(effective_max_island(4, 0, &kinds, 64, 64, true), 6);
+        assert_eq!(
+            effective_max_island(4, 0, &kinds, 64, 64, true, IslandCompute::default()),
+            6
+        );
+        // All-light glue with real edge gets +3.
+        assert_eq!(effective_max_island(4, 0, &kinds, 8192, 64, true, light()), 7);
     }
 
     #[test]
     fn stats_track_absorb_and_dissolve() {
         reset_cut_cost_stats();
         let kinds = [BackendKind::Npu, BackendKind::Gpu];
-        note_absorb_outcome(AbsorbDecision::Absorb, 1, 0, &kinds, 2);
-        note_absorb_outcome(AbsorbDecision::Absorb, 0, 1, &kinds, 1);
-        note_absorb_outcome(AbsorbDecision::RefusePreserveNpu, 0, 1, &kinds, 0);
+        note_absorb_outcome(AbsorbDecision::Absorb, 1, 0, &kinds, 2, light());
+        note_absorb_outcome(AbsorbDecision::Absorb, 0, 1, &kinds, 1, light());
+        note_absorb_outcome(
+            AbsorbDecision::RefusePreserveNpu,
+            0,
+            1,
+            &kinds,
+            0,
+            heavy(32 * 1024),
+        );
         let s = snapshot_cut_cost_stats();
         assert_eq!(s.absorbed_into_npu, 2);
         assert_eq!(s.dissolved_npu, 1);
         assert_eq!(s.preserved_fat_npu, 1);
+        assert_eq!(s.light_glue_into_npu, 2);
+        assert_eq!(s.heavy_compute_preserved, 1);
+    }
+
+    #[test]
+    fn island_compute_from_nodes() {
+        let ic = IslandCompute::from_nodes([
+            (1024u32, ffi::GGML_OP_ADD as u32),
+            (2048u32, ffi::GGML_OP_CPY as u32),
+        ]);
+        assert!(ic.all_light);
+        assert!(!ic.any_heavy);
+        let heavy_ic = IslandCompute::from_nodes([(4096u32, ffi::GGML_OP_MUL_MAT as u32)]);
+        assert!(heavy_ic.any_heavy);
+        assert!(!heavy_ic.all_light);
     }
 }
