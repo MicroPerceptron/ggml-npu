@@ -105,8 +105,9 @@ pub fn coalesce_regions(
         }
     }
 
-    // Views stay untouched here. The llama.cpp hook (1) applies only safe
-    // targets (NPU / same buft — not Vulkan sandwiches) and (2) re-syncs view
+    // Views stay untouched here. The llama.cpp hook (1) applies NPU / same-buft
+    // always, and other targets only when committed buffers are supported by
+    // the destination (buffer-safe Vulkan sandwiches), then (2) re-syncs view
     // ops to view_src. Nearest-neighbor view painting broke weight views and
     // still SIGSEGV'd in ggml_vk_build_graph on pp128.
 
