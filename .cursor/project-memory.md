@@ -153,8 +153,31 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     issue #6, PR #22, PR #52.
   - Verified: 2026-07-13
 
+- `ADR/hetero-forward-timeline` — Hetero / `-sm tensor` busy-idle observability is an
+  env-gated (`GGML_NPU_TIMELINE=<prefix>`) Rust seqlock event ring plus exit dump
+  (JSONL, chrome-trace, busy%/idle%/copy/load summary). NPU emits stage/submit/wait/
+  copy-out spans; llama.cpp thin probes mark graph_compute, synchronize, sched copies,
+  and outer sched forward. Default path stays clean; does not widen `supports_buft` or
+  require deleting L0. Live SHM `GGML_NPU_TELEMETRY_SHM` (draft #71) is not the bench
+  artifact path.
+  - Rationale: TP hetero benches need per-device busy vs idle and memory-load attribution
+    without a hot-path TUI feed; artifact dumps beat a dormant SHM producer for acceptance.
+  - Evidence: `docs/hetero-timeline.md`, `src/timeline.rs`, `src/timeline_ring.rs`,
+    issue #75, companion llama.cpp timeline probes.
+  - Verified: 2026-07-13
+
 ## Verified findings
 
+
+- `FINDING/sm-tensor-hetero-timeline-npu-idle-decode` — With `GGML_NPU_TIMELINE` on
+  LFM Q4_K_M tg128 r=1 t=6 `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5` and
+  `GGML_NPU_SCHED=auto`, the hetero timeline window (~3.4 s, 11880 events) shows
+  CPU ~90% busy / GPU ~88% busy / **NPU 0% busy** (no NPU stage/submit/wait events);
+  tg128 ~52.8 tok/s. Matches Meta(Vulkan)+NPU-as-sched-tier decode unclaim under auto.
+  - Scope: r=1 smoke with timeline probes; not locked r≥3; does not claim NPU prefill duty.
+  - Evidence: `docs/hetero-timeline.md`, `benchmarks/results/hetero-timeline-smoke/`,
+    issue #75, llama.cpp#19.
+  - Verified: 2026-07-13
 
 - `FINDING/direct-l0-corpus-parity-harness` — Representative Direct↔L0 corpus gate (six
   blobs: tiny vector-add + five LFM/coverage cache slices) compares SHA-256 identity,
@@ -465,6 +488,16 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Rejected alternatives
 
+- `REJECTED/telemetry-shm-as-hetero-timeline` — Do not treat draft PR #71
+  (`GGML_NPU_TELEMETRY_SHM` live seqlock feed for TUI/wasmrt) as the hetero bench
+  timeline deliverable. Keep a separate env-gated artifact exporter
+  (`GGML_NPU_TIMELINE`) with span/busy-idle semantics; leave live SHM as a future
+  consumer if needed.
+  - Rationale: Bench acceptance needs JSONL/chrome-trace + busy% summary, not a
+    dormant in-process SHM module; schemas differ (placement counters vs device spans).
+  - Evidence: `docs/hetero-timeline.md`, issue #75, draft PR #71.
+  - Verified: 2026-07-13
+
 - `REJECTED/sched-cut-cost-preserve-all-npu-islands` — Do not refuse every NPU→non-NPU
   island absorb under cut-cost. Preserving tiny unitary NPU sandwiches undid buft-safe
   coalesce duty-cycle (pp16 ~108→~412 disp). Keep fat islands only (≥3 ops or ≥64 KiB).
@@ -558,6 +591,17 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 ## Benchmark baselines
 
+
+- `BENCH/lfm-sm-tensor-hetero-timeline-tg128-r1` — Timeline-on smoke: LFM2.5-8B-A1B
+  Q4_K_M tg128 r=1 t=6 FA on ShortConv=1 MoE=0 ATTENTION=full `GGML_NPU_SCHED=auto`,
+  `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5`, flock + `ALLOW_HIGH_SWAP=1`,
+  `GGML_NPU_TIMELINE` set. Throughput **52.82 tok/s**. Summary: window ~3402 ms,
+  cpu busy%~90 / gpu~88 / npu~0; cpu load_bytes ~2.25 MiB; 11880 events, lapped=0.
+  - Limitation: r=1 smoke only; NPU idle expected under auto decode unclaim.
+  - Evidence: `benchmarks/results/hetero-timeline-smoke/`, `docs/hetero-timeline.md`.
+  - Reproduce: `GGML_NPU_TIMELINE=benchmarks/results/hetero-timeline-smoke/timeline`
+    with the cmdline above on interop-mkl + Direct `.so`.
+  - Verified: 2026-07-13
 
 - `BENCH/lfm-claim-stage-pp16-targeted` — Claim+stage smokes with llama.cpp#15; LFM Q4_K_M pp16
   r=1 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS, flock + `ALLOW_HIGH_SWAP=1`,
@@ -917,6 +961,130 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Reproduce: flock + `THREADS=6` `REPETITIONS=1` `GGML_NPU_SCHED=auto`
     `./benchmarks/results/_run_tg128_fullperf.sh`; control with
     `FORCE_SCHED_DEFAULT_OFF=1`.
+  - Verified: 2026-07-13
+
+
+- `FINDING/tg128-vulkan-not-hetero-dispatch-bottleneck` — On merged tip `dfe5414` /
+  llama.cpp `fc591ba8` (PR #74 / #18) with `.so` stamped `456d38e`, THREADS=6 r=1
+  LFM Q4_K_M FA on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS Direct decode-aware
+  `GGML_NPU_SCHED=auto`, excluding Vulkan via `build-cpu-flexiblas` (`GGML_VULKAN=OFF`,
+  no `libggml-vulkan`) did **not** beat `build-interop` Vulkan+BLAS+NPU auto: BLAS-only
+  auto **29.330 tok/s** / **1548** NPU disp (0% unitary / avg 2.50 / 100% no-copy) vs
+  Vulkan+BLAS auto **32.973 tok/s** / **774** disp (0% / 3.00 / 100%). Both remain below
+  Vulkan-only **53.433 ± 1.432** and above L0 soft **7.029**. Verdict: remaining tg128
+  gap vs Vulkan-only is not explained by Vulkan participating as a hetero backend.
+  - Scope: r=1 flock smokes; elevated host swap (`ALLOW_HIGH_SWAP=1`); BLAS-only sched-off
+    **7.920** / **19737** on this tip (prior interop sched-off **2.943** / **25929**).
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-blas-only-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-vulkan-blas-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-blas-only-off-r1-t6/`,
+    `benchmarks/results/develop-f1c4c98-tg128-vulkan-only-t6-r3/`,
+    `benchmarks/results/develop-f1c4c98-tg128-level-zero-r1-soft/`,
+    `FINDING/sched-decode-aware-auto-tg128`, issues #4/#5.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-tg128-456d38e-blas-vs-vulkan-hetero` — Same tip/THREADS/workload as
+  `BENCH/lfm-tg128-456d38e-decode-aware`, after merging develops `dfe5414` + llama
+  `fc591ba8`, rebuilt FlexiBLAS Direct trees:
+  (A) `build-cpu-flexiblas` BLAS+NPU auto **29.330** tok/s / 1548 disp;
+  (B) same BLAS+NPU sched-off **7.920** / 19737;
+  (C) `build-interop` Vulkan+BLAS+NPU auto **32.973** / 774.
+  Optional pp128: Vulkan+BLAS auto **156.695** tok/s / 428 disp (27.1% unitary /
+  avg 2.59 / 99.8% no-copy); BLAS-only pp128 auto **segfault exit 139** mid Direct
+  compile/dispatch (artifact kept, no tok/s).
+  - Limitation: r=1; not locked r≥3; pp128 BLAS-only crash is a host/path incident,
+    not a throughput claim.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-blas-only-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-blas-only-off-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-vulkan-blas-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-targeted-pp128-npu-vulkan-blas-auto/`,
+    `benchmarks/results/develop-456d38e-targeted-pp128-npu-blas-only-auto/`,
+    `FINDING/tg128-vulkan-not-hetero-dispatch-bottleneck`.
+  - Reproduce: flock + `THREADS=6` `REPETITIONS=1` `FLEXIBLAS=OPENBLAS-OPENMP`
+    `LLAMA_BENCH=…/build-cpu-flexiblas/bin/llama-bench` or `…/build-interop/…`
+    `LABEL_SUFFIX=…` `./benchmarks/results/_run_tg128_fullperf.sh`.
+  - Verified: 2026-07-13
+
+- `FINDING/tg128-mkl-vs-flexiblas-hetero` — Same tip/THREADS/workload as
+  `FINDING/tg128-vulkan-not-hetero-dispatch-bottleneck`, swapping FlexiBLAS for oneMKL
+  (`GGML_BLAS_VENDOR=Intel10_64lp`, oneMKL 2026.1): `build-cpu-mkl` NPU+MKL (Vulkan OFF)
+  auto **31.458 tok/s** / **1548** disp vs prior FlexiBLAS NPU-only **29.330** / 1548
+  (~+7%); `build-interop-mkl` NPU+MKL+Vulkan auto **31.236** / **774** does **not** beat
+  FlexiBLAS+Vulkan **32.973** / 774. MKL is available via system oneAPI; no install blocker.
+  - Scope: r=1 flock; `ALLOW_HIGH_SWAP=1`; does not close Vulkan-only gap (~53–59).
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-mkl-only-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-mkl-vulkan-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-mkl-vs-flexiblas-and-ts-report.md`, issues #4/#5.
+  - Verified: 2026-07-13
+
+- `FINDING/llama-ts-layer-split-not-npu-tp` — On this MicroPerceptron llama.cpp tip,
+  `llama-bench -ts a/b` is **layer-weight fraction** across the `-dev` list under
+  `-ngl > 0` (`-sm layer|row`). Default auto device pick and default `-sm tensor`
+  **skip `DEVICE_TYPE_NPU`** from Meta peers. Explicit `-dev Vulkan0/NPU` with
+  `-sm layer` places NPU in the layer-split set; with `-sm tensor` (llama.cpp#19)
+  NPU is **excluded from Meta peers** (warn) and kept as the independent sched tier.
+  Device order with ICD on MKL+Vulkan is `Vulkan0`, `BLAS:MKL`, `NPU`. This is
+  **not** true multi-NPU tensor-parallel GEMMs. tg128 r=1 t=6 MKL+Vulkan+Direct auto grid:
+  `-ngl 0` **31.2**; `-ngl 99 -dev Vulkan0` **58.7**; any nonzero NPU layer share
+  (`-ts 0.8/0.2`…`0/1`) collapses to **2.0–4.8** tok/s with 4k–23k NPU disp.
+  Pre-#19: `-sm tensor` + Vulkan/NPU **exit 134** (LFM `cache_r`→`ssm_out` assert).
+  Post-#19: same cmdline succeeds ~**51 tok/s** (Meta=Vulkan;≈Vulkan-only). Verdict: `-ts`
+  does not help decode; prefer sched `-ngl 0` hetero or pure Vulkan offload.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-ts-grid-mkl-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-sm-tensor-hetero-r1-t6/`,
+    `benchmarks/results/_run_tg128_ts_grid.sh`,
+    `benchmarks/results/develop-456d38e-mkl-vs-flexiblas-and-ts-report.md`,
+    `FINDING/lfm-sm-tensor-npu-meta-peer`, llama.cpp#19, issues #4/#5.
+  - Verified: 2026-07-13
+
+- `FINDING/lfm-sm-tensor-npu-meta-peer` — LFM2/LFM2MOE `-sm tensor` crash was
+  `cache_r_l*` looked up as SSM `ssm_out.weight` (`GGML_ASSERT`); arch deny-list was a
+  no-op because Meta attaches after `llama_model_create`. After llama.cpp#19, LFM has
+  shortconv/RS split configs and the arch guard runs post-prepare. NPU **cannot** be a
+  Meta TP weight/RS peer: Meta `supports_op` is unanimous and NPU rejects `GGML_OP_NONE`
+  leaves → pre-allocated Meta abort. Explicit `-dev Vulkan0/NPU -sm tensor` excludes NPU
+  from Meta (GPU Meta + NPU sched tier). tg128 r=1 t=6: **51.184** tok/s vs Vulkan-only
+  **53.611** and `-ngl 0` **24.395** (elevated swap).
+  - Scope: r=1 flock; single Intel iGPU; not locked pp512; sm-tensor cell npu-unproven.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-sm-tensor-hetero-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-sm-tensor-hetero-report.md`, llama.cpp#19,
+    issues #4/#5.
+  - Verified: 2026-07-13
+
+- `CONSTRAINT/npu-not-meta-tp-peer` — Do not place `DEVICE_TYPE_NPU` in a Meta
+  tensor-parallel peer set. Meta requires unanimous `supports_op` (including weight
+  `NONE`); NPU is claim/unclaim scheduler tier with a narrow surface. Hetero with
+  `-sm tensor` is Meta(GPU[+…]) + independent NPU backend, not weight-sliced NPU TP.
+  - Rationale: Meta(Vulkan+NPU) aborts on pre-allocated `cache_r`/`weights` when NPU
+    refuses `NONE`; true dual-peer TP needs backends that both host sliced weights.
+  - Evidence: llama.cpp#19 (`llama_prepare_model_devices`), `FINDING/lfm-sm-tensor-npu-meta-peer`.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-tg128-456d38e-mkl-and-ts` — Develop `456d38e` + llama.cpp `fc591ba8`
+  LFM Q4_K_M tg128 r=1 t=6 FA on ShortConv=1 MoE=0 ATTENTION=full `GGML_NPU_SCHED=auto`:
+  MKL-only **31.458** / 1548; MKL+Vulkan **31.236** / 774; `-ts` grid peaks at
+  Vulkan-only **58.732** (`-ngl 99 -dev Vulkan0`); NPU layer splits 2.0–4.8; `-sm tensor`
+  fail exit 134 on that tip (fixed in llama.cpp#19; see `BENCH/lfm-tg128-sm-tensor-hetero`).
+  - Limitation: r=1; elevated swap; Vulkan-only cells are `npu-unproven` (no NPU submit).
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-mkl-only-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-fullperf-locked-npu-mkl-vulkan-auto-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-ts-grid-mkl-r1-t6/`,
+    `FINDING/tg128-mkl-vs-flexiblas-hetero`, `FINDING/llama-ts-layer-split-not-npu-tp`.
+  - Reproduce: flock + `THREADS=6` `REPETITIONS=1` `LLAMA_BENCH=…/build-cpu-mkl/…` or
+    `…/build-interop-mkl/…` `./benchmarks/results/_run_tg128_fullperf.sh`; for `-ts`
+    `./benchmarks/results/_run_tg128_ts_grid.sh` with `VK_ICD_FILENAMES=intel_icd`.
+  - Verified: 2026-07-13
+
+- `BENCH/lfm-tg128-sm-tensor-hetero` — Develop `456d38e` + llama.cpp#19 (`ba2dc15b9`)
+  LFM Q4_K_M tg128 r=1 t=6 FA on ShortConv=1 MoE=0 ATTENTION=full `GGML_NPU_SCHED=auto`
+  MKL+Vulkan: `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5` → **51.184** tok/s
+  (exit 0; was 134); `-ngl 0` **24.395** / 774; Vulkan-only `-ngl 99 -dev Vulkan0 -sm layer`
+  **53.611**.
+  - Limitation: r=1; elevated swap; sm-tensor/Vulkan-only cells npu-unproven.
+  - Evidence: `benchmarks/results/develop-456d38e-tg128-sm-tensor-hetero-r1-t6/`,
+    `benchmarks/results/develop-456d38e-tg128-sm-tensor-hetero-report.md`, llama.cpp#19.
+  - Reproduce: flock + `THREADS=6` `REPETITIONS=1` interop-mkl `llama-bench` with
+    `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5`, `VK_ICD_FILENAMES=intel_icd`.
   - Verified: 2026-07-13
 
 ## Pending milestones
