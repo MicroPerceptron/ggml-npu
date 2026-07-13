@@ -356,17 +356,21 @@ fn validate_symbol_sources(elf: &ParsedIntelElf<'_>) -> Result<(), HpiError> {
     Ok(())
 }
 
+/// Fail closed when artifact loader/NNRT versions are outside the release-pinned window.
+pub fn versions_compatible(versions: &ArtifactVersions) -> bool {
+    versions.loader_major == ELF_LOADER_ABI_MAJOR
+        && versions.loader_minor <= ELF_LOADER_ABI_MINOR
+        && versions.mapped_inference_major == NNRT_API_MAJOR
+        && versions.mapped_inference_minor <= NNRT_API_MINOR
+}
+
 pub fn inspect_hpi_requirements(
     elf: &ParsedIntelElf<'_>,
     device: &DeviceParameters,
 ) -> Result<HpiRequirements, HpiError> {
     let resources = inspect_metadata(elf)?;
     let versions = parse_versions(elf)?;
-    if versions.loader_major != ELF_LOADER_ABI_MAJOR
-        || versions.loader_minor > ELF_LOADER_ABI_MINOR
-        || versions.mapped_inference_major != NNRT_API_MAJOR
-        || versions.mapped_inference_minor > NNRT_API_MINOR
-    {
+    if !versions_compatible(&versions) {
         return Err(HpiError::VersionMismatch);
     }
     // vpu_device.cpp at v1.32.0 decodes the raw fused-off TILE_CONFIG bits this way for NPU40XX.
@@ -408,5 +412,35 @@ mod tests {
             serial_descriptor(&bytes, 0),
             Err(HpiError::InvalidSerialization)
         ));
+    }
+
+    #[test]
+    fn loader_and_nnrt_mismatch_reject() {
+        let ok = ArtifactVersions {
+            loader_major: ELF_LOADER_ABI_MAJOR,
+            loader_minor: ELF_LOADER_ABI_MINOR,
+            loader_patch: 0,
+            mapped_inference_major: NNRT_API_MAJOR,
+            mapped_inference_minor: NNRT_API_MINOR,
+            mapped_inference_patch: 0,
+            mapped_inference_format: 0,
+        };
+        assert!(versions_compatible(&ok));
+
+        let mut newer_loader = ok;
+        newer_loader.loader_minor = ELF_LOADER_ABI_MINOR + 1;
+        assert!(!versions_compatible(&newer_loader));
+
+        let mut wrong_major = ok;
+        wrong_major.loader_major = ELF_LOADER_ABI_MAJOR + 1;
+        assert!(!versions_compatible(&wrong_major));
+
+        let mut newer_nnrt = ok;
+        newer_nnrt.mapped_inference_minor = NNRT_API_MINOR + 1;
+        assert!(!versions_compatible(&newer_nnrt));
+
+        let mut wrong_nnrt_major = ok;
+        wrong_nnrt_major.mapped_inference_major = NNRT_API_MAJOR + 1;
+        assert!(!versions_compatible(&wrong_nnrt_major));
     }
 }

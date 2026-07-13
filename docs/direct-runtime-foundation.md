@@ -118,8 +118,10 @@ GGML_NPU_TEST_ARTIFACT=./artifacts/bounded-vector-add.blob \
    IOMMU address constraints, immutable executable memory, and a byte-budgeted resident-object
    eviction policy.
 6. **Completion and recovery.** Absolute monotonic deadlines, command-BO wait, success-status
-   decoding, and deterministic normal cleanup are proven. Add cancellation boundaries,
-   device-loss handling, and reset recovery after partial execution.
+   decoding, and deterministic normal cleanup are proven. Cooperative cancel admission,
+   aborted-job vs fault classification, latched device-loss, and firmware-gated reset recovery of
+   the Direct session are software-proven (`src/vendor/ivpu/direct/health.rs`). Kernel in-flight
+   abort and hang-reset after partial execution remain open.
 7. **Redistributable artifact.** The local cached tiny vector-add artifact is proven, but its source,
    toolchain identity, and redistribution status must be recorded before it can be a portable CI
    fixture. A separately versioned tiny matmul remains useful for broader primitive coverage.
@@ -182,13 +184,19 @@ or admission depend on transient pressure after a graph has been claimed.
   patching**, Level Zero proven.
 - Submit: **direct proven for two serial submissions of one tiny artifact in one explicit queue**;
   Level Zero proven.
-- Wait/events: **direct command-BO completion and success status proven**; general event objects and
-  cancellation remain unsupported. Level Zero proven.
+- Wait/events: **direct command-BO completion and success status proven**; general event objects
+  remain unsupported. Cooperative cancel admission, aborted-job classification, and latched
+  device-loss with explicit firmware-gated reset are software-proven (`direct::health`). Level Zero
+  proven for broader event objects.
 - Cleanup/recovery: **direct deterministic cleanup proven on successful execution and injected
-  allocation/device failures**, Level Zero cleanup proven; direct reset recovery remains unproven.
+  allocation/device failures**; latched device-loss refuses further dispatch until
+  `try_reset_after_fault` re-validates firmware pins and drops resident programs. Kernel-driven
+  hang recovery and in-flight abort ioctls remain unproven. Level Zero cleanup proven.
 - Numerical parity: **direct vector-add output matched Level Zero bit-for-bit for all 32 FP32
-  elements across both submissions**. Direct ShortConv/RoPE/FlashAttention/MoE remain unproven;
-  Level Zero focused gates are proven.
+  elements across both submissions**. Hermetic differential-oracle hooks
+  (`direct::oracle::{compare_f32,binding_meta_matches}`) are available for Direct↔oracle checks
+  without hardware. Direct ShortConv/RoPE/FlashAttention/MoE remain unproven; Level Zero focused
+  gates are proven.
 - Existing tiny Intel artifact execution: **direct proven** for
   `ir2-8c91da4914adc7d5-n1.blob` (45,192 bytes, 43 sections, 33 symbols, 42 relocations,
   17 allocated sections totaling 8,096 logical bytes and 69,632 page-aligned BO bytes). Metadata
@@ -199,5 +207,7 @@ or admission depend on transient pressure after a graph has been claimed.
   deterministic cleanup, explicit submit, finite wait, and output readback** under an accounted
   28,479,488-byte ceiling. The observed direct output exactly matched the Level Zero oracle
   (`max_absolute = 0`, `max_relative = 0`, tolerance `1e-5`).
-- General artifact caching, asynchronous events, cancellation, recovery after device loss, and
-  broader numerical operation coverage remain unsupported.
+- General artifact caching, asynchronous events, and broader numerical operation coverage remain
+  unsupported. Session-level cancel/device-loss/reset and hermetic differential-oracle hooks are
+  landed; kernel abort and model-corpus Direct↔L0 parity remain required before retiring
+  `level-zero-compat`.

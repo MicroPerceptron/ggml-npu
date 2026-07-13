@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use super::direct::budget::RuntimeBudget;
 use super::direct::elf::parse_intel_elf_with_resident_limit;
+use super::direct::health::{self, FaultReason, HealthState, WaitOutcome};
 use super::direct::hpi::inspect_hpi_requirements;
 use super::direct::link::{visit_binding_requirements, DeviceMemoryClass};
 use super::direct::prepare::{
@@ -38,7 +39,10 @@ fn context() -> Result<&'static DirectContext, RuntimeError> {
         // SAFETY: published contexts are leaked and immutable after initialization.
         return Ok(unsafe { &*current });
     }
-    let device = Box::leak(Box::new(IvpuDevice::open_first()?));
+    let device = IvpuDevice::open_first()?;
+    let parameters = device.parameters()?;
+    health::negotiate_firmware(&parameters)?;
+    let device = Box::leak(Box::new(device));
     let queue = device.create_queue(0, 0)?;
     let candidate = Box::into_raw(Box::new(DirectContext { device, queue }));
     match CONTEXT.compare_exchange(
@@ -210,7 +214,6 @@ impl Drop for CacheGuard<'_> {
 }
 
 static PROGRAMS: ResidentCache = ResidentCache::new();
-static DEVICE_FAILED: AtomicBool = AtomicBool::new(false);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 static ACCOUNTED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
@@ -333,6 +336,39 @@ pub(super) fn synchronize() -> bool {
     true
 }
 
+/// Cooperative cancel: refuse new Direct admissions until cleared by a cancelled wait or reset.
+pub(super) fn request_cancel() -> bool {
+    health::request_cancel()
+}
+
+pub(super) fn session_health() -> HealthState {
+    health::health_state()
+}
+
+/// Drop resident programs and clear a latched device-loss only after firmware re-negotiation.
+pub(super) fn try_reset_after_fault() -> Result<u64, RuntimeError> {
+    let context = context()?;
+    let parameters = context.device.parameters().map_err(|error| {
+        health::latch_device_lost(FaultReason::DeviceQuery);
+        error
+    })?;
+    health::negotiate_firmware(&parameters).map_err(|error| {
+        health::latch_device_lost(FaultReason::FirmwareMismatch);
+        error
+    })?;
+    drop_all_resident_programs();
+    health::try_reset(&parameters).map_err(|_| RuntimeError::Incompatible)
+}
+
+fn drop_all_resident_programs() {
+    let mut guard = PROGRAMS.lock();
+    let state = guard.state();
+    state.entries.clear();
+    state.loading.clear();
+    state.resident_bytes = 0;
+    state.reserved_bytes = 0;
+}
+
 pub(super) fn runtime_available() -> bool {
     let Ok(device) = IvpuDevice::open_first() else {
         return false;
@@ -340,8 +376,7 @@ pub(super) fn runtime_available() -> bool {
     let Ok(parameters) = device.parameters() else {
         return false;
     };
-    super::direct::validate::validate_device(&parameters).is_ok()
-        && RuntimeBudget::query(&parameters).is_ok()
+    health::negotiate_firmware(&parameters).is_ok() && RuntimeBudget::query(&parameters).is_ok()
 }
 
 fn operand_storage_bytes(operand: &Operand) -> Option<usize> {
@@ -471,23 +506,31 @@ fn dispatch(
             return false;
         }
     };
-    if context
+    if let Err(error) = context
         .queue
         .submit(&program.handles, program.commands_offset(), 0)
-        .is_err()
     {
-        DEVICE_FAILED.store(true, Ordering::Release);
-        profile::note("[npu direct] submit failed\n");
+        let outcome = health::note_submit_failure(error);
+        profile::note(&alloc::format!(
+            "[npu direct] submit failed: {outcome:?}\n"
+        ));
         return false;
     }
     let tmid = if prof { profile::now_ns() } else { 0 };
-    let status = program
+    let wait = program
         .command
         .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)));
-    if !matches!(status, Ok(0)) {
-        DEVICE_FAILED.store(true, Ordering::Release);
-        profile::note(&alloc::format!("[npu direct] wait failed: {status:?}\n"));
-        return false;
+    let outcome = health::apply_wait_outcome(health::classify_wait_result(wait));
+    match outcome {
+        WaitOutcome::Success => {}
+        WaitOutcome::Cancelled => {
+            profile::note("[npu direct] wait cancelled\n");
+            return false;
+        }
+        other => {
+            profile::note(&alloc::format!("[npu direct] wait failed: {other:?}\n"));
+            return false;
+        }
     }
     let t2 = if prof { profile::now_ns() } else { 0 };
     for (index, output) in outputs.iter().enumerate() {
@@ -843,13 +886,21 @@ fn run_program(
         program_key.digest().hex(),
         binding_fp.digest().hex()
     ));
-    if DEVICE_FAILED.load(Ordering::Acquire) {
-        profile::note("[npu direct] device fault latched; refusing automatic retry\n");
+    if let Err(outcome) = health::admit_dispatch() {
+        profile::note(&alloc::format!(
+            "[npu direct] refusing dispatch: {outcome:?}\n"
+        ));
         return false;
     }
     let context = match context() {
         Ok(context) => context,
         Err(error) => {
+            if matches!(error, RuntimeError::Incompatible | RuntimeError::DeviceLost) {
+                health::latch_device_lost(match error {
+                    RuntimeError::Incompatible => FaultReason::FirmwareMismatch,
+                    _ => FaultReason::DeviceQuery,
+                });
+            }
             profile::note(&alloc::format!("[npu direct] context failed: {error:?}\n"));
             return false;
         }
@@ -857,12 +908,20 @@ fn run_program(
     let parameters = match context.device.parameters() {
         Ok(parameters) => parameters,
         Err(error) => {
+            health::latch_device_lost(FaultReason::DeviceQuery);
             profile::note(&alloc::format!(
                 "[npu direct] parameter query failed: {error:?}\n"
             ));
             return false;
         }
     };
+    if let Err(error) = health::negotiate_firmware(&parameters) {
+        health::latch_device_lost(FaultReason::FirmwareMismatch);
+        profile::note(&alloc::format!(
+            "[npu direct] firmware negotiation failed: {error:?}\n"
+        ));
+        return false;
+    }
     let budget = match RuntimeBudget::query(&parameters) {
         Ok(budget) => budget,
         Err(error) => {
@@ -1150,12 +1209,16 @@ pub(super) fn run_blob_selftest_multi(
             domain: crate::host::ERROR_DOMAIN,
             code: error.0,
         })?;
-    if prepared
-        .command
-        .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)))?
-        != 0
-    {
-        return Err(RuntimeError::DeviceLost);
+    match health::apply_wait_outcome(health::classify_wait_result(
+        prepared
+            .command
+            .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000))),
+    )) {
+        WaitOutcome::Success => {}
+        WaitOutcome::Cancelled => return Err(RuntimeError::Unsupported),
+        WaitOutcome::DeadlineExpired => return Err(RuntimeError::DeadlineExpired),
+        WaitOutcome::DeviceLost { .. } => return Err(RuntimeError::DeviceLost),
+        WaitOutcome::Transport(error) => return Err(error),
     }
     let bytes = prepared.output_bytes(0).ok_or(RuntimeError::Incompatible)?;
     if bytes % size_of::<f32>() != 0 || output.len() < bytes / size_of::<f32>() {
@@ -1225,13 +1288,16 @@ impl DirectBenchmarkFixture {
                 domain: crate::host::ERROR_DOMAIN,
                 code: error.0,
             })?;
-        if self
-            .prepared
-            .command
-            .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000)))?
-            != 0
-        {
-            return Err(RuntimeError::DeviceLost);
+        match health::apply_wait_outcome(health::classify_wait_result(
+            self.prepared
+                .command
+                .wait_idle(Deadline::MonotonicNs(now.saturating_add(2_000_000_000))),
+        )) {
+            WaitOutcome::Success => {}
+            WaitOutcome::Cancelled => return Err(RuntimeError::Unsupported),
+            WaitOutcome::DeadlineExpired => return Err(RuntimeError::DeadlineExpired),
+            WaitOutcome::DeviceLost { .. } => return Err(RuntimeError::DeviceLost),
+            WaitOutcome::Transport(error) => return Err(error),
         }
         Ok(())
     }
