@@ -26,6 +26,19 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     issues #5/#8/#11, PRs #32/#35/#37.
   - Verified: 2026-07-12
 
+- `ADR/sched-region-coalesce-rust-first` — Prefill same-backend region coalesce (island
+  absorption / uneconomic-cut heuristics) lives in `no_std` Rust
+  (`src/sched/region_coalesce.rs`) and is exported as
+  `ggml_backend_sched_region_coalesce` via registry `get_proc_address`. The llama.cpp
+  scheduler only packs POD rows and applies results behind
+  `GGML_SCHED_REGION_COALESCE` (default off). Claim profitability stays in `offload_op` /
+  policy; the pass must not invent NPU claims.
+  - Rationale: Safety and bitset/interval analysis belong in Rust; LTO/same-process load
+    mitigates FFI cost vs split overhead. Avoids growing opaque C++ scheduler logic.
+  - Evidence: `docs/sched-region-coalesce.md`, `src/sched/region_coalesce.rs`,
+    `src/backend/shell.rs`, PR #41; companion llama.cpp thin hook PR MicroPerceptron/llama.cpp#10.
+  - Verified: 2026-07-12
+
 - `ADR/tiered-artifact-cache` — Compiled artifacts use a host-owned tiered cache (compressed memory + durable content-addressed store) via `get_or_compile`, with Zstd L1 / system libzstd as the production codec path.
   - Rationale: Amortize compile cost without double-keeping uncompressed blobs in the vendor session cache.
   - Evidence: `docs/tiered-artifact-cache.md`, `src/artifact_cache.rs`, `src/host/linux/cache.rs`, `src/vendor/ivpu/compile.rs`.
@@ -175,6 +188,14 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   - Verified: 2026-07-12
 
 ## Rejected alternatives
+
+- `REJECTED/sched-coalesce-core-in-ggml-backend-cpp` — Do not implement bitmat/interval
+  same-backend region coalesce inside llama.cpp `ggml-backend.cpp`. Keep a thin C hook
+  only; algorithm stays in ggml-npu Rust.
+  - Rationale: User/product constraint prefers Rust for analysis safety; C++ scheduler
+    remains packing + split cutting.
+  - Evidence: `ADR/sched-region-coalesce-rust-first`, `docs/sched-region-coalesce.md`, PR #41.
+  - Verified: 2026-07-12
 
 - `REJECTED/moe-enabled-via-is-set` — Do not treat `ConfigService::is_set("GGML_NPU_MOE")` as MoE
   enable. Targeted smokes and docs export `GGML_NPU_MOE=0` to mean off; presence-only gating falsely

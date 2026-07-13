@@ -27,9 +27,13 @@ unsafe extern "C" fn reg_get_proc_address(
     _reg: ggml_backend_reg_t,
     name: *const c_char,
 ) -> *mut core::ffi::c_void {
+    let sched = unsafe { crate::sched::proc_address(name) };
+    if !sched.is_null() {
+        return sched;
+    }
     #[cfg(ggml_has_external_memory)]
     {
-        super::external::proc_address(name)
+        return unsafe { super::external::proc_address(name) };
     }
     #[cfg(not(ggml_has_external_memory))]
     {
