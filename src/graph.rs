@@ -1348,8 +1348,11 @@ mod tests {
 
     #[test]
     fn connected_shortconv_gather_conv_write_stays_one_region() {
-        // LFM ShortConv-shaped DAG: gather state → SSM_CONV → SetRows writeback.
+        // Connected gather state → SSM_CONV → SetRows writeback.
         // Connected mutable effects must not open a MutableStateBoundary (#9).
+        // Intel may still refuse fusing SSM_CONV+SET_ROWS into one OV program; the engine then
+        // peels FeasibilityLimit adjacent NPU programs (see engine tests) — never host-realize
+        // these stateful edges as layout_glue_host.
         let mut state_in = value(TensorRole::MutableState, 1, Dim::Static(4));
         state_in.owned = true;
         let values = vec![

@@ -41,7 +41,9 @@ It does **not** run full LFM pp512 and does not require NPU hardware.
    second policy path here).
 4. Add a matrix row with honest `gate` + proof tags **in the same change**.
 5. Prefer a hermetic `contract:` / `test:` proof first; add `script:` or `issue:#…` for shim/HW
-   follow-ups (#9–#11).
+   follow-ups (#9–#11). ShortConv gather/write (#9): hermetic proofs cover connected
+   gather→SSM_CONV→SetRows partitioning and FeasibilityLimit adjacent peels when Intel refuses
+   SSM_CONV+SET_ROWS fusion; shim script remains the numerical gate.
 6. Re-run `./tests/run_claim_coverage_check.sh`.
 
 ## Full local coverage gate

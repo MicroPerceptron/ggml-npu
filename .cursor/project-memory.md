@@ -169,11 +169,17 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   `GGML_NPU_ATTENTION=full`. SetRows is stateful scatter (also used by LFM `cache_r*` recurrent
   writes via CPY/GET_ROWS adjacency), not attention SoftMax/FA. Under
   `GGML_NPU_LFM_SHORTCONV`, placement now pulls SSM_CONV/SET_ROWS/GET_ROWS/CPY when they sit under
-  `.conv.` ancestry or touch `cache_r*` (not `cache_k`/`cache_v`).
-  - Scope: Capability/placement for ShortConv state edges (#9); not a claim that one OpenVINO
-    program can fuse SSM_CONV+SET_ROWS (Intel NPU compile currently rejects that fusion).
-  - Evidence: `src/graph.rs`, `src/policy.rs`, `tests/graph_ir_shortconv_check.c`, GitHub issue #9.
-  - Verified: 2026-07-12
+  `.conv.` ancestry or touch `cache_r*` (not `cache_k`/`cache_v`). Connected
+  gather→SSM_CONV→SetRows stays one semantic region; when Intel refuses SSM_CONV+SET_ROWS fusion,
+  the engine peels `feasibility_limit` adjacent NPU programs and never host-realizes those
+  stateful edges as `layout_glue_host`. Coverage matrix rows for SsmConv/GetRows/SetRows are
+  hermetic with those proofs plus the shim numerical script.
+  - Scope: Capability/placement/partition contract for ShortConv state edges (#9); not a claim
+    that one OpenVINO program can fuse SSM_CONV+SET_ROWS, nor that LFM pp16 state-boundary
+    attribution is already reduced.
+  - Evidence: `src/graph.rs`, `src/policy.rs`, `src/engine.rs`, `tests/coverage_matrix.csv`,
+    `tests/graph_ir_shortconv_check.c`, GitHub issue #9, PR #34.
+  - Verified: 2026-07-13
 
 - `FINDING/prefill-qkv-rope-not-attention-gate` — `WireOp::Rope` and `WireOp::Permute` were tagged
   `traits.attention`, so default env rejected fused prefill QKV+RoPE regions unless
