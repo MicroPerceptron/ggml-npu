@@ -10,6 +10,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ffi::{ggml_backend_buffer_type_t, ggml_backend_buft_is_host, ggml_tensor};
+use crate::host::{ConfigService, HostEnvironment};
 
 /// Process-wide `supports_buft` probe attribution (Direct gap vs L0 broad host contract).
 static PROBE_OURS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -88,11 +89,26 @@ pub fn supports_buft_policy(is_ours: bool, is_host: bool) -> bool {
     }
 }
 
-/// Gated spike for selective importable foreign-host bufts. Always false until a hermetic
-/// allowlist + import proof lands; widening all host bufts remains a non-goal.
+/// Named foreign-host buft classes with a hermetic import proof. Empty until a class is proven
+/// (dmabuf / SharedAllocationOwner handoff). Env alone must not widen.
+#[inline]
+pub fn importable_foreign_host_allowlist() -> &'static [&'static str] {
+    // Intentionally empty: no foreign host class is proven importable yet.
+    &[]
+}
+
+/// Selective foreign-host allowlist gate. Requires **both** exact `GGML_NPU_IMPORT_FOREIGN_HOST=1`
+/// **and** a non-empty [`importable_foreign_host_allowlist`]. Default off; empty allowlist keeps
+/// probes refusing foreign host even when the env is set (hermetic lock vs blind widen).
 #[inline]
 pub fn importable_foreign_host_allowlist_enabled() -> bool {
-    false
+    if !crate::host::builtin()
+        .config()
+        .is_opt_in_one(c"GGML_NPU_IMPORT_FOREIGN_HOST")
+    {
+        return false;
+    }
+    !importable_foreign_host_allowlist().is_empty()
 }
 
 /// Classify a buft pointer against our singleton and ggml's host flag.
@@ -137,13 +153,26 @@ pub(crate) unsafe fn classify_tensor(tensor: *const ggml_tensor) -> TensorReside
     }
 }
 
-/// `supports_buft` entry: classify, attribute, apply policy (allowlist stays off).
+/// Whether a classified foreign-host buft is on the proven import allowlist.
+/// Today the allowlist is empty, so this is always false; tests lock that.
+#[inline]
+pub fn foreign_host_buft_on_allowlist(_buft_name: &str) -> bool {
+    importable_foreign_host_allowlist()
+        .iter()
+        .any(|&name| name == _buft_name)
+}
+
+/// `supports_buft` entry: classify, attribute, apply policy (allowlist stays empty/off).
 pub(crate) unsafe fn supports_buft_attributed(buft: ggml_backend_buffer_type_t) -> bool {
     let class = classify_buft(buft);
     let is_ours = class == BuftClass::Ours;
     let is_host = matches!(class, BuftClass::Ours | BuftClass::ForeignHost);
-    let accept = supports_buft_policy(is_ours, is_host)
-        || (importable_foreign_host_allowlist_enabled() && class == BuftClass::ForeignHost);
+    // Allowlist admits foreign host only when env opt-in AND the named list is non-empty.
+    // With an empty allowlist this never fires — claim+stage stays the duty-cycle path.
+    // Future: match `ggml_backend_buft_name` against `importable_foreign_host_allowlist()`.
+    let allowlisted_foreign =
+        class == BuftClass::ForeignHost && importable_foreign_host_allowlist_enabled();
+    let accept = supports_buft_policy(is_ours, is_host) || allowlisted_foreign;
 
     match class {
         BuftClass::Null => {
@@ -234,7 +263,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_stays_off() {
+    fn allowlist_stays_off_and_empty() {
+        assert!(importable_foreign_host_allowlist().is_empty());
+        assert!(!importable_foreign_host_allowlist_enabled());
+        assert!(!foreign_host_buft_on_allowlist("CPU"));
+        assert!(!foreign_host_buft_on_allowlist("Vulkan"));
+    }
+
+    #[test]
+    fn env_alone_cannot_enable_empty_allowlist() {
+        // Even if a caller opted into IMPORT_FOREIGN_HOST, an empty class list must
+        // keep the gate closed (no blind widen).
+        assert!(importable_foreign_host_allowlist().is_empty());
         assert!(!importable_foreign_host_allowlist_enabled());
     }
 

@@ -195,14 +195,17 @@ unsafe extern "C" fn dev_supports_buft(
     _dev: ggml_backend_dev_t,
     buft: ggml_backend_buffer_type_t,
 ) -> bool {
-    // Direct: only our SharedAllocationOwner-backed buft. L0: any host buft.
-    // Attribution records foreign-host refusals (L0/Direct gap). Do not widen blindly (#6).
+    // Direct: only our SharedAllocationOwner-backed buft (or empty gated allowlist).
+    // Duty cycle grows via GGML_SCHED_NPU_CLAIM_STAGE + offload_op staging into
+    // NPU_HOST — not by lying about foreign host bufts (#6 / PR #22).
     super::supports_buft_attributed(buft)
 }
 
 unsafe extern "C" fn dev_offload_op(_dev: ggml_backend_dev_t, op: *const ggml_tensor) -> bool {
-    // Pull only profitable supported work from foreign buffers. Cheap unary/layout operations
-    // remain fusible capability glue and do not normally create standalone NPU dispatch islands.
+    // Pull profitable supported work from foreign buffers. With claim+stage, the
+    // scheduler may assign NPU even when supports_buft is false; inputs are copied
+    // into NPU_HOST. Cheap unary/layout ops stay fusible glue and do not normally
+    // create standalone NPU dispatch islands.
     crate::engine::supports(op) && crate::policy::should_pull(op)
 }
 
