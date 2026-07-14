@@ -155,16 +155,18 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 
 - `ADR/hetero-forward-timeline` — Hetero / `-sm tensor` busy-idle observability is an
   env-gated (`GGML_NPU_TIMELINE=<prefix>`) Rust seqlock event ring plus exit dump
-  (JSONL, chrome-trace, busy%/idle%/copy/load summary). NPU emits stage/submit/wait/
-  copy-out spans; llama.cpp thin probes mark graph_compute, synchronize, sched copies,
-  and outer sched forward. Default path stays clean; does not widen `supports_buft` or
-  require deleting L0. Live SHM `GGML_NPU_TELEMETRY_SHM` (draft #71) is not the bench
-  artifact path.
-  - Rationale: TP hetero benches need per-device busy vs idle and memory-load attribution
-    without a hot-path TUI feed; artifact dumps beat a dormant SHM producer for acceptance.
+  (JSONL, chrome-trace, busy%/idle%/copy/load summary) with domains **cpu / gpu / npu /
+  meta**. Direct/L0 attribute host `stage_in`/`submit`/`copy_out` (incl. zero_outputs) to
+  **CPU** and device `wait` to **NPU**; llama.cpp maps `DEVICE_TYPE_META` → **meta** so TP
+  fence reclaim is not CPU math. Busy kinds match `is_busy_kind` (`graph_compute`,
+  `submit`/`wait`/`synchronize`, `stage_in`/`copy_out`/`sched_copy`); `forward` is a
+  window marker only. Default path stays clean; does not widen `supports_buft` or require
+  deleting L0. Live SHM `GGML_NPU_TELEMETRY_SHM` (draft #71) is not the bench artifact path.
+  - Rationale: TP hetero benches need honest per-lane busy vs idle; Meta-as-CPU and
+    host-memcpy-as-NPU misattributed host-sync investigation results.
   - Evidence: `docs/hetero-timeline.md`, `src/timeline.rs`, `src/timeline_ring.rs`,
-    issue #75, companion llama.cpp timeline probes.
-  - Verified: 2026-07-13
+    issue #75, PRs #76/#78, llama.cpp#20/#21.
+  - Verified: 2026-07-14
 
 ## Verified findings
 
@@ -174,10 +176,22 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   `GGML_NPU_SCHED=auto`, the hetero timeline window (~3.4 s, 11880 events) shows
   CPU ~90% busy / GPU ~88% busy / **NPU 0% busy** (no NPU stage/submit/wait events);
   tg128 ~52.8 tok/s. Matches Meta(Vulkan)+NPU-as-sched-tier decode unclaim under auto.
+  **Note:** pre-#78/#21 CPU busy% included Meta synchronize (Meta mislabeled as CPU);
+  re-smoke after those land for true CPU vs meta lanes.
   - Scope: r=1 smoke with timeline probes; not locked r≥3; does not claim NPU prefill duty.
   - Evidence: `docs/hetero-timeline.md`, `benchmarks/results/hetero-timeline-smoke/`,
-    issue #75, llama.cpp#19.
+    issue #75, llama.cpp#19, PR #78 / llama.cpp#21.
   - Verified: 2026-07-13
+
+- `FINDING/timeline-meta-host-prep-misattribution` — Host-sync investigation: TP “CPU
+  busy” was mostly post-token Meta→Vulkan fence reclaim (`DEVICE_TYPE_META` fell through
+  to CPU domain); Direct/L0 labeled host stage/zero/submit/copy as `Domain::Npu`,
+  inflating NPU busy. Fixed by Meta domain + host-prep→CPU / wait→NPU (PR #78,
+  llama.cpp#21); docs now match `is_busy_kind`.
+  - Scope: Attribution/semantics only; does not change claim/buft or reduce fence cost.
+  - Evidence: `docs/hetero-timeline.md`, `src/timeline.rs`, `src/vendor/ivpu/session.rs`,
+    llama.cpp `ggml-backend.cpp` domain map, issue #75.
+  - Verified: 2026-07-14
 
 - `FINDING/direct-l0-corpus-parity-harness` — Representative Direct↔L0 corpus gate (six
   blobs: tiny vector-add + five LFM/coverage cache slices) compares SHA-256 identity,
