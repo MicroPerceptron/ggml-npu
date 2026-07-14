@@ -116,8 +116,9 @@ fn memory_limit() -> usize {
     value
 }
 
+/// Exact `GGML_NPU_ASYNC=1` only — harness `=0` must keep `caps.async_` false.
 fn async_enabled() -> bool {
-    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
+    crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_ASYNC")
 }
 
 fn device_type() -> ggml_backend_dev_type {

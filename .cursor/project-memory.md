@@ -179,32 +179,49 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
   `BO_WAIT` into `synchronize()` with a pin-held pending command (L0 sketch); drain before
   rebind/reset. Secondary: `buft_get_alloc_size` reserves 256 B ELF pad headroom after
   each NPU_HOST tensor. Default path stays synchronous without the env.
-  - Scope: Hermetic unit tests; no accel in this session so tg/pp smoke deferred. Does not
+  - Scope: Hermetic unit tests + tip tg128 timeline smokes (`6419e243`). Does not
     widen `supports_buft`; timeline domain labeling owned separately (#75).
+    `GGML_NPU_ASYNC` is exact `=1` via `is_opt_in_one` (`=0`/unset stay sync).
   - Evidence: `src/vendor/ivpu/session.rs`, `src/vendor/ivpu/direct/prepare.rs`,
-    `src/backend/buffer.rs`, `docs/direct-runtime-foundation.md`, issues #75/#63.
+    `src/backend/buffer.rs`, `docs/direct-runtime-foundation.md`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-sched-auto-tg128-r1-t6/`,
+    issues #75/#63.
   - Verified: 2026-07-14
 
 - `FINDING/sm-tensor-hetero-timeline-npu-idle-decode` — With `GGML_NPU_TIMELINE` on
   LFM Q4_K_M tg128 r=1 t=6 `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5` and
-  `GGML_NPU_SCHED=auto`, the hetero timeline window (~3.4 s, 11880 events) shows
-  CPU ~90% busy / GPU ~88% busy / **NPU 0% busy** (no NPU stage/submit/wait events);
-  tg128 ~52.8 tok/s. Matches Meta(Vulkan)+NPU-as-sched-tier decode unclaim under auto.
-  **Note:** pre-#78/#21 CPU busy% included Meta synchronize (Meta mislabeled as CPU);
-  re-smoke after those land for true CPU vs meta lanes.
+  `GGML_NPU_SCHED=auto`, TP decode stays Meta(Vulkan)+NPU-as-sched-tier: **NPU 0%
+  busy**. Post-#78/#21 tip (`6419e243` / llama `12d340f7`): cpu ~4% / gpu ~93% /
+  **meta ~93%** (fence reclaim); pre-fix smokes showed cpu~90–97% because Meta
+  was labeled CPU. tok/s ~45–53 depending on host swap pressure.
   - Scope: r=1 smoke with timeline probes; not locked r≥3; does not claim NPU prefill duty.
-  - Evidence: `docs/hetero-timeline.md`, `benchmarks/results/hetero-timeline-smoke/`,
-    issue #75, llama.cpp#19, PR #78 / llama.cpp#21.
-  - Verified: 2026-07-13
+  - Evidence: `docs/hetero-timeline.md`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-tp-tg128-r1-t6/`,
+    `benchmarks/results/hetero-timeline-smoke/`, issue #75, llama.cpp#19/#21, PR #78.
+  - Verified: 2026-07-14
 
 - `FINDING/timeline-meta-host-prep-misattribution` — Host-sync investigation: TP “CPU
   busy” was mostly post-token Meta→Vulkan fence reclaim (`DEVICE_TYPE_META` fell through
   to CPU domain); Direct/L0 labeled host stage/zero/submit/copy as `Domain::Npu`,
   inflating NPU busy. Fixed by Meta domain + host-prep→CPU / wait→NPU (PR #78,
-  llama.cpp#21); docs now match `is_busy_kind`.
+  llama.cpp#21). Tip re-smoke (`6419e243`/`12d340f7`): TP meta~93% / cpu~4%; sync
+  sched-auto stage/submit/copy_out on cpu and wait on npu (639 each). Docs match
+  `is_busy_kind`.
   - Scope: Attribution/semantics only; does not change claim/buft or reduce fence cost.
   - Evidence: `docs/hetero-timeline.md`, `src/timeline.rs`, `src/vendor/ivpu/session.rs`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-tp-tg128-r1-t6/`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-sched-auto-tg128-r1-t6/`,
     llama.cpp `ggml-backend.cpp` domain map, issue #75.
+  - Verified: 2026-07-14
+
+- `FINDING/ggml-npu-async-is-set-zero` — Pre-fix: `async_enabled()` used `ConfigService::is_set`
+  for `GGML_NPU_ASYNC`, so harness `GGML_NPU_ASYNC=0` **enabled** all-direct BO_WAIT defer
+  (same trap as MoE). Fixed to `is_opt_in_one` in session / L0 / shell: exact `=1` enables;
+  `=0`/unset stay sync. Hermetic tests cover unset/`0`/`1`.
+  - Scope: Env semantics only; does not change default-off product policy.
+  - Evidence: `src/vendor/ivpu/session.rs`, `src/vendor/ivpu/session_level_zero.rs`,
+    `src/backend/shell.rs`, `src/host/mod.rs`, `src/host/mock.rs`,
+    `docs/direct-runtime-foundation.md`, issue #75.
   - Verified: 2026-07-14
 
 - `FINDING/direct-l0-corpus-parity-harness` — Representative Direct↔L0 corpus gate (six
@@ -587,6 +604,13 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
     `FINDING/moe-expert-id-assert-after-layout-glue`, issues #5/#11.
   - Verified: 2026-07-12
 
+- `REJECTED/async-enabled-via-is-set` — Do not treat `ConfigService::is_set("GGML_NPU_ASYNC")`
+  as async enable. Harness `GGML_NPU_ASYNC=0` false-enabled Direct BO_WAIT defer / `caps.async_`.
+  - Rationale: Same MoE pattern — document `=1`; use `is_opt_in_one` for session, L0, and shell.
+  - Evidence: `FINDING/ggml-npu-async-is-set-zero`, `src/vendor/ivpu/session.rs`,
+    `src/backend/shell.rs`, issue #75.
+  - Verified: 2026-07-14
+
 - `REJECTED/invent-npu-device-type-vs-upstream` — Do not define a local `GGML_BACKEND_DEVICE_TYPE_NPU` (or fake external-memory ABI) against stock `ggml-org/llama.cpp` headers to green CI.
   - Rationale: A backend-local enum value the host scheduler does not understand would mis-report device class; use ACCEL fallback + omit external memory when headers lack the ABI, and MicroPerceptron/llama.cpp when native NPU typing is required (issue #13). Pinning CI to the private MicroPerceptron fork was also rejected for Actions: anonymous HTTPS clone fails without credentials.
   - Evidence: `.github/workflows/ci.yml`, `build.rs`, `src/backend/shell.rs`.
@@ -620,16 +644,24 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 ## Benchmark baselines
 
 
-- `BENCH/lfm-sm-tensor-hetero-timeline-tg128-r1` — Timeline-on smoke: LFM2.5-8B-A1B
-  Q4_K_M tg128 r=1 t=6 FA on ShortConv=1 MoE=0 ATTENTION=full `GGML_NPU_SCHED=auto`,
-  `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5`, flock + `ALLOW_HIGH_SWAP=1`,
-  `GGML_NPU_TIMELINE` set. Throughput **52.82 tok/s**. Summary: window ~3402 ms,
-  cpu busy%~90 / gpu~88 / npu~0; cpu load_bytes ~2.25 MiB; 11880 events, lapped=0.
-  - Limitation: r=1 smoke only; NPU idle expected under auto decode unclaim.
-  - Evidence: `benchmarks/results/hetero-timeline-smoke/`, `docs/hetero-timeline.md`.
-  - Reproduce: `GGML_NPU_TIMELINE=benchmarks/results/hetero-timeline-smoke/timeline`
-    with the cmdline above on interop-mkl + Direct `.so`.
-  - Verified: 2026-07-13
+- `BENCH/lfm-sm-tensor-hetero-timeline-tg128-r1` — Tip timeline smoke after #77+#78 /
+  llama #21 (`6419e243` / `12d340f7`): LFM2.5-8B-A1B Q4_K_M tg128 r=1 t=6 FA on
+  ShortConv=1 MoE=0 ATTENTION=full `GGML_NPU_SCHED=auto`, flock + `ALLOW_HIGH_SWAP=1`,
+  `GGML_NPU_TIMELINE` set, interop-mkl + Direct `.so`. **TP** (`-ngl 99 -dev
+  Vulkan0/NPU -sm tensor -ts 0.5/0.5`): **45.06 tok/s**; lanes cpu 3.8 / gpu 92.6 /
+  npu 0 / **meta 92.9**. **Sched-auto** (`-ngl 0`, ASYNC unset): **29.40 tok/s**;
+  cpu 81.4 / gpu 17.2 / **npu 8.9** / meta 0 — host stage/submit/copy_out on cpu,
+  wait on npu (639 each). Optional `GGML_NPU_ASYNC=1`: **32.70 tok/s**; wait deferred
+  (no npu wait spans in ring). Prior pre-meta tip (~51.7 TP / ~30.2 auto @ `721805f`)
+  for tok/s compare; TP drop vs that run under elevated swap.
+  - Limitation: r=1 smoke only; not locked r≥3; ring can lap on auto (16384 cap).
+  - Evidence: `benchmarks/results/develop-6419e24-hetero-timeline-tp-tg128-r1-t6/`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-sched-auto-tg128-r1-t6/`,
+    `benchmarks/results/develop-6419e24-hetero-timeline-sched-auto-async-tg128-r1-t6/`,
+    `docs/hetero-timeline.md`, issue #75.
+  - Reproduce: `GGML_NPU_ASYNC` unset or `=0` for sync; `=1` for async; flock + THREADS=6 +
+    `GGML_NPU_TIMELINE=<out>/timeline` with the cmdlines above.
+  - Verified: 2026-07-14
 
 - `BENCH/lfm-claim-stage-pp16-targeted` — Claim+stage smokes with llama.cpp#15; LFM Q4_K_M pp16
   r=1 sharing-on ShortConv=1 MoE=0 ATTENTION=full FlexiBLAS, flock + `ALLOW_HIGH_SWAP=1`,

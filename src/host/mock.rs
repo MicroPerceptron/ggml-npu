@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn opt_in_one_requires_exact_one_not_mere_presence() {
-        // Harness exports GGML_NPU_MOE=0 to disable; presence must not enable (#5/#11).
+        // Harness exports GGML_NPU_MOE=0 / GGML_NPU_ASYNC=0 to disable; presence must not enable.
         let zero = MockConfig {
             name: c"GGML_NPU_MOE",
             value: c"0",
@@ -464,11 +464,24 @@ mod tests {
         assert!(zero.is_set(c"GGML_NPU_MOE"));
         assert!(!zero.is_opt_in_one(c"GGML_NPU_MOE"));
 
+        let async_zero = MockConfig {
+            name: c"GGML_NPU_ASYNC",
+            value: c"0",
+        };
+        assert!(async_zero.is_set(c"GGML_NPU_ASYNC"));
+        assert!(!async_zero.is_opt_in_one(c"GGML_NPU_ASYNC"));
+
         let one = MockConfig {
             name: c"GGML_NPU_MOE",
             value: c"1",
         };
         assert!(one.is_opt_in_one(c"GGML_NPU_MOE"));
+
+        let async_one = MockConfig {
+            name: c"GGML_NPU_ASYNC",
+            value: c"1",
+        };
+        assert!(async_one.is_opt_in_one(c"GGML_NPU_ASYNC"));
 
         let empty = MockConfig {
             name: c"GGML_NPU_MOE",
