@@ -665,7 +665,7 @@ mod tests {
 
         let name = b"blk.0.ffn_norm\0";
         for (i, &b) in name.iter().enumerate() {
-            norm.name[i] = b as i8;
+            norm.name[i] = b as _;
         }
         assert!(unsafe { claims_glue(&norm) });
     }

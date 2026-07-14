@@ -160,6 +160,9 @@ fn kind_name(k: u8) -> &'static str {
         x if x == Kind::SchedCopy as u8 => "sched_copy",
         x if x == Kind::Synchronize as u8 => "synchronize",
         x if x == Kind::MemLoad as u8 => "mem_load",
+        x if x == Kind::NpuCompute as u8 => "npu_compute",
+        x if x == Kind::NpuDma as u8 => "npu_dma",
+        x if x == Kind::NpuSw as u8 => "npu_sw",
         _ => "other",
     }
 }
@@ -198,6 +201,12 @@ struct DomainStats {
     busy_ns: u64,
     copy_ns: u64,
     load_bytes: u64,
+    // Device-reported per-engine busy times (Level Zero graph profiling). These overlap each
+    // other and the host Wait window, so they are accumulated separately rather than merged into
+    // busy%; they answer "DMA-bound vs DPU-bound", not a partition of wall-clock.
+    compute_ns: u64,
+    dma_ns: u64,
+    sw_ns: u64,
 }
 
 fn merge_busy(intervals: &mut Vec<(u64, u64)>) -> u64 {
@@ -246,6 +255,13 @@ fn summarize(events: &[Event], lapped: u64) -> String {
         if is_load_kind(e.kind) {
             stats[di].load_bytes = stats[di].load_bytes.saturating_add(e.bytes);
         }
+        if e.kind == Kind::NpuCompute as u8 {
+            stats[di].compute_ns = stats[di].compute_ns.saturating_add(e.dur_ns);
+        } else if e.kind == Kind::NpuDma as u8 {
+            stats[di].dma_ns = stats[di].dma_ns.saturating_add(e.dur_ns);
+        } else if e.kind == Kind::NpuSw as u8 {
+            stats[di].sw_ns = stats[di].sw_ns.saturating_add(e.dur_ns);
+        }
     }
 
     let window = if window_lo == u64::MAX {
@@ -276,13 +292,16 @@ fn summarize(events: &[Event], lapped: u64) -> String {
         let busy = stats[i].busy_ns.min(window);
         let idle = window.saturating_sub(busy);
         out.push_str(&format!(
-            "  {name}: busy%={:.1} idle%={:.1} busy_ms={:.3} idle_ms={:.3} copy_ms={:.3} load_bytes={}\n",
+            "  {name}: busy%={:.1} idle%={:.1} busy_ms={:.3} idle_ms={:.3} copy_ms={:.3} load_bytes={} compute_ms={:.3} dma_ms={:.3} sw_ms={:.3}\n",
             pct(busy, window),
             pct(idle, window),
             ms(busy),
             ms(idle),
             ms(stats[i].copy_ns),
-            stats[i].load_bytes
+            stats[i].load_bytes,
+            ms(stats[i].compute_ns),
+            ms(stats[i].dma_ns),
+            ms(stats[i].sw_ns)
         ));
     }
     out
@@ -471,6 +490,9 @@ pub unsafe extern "C" fn ggml_npu_timeline_span(
         7 => Kind::SchedCopy,
         8 => Kind::Synchronize,
         9 => Kind::MemLoad,
+        10 => Kind::NpuCompute,
+        11 => Kind::NpuDma,
+        12 => Kind::NpuSw,
         _ => return,
     };
     span(d, k, t0_ns, t1_ns, bytes);
@@ -586,6 +608,59 @@ mod tests {
         assert!(is_busy_kind(Kind::StageIn as u8));
         assert!(is_busy_kind(Kind::Wait as u8));
         assert!(is_busy_kind(Kind::Synchronize as u8));
+    }
+
+    #[test]
+    fn device_engine_kinds_named_and_not_busy() {
+        assert_eq!(kind_name(Kind::NpuCompute as u8), "npu_compute");
+        assert_eq!(kind_name(Kind::NpuDma as u8), "npu_dma");
+        assert_eq!(kind_name(Kind::NpuSw as u8), "npu_sw");
+        // Per-engine device times overlap; they must not drive the merged busy% for the domain.
+        assert!(!is_busy_kind(Kind::NpuCompute as u8));
+        assert!(!is_busy_kind(Kind::NpuDma as u8));
+        assert!(!is_busy_kind(Kind::NpuSw as u8));
+    }
+
+    #[test]
+    fn summarize_reports_device_engine_breakdown() {
+        let events = [
+            Event {
+                ts_ns: 10_000_000,
+                dur_ns: 50_000_000, // host-observed NPU wait window: 50 ms busy
+                domain: Domain::Npu as u8,
+                kind: Kind::Wait as u8,
+                ..Event::default()
+            },
+            Event {
+                ts_ns: 10_000_000,
+                dur_ns: 30_000_000, // DPU compute 30 ms (device-reported, nested in Wait)
+                domain: Domain::Npu as u8,
+                kind: Kind::NpuCompute as u8,
+                ..Event::default()
+            },
+            Event {
+                ts_ns: 10_000_000,
+                dur_ns: 40_000_000, // DMA 40 ms (overlaps compute)
+                domain: Domain::Npu as u8,
+                kind: Kind::NpuDma as u8,
+                ..Event::default()
+            },
+            Event {
+                ts_ns: 10_000_000,
+                dur_ns: 5_000_000, // SHAVE/software 5 ms
+                domain: Domain::Npu as u8,
+                kind: Kind::NpuSw as u8,
+                ..Event::default()
+            },
+        ];
+        let s = summarize(&events, 0);
+        let npu_line = s.lines().find(|l| l.trim_start().starts_with("npu:")).unwrap();
+        // Device engine columns present with the expected durations.
+        assert!(npu_line.contains("compute_ms=30.000"), "{npu_line}");
+        assert!(npu_line.contains("dma_ms=40.000"), "{npu_line}");
+        assert!(npu_line.contains("sw_ms=5.000"), "{npu_line}");
+        // Overlapping engine times must NOT inflate busy% past the host Wait window (50 ms).
+        assert!(npu_line.contains("busy_ms=50.000"), "{npu_line}");
     }
 
     #[test]

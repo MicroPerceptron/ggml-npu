@@ -283,6 +283,9 @@ pub(super) struct Runtime {
     pub(super) device: ze_device_handle_t,
     pub(super) context: ze_context_handle_t,
     pub(super) ddi: *mut ze_graph_dditable_ext_t,
+    /// Graph profiling extension table ("ZE_extension_profiling_data"), or null when the driver
+    /// lacks it. Optional: absence just disables device-reported DPU/DMA/SW timing.
+    pub(super) prof_ddi: *mut ze_graph_profiling_dditable_ext_t,
     pub(super) queue: ze_command_queue_handle_t,
     pub(super) name: String,
 }
@@ -313,6 +316,18 @@ unsafe fn build_runtime() -> Option<Runtime> {
         return None;
     }
 
+    // Graph profiling table is optional; fetch best-effort so a driver without it still runs
+    // (device DPU/DMA/SW timing simply stays unavailable). Same extension-DDI mechanism.
+    let mut prof_table: *mut c_void = ptr::null_mut();
+    if (l.get_ext_fn_addr)(
+        dev.driver,
+        c"ZE_extension_profiling_data".as_ptr(),
+        &mut prof_table,
+    ) != ZE_RESULT_SUCCESS
+    {
+        prof_table = ptr::null_mut();
+    }
+
     let mut qd: ze_command_queue_desc_t = mem::zeroed();
     qd.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
     qd.ordinal = 0;
@@ -327,6 +342,7 @@ unsafe fn build_runtime() -> Option<Runtime> {
         device: dev.handle,
         context,
         ddi: table as *mut ze_graph_dditable_ext_t,
+        prof_ddi: prof_table as *mut ze_graph_profiling_dditable_ext_t,
         queue,
         name: dev.name,
     })

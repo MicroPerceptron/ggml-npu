@@ -81,6 +81,12 @@ struct NodeList {
     exec: ze_command_list_handle_t,
     inputs: Vec<Bind>,
     outs: Vec<Bind>,
+    /// Graph profiling query baked into the recorded execute list (device DPU/DMA/SW timing),
+    /// with the pool that owns it. Null when device profiling is off. The device overwrites the
+    /// query on each replay; read back after the queue sync. Single-threaded compute per backend,
+    /// so reusing one query across dispatches is safe.
+    prof_pool: ze_graph_profiling_pool_handle_t,
+    prof_query: ze_graph_profiling_query_handle_t,
 }
 // SAFETY: immutable after build; compute is single-threaded per backend.
 unsafe impl Send for NodeList {}
@@ -119,6 +125,18 @@ pub(super) fn async_enabled() -> bool {
     crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_ASYNC")
 }
 
+/// Opt into device-reported DPU/DMA/SW timing (Level Zero graph profiling). Requires the timeline
+/// active, `GGML_NPU_PROFILE_DEVICE=1`, and a driver exposing the profiling extension. Env is
+/// stable across the process, so graphs/lists bake a consistent profiling decision at build time.
+/// Enabling the profiling flag on the graph carries per-dispatch cost, hence the explicit opt-in.
+pub(super) fn device_profile_enabled() -> bool {
+    crate::timeline::enabled()
+        && crate::host::builtin()
+            .config()
+            .is_opt_in_one(c"GGML_NPU_PROFILE_DEVICE")
+        && ze::runtime().is_some_and(|rt| !rt.prof_ddi.is_null())
+}
+
 pub(super) fn synchronize() -> bool {
     if !PENDING.swap(false, Ordering::AcqRel) {
         return true;
@@ -148,13 +166,29 @@ unsafe fn build_graph(blob: &[u8]) -> Option<&'static Graph> {
     let pfn_init = (*g).pfnAppendGraphInitialize?;
     let pfn_destroy = (*g).pfnDestroy;
 
-    let mut gd: ze_graph_desc_t = mem::zeroed();
-    gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC;
-    gd.format = ZE_GRAPH_FORMAT_NATIVE;
-    gd.inputSize = blob.len();
-    gd.pInput = blob.as_ptr();
+    // The profiling `flags` bit lives on `ze_graph_desc_2_t` (via `pfnCreate2`), not the base
+    // `ze_graph_desc_t` (which only carries `pBuildFlags`). Under the opt-in, and when the driver
+    // exposes `pfnCreate2`, build a profiling-capable graph; otherwise the default create path is
+    // unchanged.
     let mut handle: ze_graph_handle_t = ptr::null_mut();
-    if pfn_create(rt.context, rt.device, &gd, &mut handle) != ZE_RESULT_SUCCESS {
+    let created = if device_profile_enabled() && (*g).pfnCreate2.is_some() {
+        let pfn_create2 = (*g).pfnCreate2.unwrap();
+        let mut gd: ze_graph_desc_2_t = mem::zeroed();
+        gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC_2;
+        gd.format = ZE_GRAPH_FORMAT_NATIVE;
+        gd.inputSize = blob.len();
+        gd.pInput = blob.as_ptr();
+        gd.flags = ZE_GRAPH_FLAG_ENABLE_PROFILING as u32;
+        pfn_create2(rt.context, rt.device, &gd, &mut handle) == ZE_RESULT_SUCCESS
+    } else {
+        let mut gd: ze_graph_desc_t = mem::zeroed();
+        gd.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC;
+        gd.format = ZE_GRAPH_FORMAT_NATIVE;
+        gd.inputSize = blob.len();
+        gd.pInput = blob.as_ptr();
+        pfn_create(rt.context, rt.device, &gd, &mut handle) == ZE_RESULT_SUCCESS
+    };
+    if !created {
         return None;
     }
 
@@ -326,6 +360,77 @@ unsafe fn bind_arg(
     }
 }
 
+/// Create a one-slot graph profiling pool + query for `graph`. `None` if the extension is absent
+/// or creation fails (the caller then records the list without profiling). The query handle is
+/// baked into the execute list and reused across dispatches.
+unsafe fn create_profiling_query(
+    graph: ze_graph_handle_t,
+) -> Option<(
+    ze_graph_profiling_pool_handle_t,
+    ze_graph_profiling_query_handle_t,
+)> {
+    let rt = ze::runtime()?;
+    if rt.prof_ddi.is_null() {
+        return None;
+    }
+    let p = &*rt.prof_ddi;
+    let pool_create = p.pfnProfilingPoolCreate?;
+    let query_create = p.pfnProfilingQueryCreate?;
+    let mut pool: ze_graph_profiling_pool_handle_t = ptr::null_mut();
+    if pool_create(graph, 1, &mut pool) != ZE_RESULT_SUCCESS || pool.is_null() {
+        return None;
+    }
+    let mut query: ze_graph_profiling_query_handle_t = ptr::null_mut();
+    if query_create(pool, 0, &mut query) != ZE_RESULT_SUCCESS || query.is_null() {
+        if let Some(pool_destroy) = p.pfnProfilingPoolDestroy {
+            pool_destroy(pool);
+        }
+        return None;
+    }
+    Some((pool, query))
+}
+
+/// Read the device-reported per-engine busy times (LAYER level) from `query`, summed across
+/// layers: `(dpu_ns, dma_ns, sw_ns)`. These overlap (DMA prefetch during DPU compute) so they are
+/// not a partition of wall-clock. `None` on any failure. Two-call size-then-data protocol.
+unsafe fn read_layer_profile(query: ze_graph_profiling_query_handle_t) -> Option<(u64, u64, u64)> {
+    let rt = ze::runtime()?;
+    if rt.prof_ddi.is_null() || query.is_null() {
+        return None;
+    }
+    let get_data = (*rt.prof_ddi).pfnProfilingQueryGetData?;
+    let mut size: u32 = 0;
+    if get_data(
+        query,
+        ZE_GRAPH_PROFILING_LAYER_LEVEL,
+        &mut size,
+        ptr::null_mut(),
+    ) != ZE_RESULT_SUCCESS
+        || size == 0
+    {
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(size as usize).ok()?;
+    buf.resize(size as usize, 0);
+    if get_data(query, ZE_GRAPH_PROFILING_LAYER_LEVEL, &mut size, buf.as_mut_ptr())
+        != ZE_RESULT_SUCCESS
+    {
+        return None;
+    }
+    let n = size as usize / mem::size_of::<ze_profiling_layer_info>();
+    let layers = core::slice::from_raw_parts(buf.as_ptr() as *const ze_profiling_layer_info, n);
+    let mut dpu = 0u64;
+    let mut dma = 0u64;
+    let mut sw = 0u64;
+    for ly in layers {
+        dpu = dpu.saturating_add(ly.dpu_ns);
+        dma = dma.saturating_add(ly.dma_ns);
+        sw = sw.saturating_add(ly.sw_ns);
+    }
+    Some((dpu, dma, sw))
+}
+
 unsafe fn build_node_list(
     g: &Graph,
     inputs: &[&Operand],
@@ -357,10 +462,18 @@ unsafe fn build_node_list(
         ));
         return None;
     }
+    // Bake a profiling query into the recorded list when device profiling is opted in; the device
+    // rewrites it on every replay and we read it back after each queue sync.
+    let (prof_pool, prof_query) = if device_profile_enabled() {
+        create_profiling_query(g.handle).unwrap_or((ptr::null_mut(), ptr::null_mut()))
+    } else {
+        (ptr::null_mut(), ptr::null_mut())
+    };
+
     let exec_result = pfn_exec(
         exec,
         g.handle,
-        ptr::null_mut(),
+        prof_query,
         ptr::null_mut(),
         0,
         ptr::null_mut(),
@@ -375,12 +488,24 @@ unsafe fn build_node_list(
             "[npu] command-list record FAIL: execute ze={exec_result}, close ze={close_result}\n"
         ));
         (l.cmd_list_destroy)(exec);
+        if !prof_query.is_null() {
+            if let Some(p) = rt.prof_ddi.as_ref() {
+                if let Some(qd) = p.pfnProfilingQueryDestroy {
+                    qd(prof_query);
+                }
+                if let Some(pd) = p.pfnProfilingPoolDestroy {
+                    pd(prof_pool);
+                }
+            }
+        }
         return None;
     }
     Some(Box::leak(Box::new(NodeList {
         exec,
         inputs: binds,
         outs: out_binds,
+        prof_pool,
+        prof_query,
     })))
 }
 
@@ -518,6 +643,13 @@ fn dispatch(g: &'static Graph, inputs: &[&Operand], outs: &[&Operand]) -> bool {
                 }
                 if bytes_out > 0 {
                     crate::timeline::instant(Domain::Cpu, Kind::MemLoad, bytes_out);
+                }
+                // Device-reported engine breakdown, nested in the host Wait window (anchored at
+                // tmid). Not busy-merged — accumulated separately, so the anchor is cosmetic.
+                if let Some((dpu, dma, sw)) = read_layer_profile(node.prof_query) {
+                    crate::timeline::span(Domain::Npu, Kind::NpuCompute, tmid, tmid + dpu, 0);
+                    crate::timeline::span(Domain::Npu, Kind::NpuDma, tmid, tmid + dma, 0);
+                    crate::timeline::span(Domain::Npu, Kind::NpuSw, tmid, tmid + sw, 0);
                 }
             }
             if profile::enabled() {

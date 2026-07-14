@@ -42,6 +42,12 @@ pub enum Kind {
     SchedCopy = 7,
     Synchronize = 8,
     MemLoad = 9,
+    /// Device-reported per-engine breakdown of an NPU dispatch (Level Zero graph profiling):
+    /// DPU compute, DMA (memory streaming), and SHAVE/software time. Per-engine busy times that
+    /// can overlap, so they are informational accumulators rather than merged busy intervals.
+    NpuCompute = 10,
+    NpuDma = 11,
+    NpuSw = 12,
 }
 
 const MAGIC: u64 = 0x4845_5445_524F_544C; // "HETEROTL"
