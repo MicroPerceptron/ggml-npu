@@ -655,8 +655,9 @@ fn dispatch(
             let staged = (inputs.len() + outputs.len()) as u64 - imported;
             if tl {
                 use crate::timeline_ring::{Domain, Kind};
-                crate::timeline::span(Domain::Npu, Kind::StageIn, t0, t1, bytes_in);
-                crate::timeline::span(Domain::Npu, Kind::Submit, t1, tmid, 0);
+                // Keep #78 host-prep attribution on the async defer path too.
+                crate::timeline::span(Domain::Cpu, Kind::StageIn, t0, t1, bytes_in);
+                crate::timeline::span(Domain::Cpu, Kind::Submit, t1, tmid, 0);
             }
             if profile::enabled() || crate::trace::perf_enabled() {
                 profile::record(
