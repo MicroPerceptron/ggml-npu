@@ -114,8 +114,9 @@ struct BindingKey {
 static LISTS: Cache<BindingKey, Option<&'static NodeList>> = Cache::new(2048);
 static PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Exact `GGML_NPU_ASYNC=1` only — `=0`/unset stay synchronous (MoE `is_opt_in_one` pattern).
 pub(super) fn async_enabled() -> bool {
-    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
+    crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_ASYNC")
 }
 
 pub(super) fn synchronize() -> bool {

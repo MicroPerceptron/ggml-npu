@@ -328,9 +328,11 @@ enum ResidentAction {
     Load(LoadingGuard),
 }
 
-/// Matches shell `caps.async_` / Level Zero: opt-in via `GGML_NPU_ASYNC`.
+/// Matches shell `caps.async_` / Level Zero: exact `GGML_NPU_ASYNC=1` only.
+///
+/// Harnesses export `=0` to mean off; `is_set` would falsely enable (same trap as MoE).
 pub(super) fn async_enabled() -> bool {
-    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
+    crate::host::builtin().config().is_opt_in_one(c"GGML_NPU_ASYNC")
 }
 
 /// Drain a deferred Direct `BO_WAIT` (when `GGML_NPU_ASYNC` deferred submit completion).
@@ -1516,6 +1518,42 @@ mod cache_policy_tests {
         assert!(
             !async_enabled(),
             "Direct async must stay opt-in so graph_compute remains fail-closed without caps.async_"
+        );
+    }
+
+    #[test]
+    fn async_opt_in_rejects_zero_string_like_harness() {
+        // Timeline rebench harness may export GGML_NPU_ASYNC=0; that must disable, not enable.
+        use crate::host::{ConfigService, HostEnvironment};
+        let unset = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_OTHER",
+            value: c"1",
+        };
+        assert!(
+            !unset.is_set(c"GGML_NPU_ASYNC") && !unset.is_opt_in_one(c"GGML_NPU_ASYNC"),
+            "unset must stay sync"
+        );
+        let off = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_ASYNC",
+            value: c"0",
+        };
+        assert!(off.is_set(c"GGML_NPU_ASYNC"));
+        assert!(
+            !off.is_opt_in_one(c"GGML_NPU_ASYNC"),
+            "ASYNC=0 must match MoE: presence alone must not enable"
+        );
+        let on = crate::host::mock::MockConfig {
+            name: c"GGML_NPU_ASYNC",
+            value: c"1",
+        };
+        assert!(on.is_opt_in_one(c"GGML_NPU_ASYNC"));
+        // async_enabled() reads process env via the same is_opt_in_one contract.
+        assert_eq!(
+            async_enabled(),
+            crate::host::builtin()
+                .config()
+                .is_opt_in_one(c"GGML_NPU_ASYNC"),
+            "session async_enabled must use is_opt_in_one, not is_set"
         );
     }
 

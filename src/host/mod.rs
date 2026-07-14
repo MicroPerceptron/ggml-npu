@@ -155,7 +155,7 @@ pub(crate) trait ConfigService {
     /// Opt-in flag: enabled only when the value is exactly `1`.
     ///
     /// Presence alone is not enough — harnesses and docs use `VAR=0` to mean off
-    /// (`GGML_NPU_MOE=0` in targeted smokes). Matching `is_set` would falsely enable.
+    /// (`GGML_NPU_MOE=0`, `GGML_NPU_ASYNC=0`). Matching `is_set` would falsely enable.
     fn is_opt_in_one(&self, name: &CStr) -> bool {
         self.is_exact(name, b"1")
     }
