@@ -123,7 +123,11 @@ GGML_NPU_TEST_ARTIFACT=./artifacts/bounded-vector-add.blob \
    the Direct session are software-proven (`src/vendor/ivpu/direct/health.rs`). Hang/cancel-
    observable sliced `BO_WAIT` after submit and fail-closed `InFlightAbandoned` abandon are also
    software-proven. Kernel in-flight **job abort** / hang-reset ioctls do not exist on current
-   IVPU UAPI and remain a firmware residual (`CONSTRAINT/ivpu-no-job-abort-ioctl`).
+   IVPU UAPI and remain a firmware residual (`CONSTRAINT/ivpu-no-job-abort-ioctl`). With
+   `GGML_NPU_ASYNC` (and shell `caps.async_`), all-direct dispatches may defer `BO_WAIT` into
+   `synchronize()` so the scheduler can overlap other backends; default remains fully synchronous.
+   Per-dispatch output init skips warm no-copy (`direct`) bindings; prepare/rebind still zeros
+   every output and staged BOs still zero on dispatch.
 7. **Redistributable artifact.** The local cached tiny vector-add artifact is proven, but its source,
    toolchain identity, and redistribution status must be recorded before it can be a portable CI
    fixture. A separately versioned tiny matmul remains useful for broader primitive coverage.

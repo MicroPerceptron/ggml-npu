@@ -250,12 +250,33 @@ impl PreparedInference<'_> {
             .map_err(PrepareError::Runtime)
     }
 
+    /// Zero every output binding (prepare / rebind / cold path).
+    ///
+    /// Firmware and host-glue assume a known initial image after JIT; prepare validates
+    /// with [`Self::outputs_are_zero`].
     pub fn zero_outputs(&self) -> Result<(), PrepareError> {
+        self.zero_outputs_scoped(ZeroOutputsScope::All)
+    }
+
+    /// Per-dispatch output init: skip warm **direct** (no-copy) bindings.
+    ///
+    /// Direct outputs are already host-resident ggml tensors that the NPU overwrites for the
+    /// full logical range; memset-ing them every dispatch is pure host tax under ~99% no-copy.
+    /// Staged (non-direct) BO outputs still zero so partially written firmware images cannot
+    /// leak prior BO contents into host copy-back.
+    pub fn zero_outputs_for_dispatch(&self) -> Result<(), PrepareError> {
+        self.zero_outputs_scoped(ZeroOutputsScope::StagedOnly)
+    }
+
+    fn zero_outputs_scoped(&self, scope: ZeroOutputsScope) -> Result<(), PrepareError> {
         for binding in self
             .bindings
             .iter()
             .filter(|binding| binding.class == DeviceMemoryClass::Output)
         {
+            if !should_zero_output_on_dispatch(binding.direct, scope) {
+                continue;
+            }
             if let Some(address) = binding.host_address {
                 // SAFETY: direct output view is live and bounded by logical_bytes.
                 unsafe {
@@ -314,6 +335,20 @@ impl PreparedInference<'_> {
 
     pub fn destroy(self) {
         drop(self);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroOutputsScope {
+    All,
+    StagedOnly,
+}
+
+const fn should_zero_output_on_dispatch(direct: bool, scope: ZeroOutputsScope) -> bool {
+    match scope {
+        ZeroOutputsScope::All => true,
+        // Warm no-copy: firmware writes the full logical range; prepare already zeroed once.
+        ZeroOutputsScope::StagedOnly => !direct,
     }
 }
 
@@ -1197,6 +1232,26 @@ mod tests {
         );
         assert!(prepared.total_accounted_bytes <= 64 * 1024 * 1024);
         assert!(prepared.outputs_are_zero().unwrap());
+    }
+
+    #[test]
+    fn dispatch_zero_skips_direct_keeps_staged() {
+        assert!(should_zero_output_on_dispatch(
+            false,
+            ZeroOutputsScope::StagedOnly
+        ));
+        assert!(!should_zero_output_on_dispatch(
+            true,
+            ZeroOutputsScope::StagedOnly
+        ));
+        assert!(should_zero_output_on_dispatch(
+            true,
+            ZeroOutputsScope::All
+        ));
+        assert!(should_zero_output_on_dispatch(
+            false,
+            ZeroOutputsScope::All
+        ));
     }
 
     #[test]

@@ -171,6 +171,20 @@ current code, tests, and artifacts. Use repository-relative paths only; keep one
 ## Verified findings
 
 
+- `FINDING/direct-host-tax-zero-async` — Direct dispatch host tax: per-dispatch
+  `zero_outputs` memset every output including warm no-copy (`direct`) bindings, and
+  `BO_WAIT` always completed inside `graph_compute` while `async_enabled` was hard-false
+  (`synchronize` no-op). Fix: `zero_outputs_for_dispatch` skips `direct` outputs (prepare/
+  rebind still zero all; staged BOs still zero); `GGML_NPU_ASYNC` defers all-direct
+  `BO_WAIT` into `synchronize()` with a pin-held pending command (L0 sketch); drain before
+  rebind/reset. Secondary: `buft_get_alloc_size` reserves 256 B ELF pad headroom after
+  each NPU_HOST tensor. Default path stays synchronous without the env.
+  - Scope: Hermetic unit tests; no accel in this session so tg/pp smoke deferred. Does not
+    widen `supports_buft`; timeline domain labeling owned separately (#75).
+  - Evidence: `src/vendor/ivpu/session.rs`, `src/vendor/ivpu/direct/prepare.rs`,
+    `src/backend/buffer.rs`, `docs/direct-runtime-foundation.md`, issues #75/#63.
+  - Verified: 2026-07-14
+
 - `FINDING/sm-tensor-hetero-timeline-npu-idle-decode` — With `GGML_NPU_TIMELINE` on
   LFM Q4_K_M tg128 r=1 t=6 `-ngl 99 -dev Vulkan0/NPU -sm tensor -ts 0.5/0.5` and
   `GGML_NPU_SCHED=auto`, the hetero timeline window (~3.4 s, 11880 events) shows
