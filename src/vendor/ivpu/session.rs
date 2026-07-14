@@ -328,12 +328,106 @@ enum ResidentAction {
     Load(LoadingGuard),
 }
 
+/// Matches shell `caps.async_` / Level Zero: opt-in via `GGML_NPU_ASYNC`.
 pub(super) fn async_enabled() -> bool {
-    false
+    crate::host::builtin().config().is_set(c"GGML_NPU_ASYNC")
 }
 
+/// Drain a deferred Direct `BO_WAIT` (when `GGML_NPU_ASYNC` deferred submit completion).
 pub(super) fn synchronize() -> bool {
-    true
+    drain_pending_wait()
+}
+
+struct AsyncPending {
+    program: Arc<ResidentProgram>,
+    submit_ns: u64,
+}
+
+/// Single outstanding deferred wait. Command BO lifetime is pinned via `program.pins`.
+struct AsyncPendingCell {
+    locked: AtomicBool,
+    value: UnsafeCell<Option<AsyncPending>>,
+}
+
+// SAFETY: exclusive access is gated by `locked`.
+unsafe impl Sync for AsyncPendingCell {}
+
+impl AsyncPendingCell {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(None),
+        }
+    }
+
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<AsyncPending> {
+        self.lock();
+        // SAFETY: exclusive lock held.
+        let pending = unsafe { (*self.value.get()).take() };
+        self.unlock();
+        pending
+    }
+
+    fn replace(&self, next: AsyncPending) -> Option<AsyncPending> {
+        self.lock();
+        // SAFETY: exclusive lock held.
+        let previous = unsafe { (*self.value.get()).replace(next) };
+        self.unlock();
+        previous
+    }
+}
+
+static ASYNC_PENDING: AsyncPendingCell = AsyncPendingCell::new();
+
+fn arm_pending(program: &Arc<ResidentProgram>, submit_ns: u64) {
+    program.pins.fetch_add(1, Ordering::AcqRel);
+    let displaced = ASYNC_PENDING.replace(AsyncPending {
+        program: Arc::clone(program),
+        submit_ns,
+    });
+    if let Some(previous) = displaced {
+        // Should not happen: callers drain before submit. Fail closed by waiting the old job.
+        let _ = wait_pending(previous);
+    }
+}
+
+fn wait_pending(pending: AsyncPending) -> bool {
+    let outcome = wait_command_bo(&pending.program.prepared().command, pending.submit_ns);
+    pending.program.pins.fetch_sub(1, Ordering::AcqRel);
+    match outcome {
+        WaitOutcome::Success => true,
+        WaitOutcome::Cancelled => {
+            profile::note("[npu direct] deferred wait cancelled\n");
+            false
+        }
+        other => {
+            profile::note(&alloc::format!(
+                "[npu direct] deferred wait failed: {other:?}\n"
+            ));
+            false
+        }
+    }
+}
+
+fn drain_pending_wait() -> bool {
+    match ASYNC_PENDING.take() {
+        Some(pending) => wait_pending(pending),
+        None => true,
+    }
 }
 
 /// Cooperative cancel: refuse new Direct admissions until cleared by a cancelled wait or reset.
@@ -369,6 +463,7 @@ fn wait_command_bo(command: &super::direct::BufferObject<'_>, now_ns: u64) -> Wa
 
 /// Drop resident programs and clear a latched device-loss only after firmware re-negotiation.
 pub(super) fn try_reset_after_fault() -> Result<u64, RuntimeError> {
+    let _ = drain_pending_wait();
     let context = context()?;
     let parameters = context.device.parameters().map_err(|error| {
         health::latch_device_lost(FaultReason::DeviceQuery);
@@ -458,16 +553,17 @@ fn copy_output(program: &PreparedInference<'_>, index: usize, output: &Operand) 
 
 fn dispatch(
     context: &DirectContext,
-    program: &PreparedInference<'_>,
+    program: &Arc<ResidentProgram>,
     inputs: &[&Operand],
     outputs: &[&Operand],
 ) -> bool {
+    let prepared = program.prepared();
     let mut input_bytes = Vec::new();
     if input_bytes.try_reserve_exact(inputs.len()).is_err() {
         return false;
     }
     for (index, input) in inputs.iter().enumerate() {
-        let Some(bytes) = program.input_bytes(index) else {
+        let Some(bytes) = prepared.input_bytes(index) else {
             profile::note(&alloc::format!(
                 "[npu direct] dispatch input index {index} missing from artifact\n"
             ));
@@ -485,7 +581,7 @@ fn dispatch(
         input_bytes.push(data);
     }
     if outputs.len()
-        != program
+        != prepared
             .bindings
             .iter()
             .filter(|binding| binding.class == super::direct::link::DeviceMemoryClass::Output)
@@ -494,7 +590,7 @@ fn dispatch(
         profile::note(&alloc::format!(
             "[npu direct] dispatch output count mismatch: runtime={} artifact={}\n",
             outputs.len(),
-            program
+            prepared
                 .bindings
                 .iter()
                 .filter(|binding| binding.class == DeviceMemoryClass::Output)
@@ -506,13 +602,13 @@ fn dispatch(
     let tl = crate::timeline::enabled();
     let prof = profile::enabled() || crate::trace::perf_enabled() || tl;
     let t0 = if prof { profile::now_ns() } else { 0 };
-    if let Err(error) = program.write_inputs(&input_bytes) {
+    if let Err(error) = prepared.write_inputs(&input_bytes) {
         profile::note(&alloc::format!(
             "[npu direct] input staging failed: {error:?}\n"
         ));
         return false;
     }
-    if let Err(error) = program.zero_outputs() {
+    if let Err(error) = prepared.zero_outputs_for_dispatch() {
         profile::note(&alloc::format!(
             "[npu direct] output initialization failed: {error:?}\n"
         ));
@@ -531,7 +627,7 @@ fn dispatch(
     };
     if let Err(error) = context
         .queue
-        .submit(&program.handles, program.commands_offset(), 0)
+        .submit(&prepared.handles, prepared.commands_offset(), 0)
     {
         let outcome = health::note_submit_failure(error);
         profile::note(&alloc::format!(
@@ -540,7 +636,65 @@ fn dispatch(
         return false;
     }
     let tmid = if prof { profile::now_ns() } else { 0 };
-    let outcome = wait_command_bo(&program.command, now);
+
+    // Staged (non-direct) bindings need an immediate wait so host can overwrite staging BOs
+    // or copy outputs back. All-direct can defer BO_WAIT into `synchronize()` when async is on
+    // (L0 sketch): sched may overlap other backends until sync.capabilities.async_.
+    let has_staged = prepared.bindings.iter().any(|binding| !binding.direct);
+    if async_enabled() && !has_staged {
+        arm_pending(program, now);
+        DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        if prof {
+            let bytes_in: u64 = input_bytes
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !prepared.input_is_direct(*index))
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum();
+            let imported = prepared.direct_binding_count() as u64;
+            let staged = (inputs.len() + outputs.len()) as u64 - imported;
+            if tl {
+                use crate::timeline_ring::{Domain, Kind};
+                // Keep #78 host-prep attribution on the async defer path too.
+                crate::timeline::span(Domain::Cpu, Kind::StageIn, t0, t1, bytes_in);
+                crate::timeline::span(Domain::Cpu, Kind::Submit, t1, tmid, 0);
+            }
+            if profile::enabled() || crate::trace::perf_enabled() {
+                profile::record(
+                    t0,
+                    t1,
+                    tmid,
+                    tmid,
+                    tmid,
+                    0,
+                    0,
+                    imported,
+                    staged,
+                    bytes_in,
+                    bytes_in,
+                    0,
+                );
+                crate::trace::perf(
+                    "dispatch",
+                    &alloc::format!(
+                        ",\"stage_in_ns\":{},\"submit_ns\":{},\"wait_ns\":0,\"copy_out_ns\":0,\"direct_bindings\":{},\"staged_bindings\":{},\"bytes_in\":{bytes_in},\"bytes_out\":0,\"async_deferred\":true",
+                        t1.saturating_sub(t0),
+                        tmid.saturating_sub(t1),
+                        imported,
+                        staged,
+                    ),
+                );
+            }
+            if profile::enabled() {
+                profile::note(
+                    "[npu direct] async queued (BO_WAIT deferred to synchronize)\n",
+                );
+            }
+        }
+        return true;
+    }
+
+    let outcome = wait_command_bo(&prepared.command, now);
     match outcome {
         WaitOutcome::Success => {}
         WaitOutcome::Cancelled => {
@@ -554,7 +708,7 @@ fn dispatch(
     }
     let t2 = if prof { profile::now_ns() } else { 0 };
     for (index, output) in outputs.iter().enumerate() {
-        if !copy_output(program, index, output) {
+        if !copy_output(prepared, index, output) {
             return false;
         }
     }
@@ -564,17 +718,17 @@ fn dispatch(
         let bytes_in: u64 = input_bytes
             .iter()
             .enumerate()
-            .filter(|(index, _)| !program.input_is_direct(*index))
+            .filter(|(index, _)| !prepared.input_is_direct(*index))
             .map(|(_, bytes)| bytes.len() as u64)
             .sum();
         let bytes_out: u64 = outputs
             .iter()
             .enumerate()
-            .filter(|(index, _)| !program.output_is_direct(*index))
+            .filter(|(index, _)| !prepared.output_is_direct(*index))
             .filter_map(|(_, output)| operand_storage_bytes(output))
             .map(|bytes| bytes as u64)
             .sum();
-        let imported = program.direct_binding_count() as u64;
+        let imported = prepared.direct_binding_count() as u64;
         let staged = (inputs.len() + outputs.len()) as u64 - imported;
         if tl {
             use crate::timeline_ring::{Domain, Kind};
@@ -928,6 +1082,10 @@ fn run_program(
         ));
         return false;
     }
+    // Drain deferred BO_WAIT before any rebind / new submit so command BOs stay valid.
+    if !synchronize() {
+        return false;
+    }
     let context = match context() {
         Ok(context) => context,
         Err(error) => {
@@ -1060,7 +1218,7 @@ fn run_program(
                     evict_unpinned(&program);
                     continue;
                 }
-                let result = dispatch(context, program.prepared(), inputs, outputs);
+                let result = dispatch(context, &program, inputs, outputs);
                 profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
                 return result;
             }
@@ -1152,7 +1310,7 @@ fn run_program(
                 ));
                 let pinned = PinnedProgram { program };
                 let _dispatch_guard = pinned.program.lock_dispatch();
-                let result = dispatch(context, pinned.program.prepared(), inputs, outputs);
+                let result = dispatch(context, &pinned.program, inputs, outputs);
                 profile::note(&alloc::format!("[npu direct] dispatch result={result}\n"));
                 return result;
             }
@@ -1339,9 +1497,27 @@ impl DirectBenchmarkFixture {
 #[cfg(test)]
 mod cache_policy_tests {
     use super::{
-        oldest_unpinned, resident_cache_key, WARM_REUSE_MAX_ARTIFACT_BYTES,
+        async_enabled, oldest_unpinned, resident_cache_key, synchronize,
+        WARM_REUSE_MAX_ARTIFACT_BYTES,
     };
     use crate::identity::ExactKeyBuilder;
+
+    #[test]
+    fn deferred_synchronize_is_noop_without_pending() {
+        assert!(
+            synchronize(),
+            "empty deferred wait must succeed without a device"
+        );
+    }
+
+    #[test]
+    fn async_opt_in_defaults_off_without_env() {
+        // Hermetic default: GGML_NPU_ASYNC unset in unit-test process.
+        assert!(
+            !async_enabled(),
+            "Direct async must stay opt-in so graph_compute remains fail-closed without caps.async_"
+        );
+    }
 
     #[test]
     fn resident_eviction_never_selects_pinned_programs() {

@@ -26,6 +26,11 @@ use crate::interop::{
 /// Weights are large, so the padding is negligible.
 const BUFFER_ALIGN: usize = 4096;
 
+/// Extra bytes reserved after each NPU_HOST tensor so OpenVINO ELF `allocation_bytes`
+/// (often slightly above logical nbytes) still fit when the tensor sits at the end of its
+/// reserved region (`FINDING/direct-tg128-decode-ffn-invalid-metadata`, PR #62 pad path).
+const ELF_SECTION_PAD_HEADROOM: usize = 256;
+
 /// Generation of model-resident NPU buffers. Compiled graphs bake model weights, so an address is
 /// only a valid identity within the lifetime of the buffer allocation that owns it. Incrementing
 /// this generation on buffer destruction prevents a later model allocation at the same virtual
@@ -67,7 +72,7 @@ pub(super) static BUFT_IFACE: ggml_backend_buffer_type_i = ggml_backend_buffer_t
     alloc_buffer: Some(buft_alloc_buffer),
     get_alignment: Some(buft_get_alignment),
     get_max_size: None,
-    get_alloc_size: None,
+    get_alloc_size: Some(buft_get_alloc_size),
     is_host: Some(buft_is_host),
 };
 
@@ -115,6 +120,40 @@ unsafe extern "C" fn buft_alloc_buffer(
 
 unsafe extern "C" fn buft_get_alignment(_buft: ggml_backend_buffer_type_t) -> usize {
     BUFFER_ALIGN
+}
+
+unsafe extern "C" fn buft_get_alloc_size(
+    _buft: ggml_backend_buffer_type_t,
+    tensor: *const ggml_tensor,
+) -> usize {
+    if tensor.is_null() {
+        return 0;
+    }
+    // SAFETY: ggml passes a live tensor when querying alloc size during buffer planning.
+    let nbytes = match tensor_logical_bytes(unsafe { &*tensor }) {
+        Some(bytes) => bytes,
+        None => return 0,
+    };
+    nbytes.saturating_add(ELF_SECTION_PAD_HEADROOM)
+}
+
+fn tensor_logical_bytes(tensor: &ggml_tensor) -> Option<usize> {
+    // SAFETY: type traits pointer is a process-lifetime table from ggml.
+    let traits = unsafe { crate::ffi::ggml_get_type_traits(tensor.type_) };
+    if traits.is_null() {
+        return None;
+    }
+    let traits = unsafe { &*traits };
+    let elements = tensor.ne.iter().try_fold(1usize, |product, &dimension| {
+        product.checked_mul(usize::try_from(dimension).ok()?)
+    })?;
+    let block = usize::try_from(traits.blck_size).ok()?;
+    if block == 0 || elements % block != 0 {
+        return None;
+    }
+    elements
+        .checked_div(block)?
+        .checked_mul(traits.type_size)
 }
 
 unsafe extern "C" fn buft_is_host(_buft: ggml_backend_buffer_type_t) -> bool {
@@ -285,4 +324,20 @@ pub(super) fn release_external(buffer: ggml_backend_buffer_t) -> Result<(), Owne
         .owner()
         .ok_or(OwnershipError::Released)?
         .release_external()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ELF_SECTION_PAD_HEADROOM, BUFFER_ALIGN};
+
+    #[test]
+    fn elf_pad_headroom_is_multiple_of_common_section_align() {
+        assert!(BUFFER_ALIGN.is_power_of_two());
+        assert_eq!(
+            ELF_SECTION_PAD_HEADROOM % 64,
+            0,
+            "pad headroom should cover typical ELF section alignment (64)"
+        );
+        assert!(ELF_SECTION_PAD_HEADROOM >= 64);
+    }
 }
