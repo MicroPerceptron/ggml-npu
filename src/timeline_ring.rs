@@ -26,6 +26,8 @@ pub enum Domain {
     Cpu = 0,
     Gpu = 1,
     Npu = 2,
+    /// Tensor-parallel Meta scheduler facade (not host CPU math).
+    Meta = 3,
 }
 
 #[repr(u8)]

@@ -7,8 +7,10 @@
 //! - `<prefix>.summary.txt` — busy%/idle%/copy/load per domain
 //! and prints the same summary on stderr.
 //!
-//! Host (llama.cpp) probes resolve `ggml_npu_timeline_*` via `get_proc_address`. NPU session
-//! stage/submit/wait/copy-out emit spans directly. Does not change claim/buft policy.
+//! Host (llama.cpp) probes resolve `ggml_npu_timeline_*` via `get_proc_address`. Direct / L0
+//! sessions attribute host stage/zero/submit/copy-out to CPU and device wait to NPU. Meta TP
+//! backends use domain 3 so fence reclaim is not labeled CPU math. Does not change claim/buft
+//! policy.
 
 use alloc::format;
 use alloc::string::String;
@@ -138,9 +140,14 @@ fn domain_name(d: u8) -> &'static str {
         x if x == Domain::Cpu as u8 => "cpu",
         x if x == Domain::Gpu as u8 => "gpu",
         x if x == Domain::Npu as u8 => "npu",
+        x if x == Domain::Meta as u8 => "meta",
         _ => "unknown",
     }
 }
+
+/// Domains reported in the summary / chrome lanes (CPU · GPU · NPU · Meta).
+const DOMAIN_COUNT: usize = 4;
+const DOMAIN_NAMES: [&str; DOMAIN_COUNT] = ["cpu", "gpu", "npu", "meta"];
 
 fn kind_name(k: u8) -> &'static str {
     match k {
@@ -157,6 +164,9 @@ fn kind_name(k: u8) -> &'static str {
     }
 }
 
+/// Busy kinds for merged busy%/idle%. Host staging copies count on the domain that owns
+/// them (CPU after host-prep attribution); `forward` is a window marker only and is excluded
+/// so the outer sched span does not force CPU busy% ≈ 100.
 fn is_busy_kind(k: u8) -> bool {
     matches!(
         k,
@@ -212,8 +222,8 @@ fn merge_busy(intervals: &mut Vec<(u64, u64)>) -> u64 {
 fn summarize(events: &[Event], lapped: u64) -> String {
     let mut window_lo = u64::MAX;
     let mut window_hi = 0u64;
-    let mut busy_iv: [Vec<(u64, u64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut stats = [DomainStats::default(); 3];
+    let mut busy_iv: [Vec<(u64, u64)>; DOMAIN_COUNT] = Default::default();
+    let mut stats = [DomainStats::default(); DOMAIN_COUNT];
 
     for e in events {
         let end = e.ts_ns.saturating_add(e.dur_ns);
@@ -224,7 +234,7 @@ fn summarize(events: &[Event], lapped: u64) -> String {
             window_hi = end;
         }
         let di = e.domain as usize;
-        if di > 2 {
+        if di >= DOMAIN_COUNT {
             continue;
         }
         if is_busy_kind(e.kind) && e.dur_ns > 0 {
@@ -262,7 +272,7 @@ fn summarize(events: &[Event], lapped: u64) -> String {
         events.len(),
         lapped
     );
-    for (i, name) in ["cpu", "gpu", "npu"].iter().enumerate() {
+    for (i, name) in DOMAIN_NAMES.iter().enumerate() {
         let busy = stats[i].busy_ns.min(window);
         let idle = window.saturating_sub(busy);
         out.push_str(&format!(
@@ -422,7 +432,17 @@ pub unsafe extern "C" fn ggml_npu_timeline_now_ns() -> u64 {
     now_ns()
 }
 
-/// `domain`: 0=cpu 1=gpu 2=npu · `kind`: see [`Kind`] · span `[t0_ns, t1_ns)`.
+fn domain_from_c(domain: c_int) -> Option<Domain> {
+    match domain {
+        0 => Some(Domain::Cpu),
+        1 => Some(Domain::Gpu),
+        2 => Some(Domain::Npu),
+        3 => Some(Domain::Meta),
+        _ => None,
+    }
+}
+
+/// `domain`: 0=cpu 1=gpu 2=npu 3=meta · `kind`: see [`Kind`] · span `[t0_ns, t1_ns)`.
 #[no_mangle]
 pub unsafe extern "C" fn ggml_npu_timeline_span(
     domain: c_int,
@@ -438,11 +458,8 @@ pub unsafe extern "C" fn ggml_npu_timeline_span(
             return;
         }
     }
-    let d = match domain {
-        0 => Domain::Cpu,
-        1 => Domain::Gpu,
-        2 => Domain::Npu,
-        _ => return,
+    let Some(d) = domain_from_c(domain) else {
+        return;
     };
     let k = match kind {
         1 => Kind::Forward,
@@ -468,11 +485,8 @@ pub unsafe extern "C" fn ggml_npu_timeline_instant(domain: c_int, kind: c_int, b
             return;
         }
     }
-    let d = match domain {
-        0 => Domain::Cpu,
-        1 => Domain::Gpu,
-        2 => Domain::Npu,
-        _ => return,
+    let Some(d) = domain_from_c(domain) else {
+        return;
     };
     let k = match kind {
         1 => Kind::Forward,
@@ -507,7 +521,7 @@ mod tests {
         let events = [
             Event {
                 ts_ns: 1_000_000,
-                dur_ns: 100_000_000, // 100 ms forward window marker
+                dur_ns: 100_000_000, // 100 ms forward window marker (not busy)
                 domain: Domain::Cpu as u8,
                 kind: Kind::Forward as u8,
                 ..Event::default()
@@ -528,10 +542,17 @@ mod tests {
             },
             Event {
                 ts_ns: 15_000_000,
-                dur_ns: 5_000_000, // stage-in copy
+                dur_ns: 5_000_000, // host stage-in on CPU
                 bytes: 4096,
-                domain: Domain::Npu as u8,
+                domain: Domain::Cpu as u8,
                 kind: Kind::StageIn as u8,
+                ..Event::default()
+            },
+            Event {
+                ts_ns: 55_000_000,
+                dur_ns: 20_000_000, // Meta synchronize (TP fence reclaim)
+                domain: Domain::Meta as u8,
+                kind: Kind::Synchronize as u8,
                 ..Event::default()
             },
             Event {
@@ -546,9 +567,31 @@ mod tests {
         let s = summarize(&events, 0);
         assert!(s.contains("gpu:"));
         assert!(s.contains("npu:"));
+        assert!(s.contains("meta:"));
         assert!(s.contains("load_bytes=8192") || s.contains("load_bytes=12288"));
         assert!(s.contains("busy%="));
         assert!(s.contains("idle%="));
+        // Host prep is CPU copy_/busy, not NPU; Meta fence wait is its own lane.
+        let cpu_line = s.lines().find(|l| l.trim_start().starts_with("cpu:")).unwrap();
+        let npu_line = s.lines().find(|l| l.trim_start().starts_with("npu:")).unwrap();
+        let meta_line = s.lines().find(|l| l.trim_start().starts_with("meta:")).unwrap();
+        assert!(cpu_line.contains("copy_ms=5.000"));
+        assert!(npu_line.contains("busy_ms=30.000"));
+        assert!(meta_line.contains("busy_ms=20.000"));
+    }
+
+    #[test]
+    fn forward_is_not_busy_kind() {
+        assert!(!is_busy_kind(Kind::Forward as u8));
+        assert!(is_busy_kind(Kind::StageIn as u8));
+        assert!(is_busy_kind(Kind::Wait as u8));
+        assert!(is_busy_kind(Kind::Synchronize as u8));
+    }
+
+    #[test]
+    fn domain_abi_accepts_meta() {
+        assert_eq!(domain_from_c(3), Some(Domain::Meta));
+        assert_eq!(domain_from_c(4), None);
     }
 
     #[test]
