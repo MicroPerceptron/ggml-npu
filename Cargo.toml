@@ -1,91 +1,35 @@
 [package]
 name = "ggml-npu"
-version = "0.4.0"
-edition = "2021"
-description = "Universal NPU backend for ggml — Phase 0 skeleton (CPU fallback + NpuHal seam)"
+version = "0.5.0"
+edition = "2024"
+description = "Out-of-tree ggml backend backed by virtio-accel"
 license = "MIT"
 publish = false
+autotests = false
+autobenches = false
 
 [lib]
-# What ggml dlopens. Cargo emits `libggml_npu.so` (underscore); load it explicitly
-# via GGML_BACKEND_PATH, so the exact filename does not matter for discovery.
+path = "src/bridge/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["direct-ivpu", "portable-simd"]
-# Linux intel_vpu discovery, checked UAPI wrappers, and release-pinned firmware command validation.
-direct-ivpu = ["dep:goblin"]
-level-zero-compat = []
-bench = ["dep:criterion", "dep:zstd", "direct-ivpu"]
-bench-hardware = ["bench", "level-zero-compat"]
-test-support = []
-# Production quant-transcode implementation. The crate's pinned nightly enables `portable_simd`;
-# unsupported architectures retain the scalar implementation.
-portable-simd = ["dep:cpufeatures"]
+default = ["vulkan"]
+vulkan = ["dep:virtio-accel-vulkan"]
+coreml = ["dep:virtio-accel-coreml"]
 
 [dependencies]
-blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
-cpufeatures = { version = "0.3.0", default-features = false, optional = true }
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"], optional = true }
-goblin = { version = "0.10.7", default-features = false, features = ["elf32", "elf64", "endian_fd"], optional = true }
-# Syscall mechanics only; vendor protocol semantics remain in vendor/ivpu/direct.
-rustix = { version = "1.1.4", features = ["alloc", "event", "fs", "mm", "param", "process", "thread", "time"], default-features = false }
-zstd = { version = "0.13.3", default-features = false, optional = true }
+virtio-accel-core = { git = "https://github.com/MicroPerceptron/virtio-accel", rev = "8b66e79b6d889886fb22b0c9e72d868ff96fc9cb" }
+virtio-accel-tosa = { git = "https://github.com/MicroPerceptron/virtio-accel", rev = "8b66e79b6d889886fb22b0c9e72d868ff96fc9cb" }
+virtio-accel-tosa-build = { git = "https://github.com/MicroPerceptron/virtio-accel", rev = "8b66e79b6d889886fb22b0c9e72d868ff96fc9cb" }
+virtio-accel-vulkan = { git = "https://github.com/MicroPerceptron/virtio-accel", rev = "8b66e79b6d889886fb22b0c9e72d868ff96fc9cb", optional = true }
+virtio-accel-coreml = { git = "https://github.com/MicroPerceptron/virtio-accel", rev = "8b66e79b6d889886fb22b0c9e72d868ff96fc9cb", optional = true }
 
 [build-dependencies]
 bindgen = "0.72.1"
 
-# no_std crate: no unwinding runtime, so panic = "abort" in every profile. A panic in
-# a vtable entry hits the #[panic_handler] in src/lib.rs, which calls libc abort() —
-# UB-free across the C ABI (the no_std replacement for the old catch_unwind firewall).
-[profile.dev]
-panic = "abort"
-
 [profile.release]
 panic = "abort"
-lto = "fat"
-codegen-units = 1
-opt-level = 3
+lto = "thin"
 
-[[bench]]
-name = "hashing"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "runtime"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "async_runtime"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "artifact_cache"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "hardware"
-harness = false
-required-features = ["bench-hardware"]
-
-[[test]]
-name = "async_runtime"
-required-features = ["test-support"]
-
-[[bench]]
-name = "quant_kernels"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "quant_cycles"
-harness = false
-
-[[bench]]
-name = "quant_asm"
-harness = false
-required-features = ["portable-simd"]
+[profile.dev]
+panic = "abort"

@@ -1,55 +1,48 @@
 name: ci
-
-# Phase 0 gate: the cdylib must build on BOTH x86_64 and aarch64 (Snapdragon hosts are
-# ARM), and the registration harness must pass on the native runner. No x86-only code in
-# the shell / HAL is the invariant this protects.
-
 on:
   push:
   pull_request:
   workflow_dispatch:
 
 env:
-  # Pin the llama.cpp source used for headers. Bump deliberately.
-  LLAMA_CPP_REF: master
+  LLAMA_CPP_REF: 29c720eaf72fcf8e4e61a56a88b994d92668261d
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            cross: true
+  lavapipe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-
-      - name: Fetch ggml headers (llama.cpp)
-        run: git clone --depth 1 --branch "$LLAMA_CPP_REF" https://github.com/ggml-org/llama.cpp ../llama.cpp
-
-      - name: Install libclang + build deps
-        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
-
-      - name: Install aarch64 cross toolchain
-        if: matrix.cross
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      # Nightly is required for allocator_api (also pinned by rust-toolchain.toml).
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@v4
         with:
-          targets: ${{ matrix.target }}
-
-      # bindgen runs host-side; the ggml ABI structs are LP64-identical on x86_64 and
-      # aarch64-linux, so host-generated bindings are correct for both. The cross build
-      # only needs a cross linker (below).
-      - name: Build (${{ matrix.target }})
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Registration check (native only)
-        if: '!matrix.cross'
-        run: ./tests/run_registration_check.sh target/${{ matrix.target }}/release/libggml_npu.so
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_REF }}
+          path: llama.cpp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install build dependencies and software Vulkan
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake ninja-build mesa-vulkan-drivers libvulkan1
+      - name: Configure paths and require lavapipe
+        shell: bash
+        run: |
+          echo "GGML_DIR=$GITHUB_WORKSPACE/llama.cpp" >> "$GITHUB_ENV"
+          echo "GGML_LIB_DIR=$GITHUB_WORKSPACE/llama.cpp/build/bin" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/llama.cpp/build/bin" >> "$GITHUB_ENV"
+          ICD=$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)
+          test -n "$ICD"
+          echo "VK_DRIVER_FILES=$ICD" >> "$GITHUB_ENV"
+      - name: Build unmodified ggml and llama-cli
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF
+          cmake --build llama.cpp/build --target llama-cli -j 2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo build --locked --release
+      - name: Discover external plugin in llama.cpp
+        run: |
+          GGML_BACKEND_PATH="$GITHUB_WORKSPACE/target/release/libggml_npu.so" llama.cpp/build/bin/llama-cli --list-devices | tee devices.txt
+          grep -q VIRTIO_VULKAN devices.txt
+      - name: Compare Vulkan graph execution with ggml CPU
+        run: bash tests/run_bridge_check.sh
