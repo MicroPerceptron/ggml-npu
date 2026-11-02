@@ -1,127 +1,99 @@
 # ggml-npu
 
-A universal NPU backend for [ggml](https://github.com/ggml-org/ggml) / llama.cpp,
-targeting Intel (Level Zero), AMD (XRT/XDNA), and Qualcomm (Hexagon/QNN) client NPUs
-behind one runtime seam, with CPU fallback for everything it does not claim.
+An out-of-tree Rust backend connecting [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+to [virtio-accel](https://github.com/MicroPerceptron/virtio-accel)'s native providers.
+Cargo builds the plugin independently; llama.cpp needs no source changes or Rust toolchain.
+The bridge calls the provider's Rust `Accelerator` interface directly. It does not use a VM,
+virtqueue, wire protocol, or a new C wrapper.
 
-**Status: Intel graph-compiler prototype.** The backend registers as a dynamically-loaded ggml
-`NPU` device and currently lowers dense FFN, LFM ShortConv/state writes, RoPE, runtime attention,
-FlashAttention, and sparse routed-expert graphs on Intel Lunar Lake. It
-re-quantizes model weights, compiles OpenVINO models with low-bit weights baked as Constants,
-loads the native artifacts through the Level Zero graph extension, and dispatches scheduler
-splits from Rust. Unsupported operations remain on CPU/GPU.
+## First integration
 
-The next architecture target is Liquid AI's LFM family, especially LFM2.5-8B-A1B. That requires
-stateful short-convolution, sparse routed-expert, and attention graph coverage; see
-[`docs/npu-findings-and-roadmap.md`](docs/npu-findings-and-roadmap.md) for measured constraints.
+This is a correctness baseline, not a full-model NPU implementation or a performance claim.
+The active plugin lives in `src/bridge/`. Earlier Intel prototype code, benchmarks, and design
+notes remain in the repository for reference but are not compiled by the new Cargo manifest.
 
-## Design conventions
-
-- **`no_std` + `alloc`.** No dependency on Rust std; the global allocator forwards to the
-  host libc (`malloc`/`posix_memalign`), resolved at `dlopen`. Panics abort via a
-  `#[panic_handler]` (no unwinding across the C ABI).
-- **`allocator_api` (nightly).** Collections are allocator-parameterized (`A = Global` today)
-  so vendors can back device buffers with their own allocators.
-- **Atomics over global locks.** The singleton vtable graph is published with a lock-free
-  `AtomicPtr` CAS, not a `OnceLock`.
-- **Partitioned modules**, organized by association; vendors live under `vendor/<driver>/`.
-- **Portable ownership first.** `runtime/` defines device/program/memory/queue/event lifecycles;
-  `os/` supplies owned host primitives. Vendor command protocols stay below both interfaces.
-
-## Layout
-
-```
-src/lib.rs              no_std crate root: global allocator, panic handler, mod ffi (bindgen), DL entry points
-src/backend/mod.rs      singleton vtable graph (AtomicPtr CAS wiring)
-src/backend/shell.rs    registry + device + backend(stream) vtables
-src/backend/buffer.rs   buffer-type + buffer vtables (host allocation)
-src/engine.rs           scheduler split recognition and graph dispatch
-src/ops/                matmul, graph-pattern IR, and host requantization
-src/hal.rs              legacy five-verb compatibility façade
-src/runtime/            portable fallible runtime lifecycle + artifact envelope
-src/host/               host contracts, mock provider, and rustix Linux implementation
-src/vendor/stub.rs      CPU-echo NpuHal (no hardware)
-src/vendor/ivpu/        Intel NPU (Level Zero + OpenVINO); level_zero/ vendored headers   <- active
-src/vendor/ivpu/direct/ feature-gated Linux intel_vpu discovery/resource UAPI (no submit)
-src/vendor/xdna/        AMD Ryzen AI (XRT + mlir-aie)                                       skeleton
-src/vendor/hexagon/     Qualcomm Hexagon (FastRPC/QNN + hexagon-mlir)                       skeleton
-tests/registration_check.c   self-contained registration verifier (mimics ggml's DL loader)
-build.rs                bindgen driver (locates ggml headers + clang resource dir)
-```
-
-## Prerequisites
-
-- **Rust nightly** (pinned by `rust-toolchain.toml`) — required for `allocator_api`.
-- **clang** with its resource headers (`build.rs` uses `clang -print-resource-dir`).
-- A **llama.cpp checkout** for the ggml headers: sibling `../llama.cpp` by default, or set
-  `GGML_DIR=/path/to/llama.cpp`.
-- Cross-ISA: `rustup target add aarch64-unknown-linux-gnu` + a cross linker
-  (`aarch64-linux-gnu-gcc`).
+- Vulkan is the default provider (`VIRTIO_VULKAN`). A Vulkan 1.3 loader and device are required;
+  Mesa lavapipe provides a software device for CI. `GGML_NPU_VULKAN_DEVICE` selects an exact
+  name returned by virtio-accel's Vulkan enumeration; otherwise its preferred device is used.
+- `--features coreml` additionally exposes `VIRTIO_COREML` on supported Macs. Core ML controls
+  CPU/Neural Engine placement; successful execution is not proof of exclusive ANE execution.
+- Supported: FP32 vectors/matrices, dense `MUL_MAT`, `ADD`, `MUL`, `TANH`, and `SILU`.
+  Binary broadcasting supports singleton dimensions, not ggml's general tiled repetition.
+- Input host views may have offsets, padded rows, or transposed strides. Computed views form
+  a scheduler boundary; in-place outputs, higher-rank batches, quantization, attention, and
+  mutable state are not claimed. Each matrix dimension is at most 8192.
+- One ggml split becomes one validated TOSA program. All computed outputs are copied back,
+  including intermediate results that ggml may consume after the split. There is a 128-node
+  and 128 MiB aggregate boundary-buffer limit.
+- Each backend instance owns one provider worker. Calls complete synchronously, so providers
+  with thread-local handles need no `Send` implementation. Programs and provider allocations
+  are cached for the most recent graph signature; a shape/topology change replaces that entry.
+  Tensor addresses and values are not cache keys. Every invocation uploads its current inputs,
+  including weights, so this baseline does not provide resident-weight or zero-copy performance.
+- Unsupported operations remain on ggml's other backends. A failed assigned split reports
+  failure; it is never silently treated as success or automatically replayed on the CPU.
 
 ## Build
 
-```sh
-cargo build --release                 # -> target/release/libggml_npu.so
-GGML_DIR=/path/to/llama.cpp cargo build --release   # if not a sibling
-cargo check --features direct-ivpu    # safe direct Linux foundation; no graph execution
-```
-
-The direct runtime boundary and exact prerequisites for a first direct matmul are documented in
-[`docs/direct-runtime-foundation.md`](docs/direct-runtime-foundation.md). The existing OpenVINO and
-Level Zero runtime remains the default compatibility path. `direct-ivpu` enables a no-std,
-ELF-only Goblin configuration for device artifacts; host shared-library loading continues to use
-the platform `dlopen`/`dlsym` boundary.
-
-Host microbenchmarks use feature-gated Criterion, while llama-bench remains the end-to-end pp/tg
-framework; see [`docs/benchmarking.md`](docs/benchmarking.md). The io_uring transport decision is
-documented in [`docs/io-uring-assessment.md`](docs/io-uring-assessment.md).
-Persistent and in-process key semantics are documented in
-[`docs/identity.md`](docs/identity.md).
-
-`ggml_*` symbols are left undefined and resolve at `dlopen` from the host; set
-`GGML_LIB_DIR=/dir/with/libggml-base.so` to link deterministically instead. The cdylib is
-`libggml_npu.so` (underscore); load it by explicit path.
-
-## Verify
+The integration is pinned to llama.cpp commit
+`29c720eaf72fcf8e4e61a56a88b994d92668261d` (ggml backend API 3), and virtio-accel commit
+`8b66e79b6d889886fb22b0c9e72d868ff96fc9cb`. Pinning matters: the ggml backend interface is internal.
+Use stable Rust, clang/libclang, CMake, and a C/C++ compiler.
 
 ```sh
-./tests/run_registration_check.sh     # -> REGISTRATION PASS
+git clone https://github.com/ggml-org/llama.cpp ../llama.cpp
+git -C ../llama.cpp checkout 29c720eaf72fcf8e4e61a56a88b994d92668261d
+cmake -S ../llama.cpp -B ../llama.cpp/build \
+  -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON
+cmake --build ../llama.cpp/build --target llama-cli -j
+
+export GGML_DIR="$(cd ../llama.cpp && pwd)"
+export GGML_LIB_DIR="$GGML_DIR/build/bin"
+cargo build --locked --release
 ```
 
-End-to-end, against a host built with `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON`:
+The Cargo dependencies fetch virtio-accel at the pinned revision; no sibling checkout or vendor
+SDK is needed to compile the default Vulkan path. `GGML_LIB_DIR` links the host's `ggml-base`;
+keep that same build available to the system loader when loading the plugin. On Linux:
 
 ```sh
-GGML_BACKEND_PATH=$PWD/target/release/libggml_npu.so \
-  /path/to/llama.cpp/build/bin/test-backend-ops support -b NPU
+export LD_LIBRARY_PATH="$GGML_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GGML_BACKEND_PATH="$PWD/target/release/libggml_npu.so"
+"$GGML_DIR/build/bin/llama-cli" --list-devices
 ```
 
-## Diagnostics
+macOS uses `libggml_npu.dylib`. A Homebrew Vulkan loader may need
+`DYLD_LIBRARY_PATH="$GGML_LIB_DIR:/opt/homebrew/lib"` (also for Rust unit tests). The plugin registers an auxiliary `ACCEL` device and
+pulls supported FP32 matrix multiplication from host buffers; loading it does not make
+quantized GGUF models supported. Full model inference and useful offload policies are later work.
 
-- `GGML_NPU_TRACE=1` prints each assigned scheduler split with op ids, shapes, strides, data
-  addresses, and NPU-buffer ownership.
-- `GGML_NPU_PROFILE=1` reports stage-in, submit, device/sync, and copy-out time at process exit.
-- `GGML_NPU_DEBUG=1` enables failure-path notes.
-- `GGML_NPU_BITS=4|8|16` overrides the host-side requant width for quality/performance studies.
-- `GGML_NPU_DEVICE_CLASS=npu|igpu|gpu|accel` overrides the scheduler identity. `npu` is the
-  default; `igpu` is an experiment that permits whole-layer model placement.
-- `GGML_NPU_ATTENTION=full` opts into runtime KQ/softmax/KQV and FlashAttention candidates; the default keeps
-  attention on GPU while allowing constant-weight/QKV projections.
-- `GGML_NPU_MOE=1` opts into the experimental baked-expert-bank plus runtime-index path.
-- `GGML_NPU_MEMORY_LIMIT=<bytes>` sets the shared-memory placement budget reported to ggml.
-- `GGML_NPU_ASYNC=1` queues zero-copy NPU-owned splits and synchronizes through backend events;
-  any staged foreign binding remains synchronous to protect bounce-buffer lifetimes.
-- `GGML_NPU_LFM_SHORTCONV=1` opts into ancestry-based placement of LFM convolution segments while
-  leaving sequence gather/write setup and unrelated attention/MoE glue on CPU/GPU.
+## Validation
 
-Run the mandatory operation/capability gate with `./tests/run_coverage_gate.sh`. Set `MODEL` to
-also run two fresh-process, timeout- and memory-guarded LFM prefill/decode checks with MoE,
-ShortConv, and full attention enabled. The default keeps model placement on CPU (`NGL=0`) and pulls
-eligible NPU splits; `NPU_ONLY=1 NPU_DEVICE_CLASS=igpu` remains an explicit experiment. Whole-layer
-placement previously reached only 1.84 prompt tok/s versus roughly 53 tok/s for Vulkan+NPU
-enumeration, and cold compilation of large routed-expert graphs can exceed the default timeout.
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+bash tests/run_bridge_check.sh
+```
 
-## Roadmap
+The integration harness uses the upstream external-backend loader and compares a
+matmul/bias/SiLU/multiply/tanh graph against ggml CPU. It covers updated inputs, new addresses,
+program reuse and replacement, padded/offset and transposed input views, plugin-owned host
+buffers, unsupported-operation rejection, mixed CPU/bridge scheduling, and teardown/reopening.
+A missing selected provider is a test failure, not a skip.
 
-The backend is moving from bespoke op matching to an independent graph-oriented compiler:
-correctness and cache-lifetime gates first, then LFM ShortConv state, sparse MoE feasibility,
-heterogeneous attention, broad llama.cpp graph coverage, and asynchronous cost-based placement.
+Linux CI pins `VK_DRIVER_FILES` to lavapipe and also checks `llama-cli --list-devices`.
+To exercise the same graph translator on Core ML:
+
+```sh
+cargo build --locked --release --features coreml
+GGML_NPU_TEST_PROVIDER=VIRTIO_COREML \
+  bash tests/run_bridge_check.sh "$PWD/target/release/libggml_npu.dylib"
+```
+
+`GGML_CPU_MODULE` can override the CPU module path when the host was built with a different
+output layout. `TMPDIR` must be writable by Core ML's model compiler on macOS.
+
+## License
+
+[MIT](LICENSE). Third-party components retain their own licenses and notices.

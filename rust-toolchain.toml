@@ -1,4 +1,3 @@
 [toolchain]
-# Nightly is required for #![feature(allocator_api)] (device-buffer allocators).
-channel = "nightly"
+channel = "stable"
 components = ["rustfmt", "clippy"]
